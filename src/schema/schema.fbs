@@ -1,0 +1,17 @@
+namespace serial_proxy;
+
+enum ControlCode: ubyte {
+  Ack,
+  Close,
+  Command,
+  Data,
+  Initial,
+}
+
+table Datagram {
+  identifier: uint64;
+  code: ControlCode;
+  data: [ubyte];
+}
+
+root_type Datagram;
