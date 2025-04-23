@@ -3,7 +3,6 @@ namespace serial_proxy;
 enum ControlCode: ubyte {
   Ack,
   Close,
-  Command,
   Data,
   Initial,
 }

@@ -26,16 +26,15 @@ pub mod serial_proxy {
     since = "2.0.0",
     note = "Use associated constants instead. This will no longer be generated in 2021."
   )]
-  pub const ENUM_MAX_CONTROL_CODE: u8 = 4;
+  pub const ENUM_MAX_CONTROL_CODE: u8 = 3;
   #[deprecated(
     since = "2.0.0",
     note = "Use associated constants instead. This will no longer be generated in 2021."
   )]
   #[allow(non_camel_case_types)]
-  pub const ENUM_VALUES_CONTROL_CODE: [ControlCode; 5] = [
+  pub const ENUM_VALUES_CONTROL_CODE: [ControlCode; 4] = [
     ControlCode::Ack,
     ControlCode::Close,
-    ControlCode::Command,
     ControlCode::Data,
     ControlCode::Initial,
   ];
@@ -47,25 +46,17 @@ pub mod serial_proxy {
   impl ControlCode {
     pub const Ack: Self = Self(0);
     pub const Close: Self = Self(1);
-    pub const Command: Self = Self(2);
-    pub const Data: Self = Self(3);
-    pub const Initial: Self = Self(4);
+    pub const Data: Self = Self(2);
+    pub const Initial: Self = Self(3);
 
     pub const ENUM_MIN: u8 = 0;
-    pub const ENUM_MAX: u8 = 4;
-    pub const ENUM_VALUES: &'static [Self] = &[
-      Self::Ack,
-      Self::Close,
-      Self::Command,
-      Self::Data,
-      Self::Initial,
-    ];
+    pub const ENUM_MAX: u8 = 3;
+    pub const ENUM_VALUES: &'static [Self] = &[Self::Ack, Self::Close, Self::Data, Self::Initial];
     /// Returns the variant's name or "" if unknown.
     pub fn variant_name(self) -> Option<&'static str> {
       match self {
         Self::Ack => Some("Ack"),
         Self::Close => Some("Close"),
-        Self::Command => Some("Command"),
         Self::Data => Some("Data"),
         Self::Initial => Some("Initial"),
         _ => None,

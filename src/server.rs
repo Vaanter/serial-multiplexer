@@ -1,12 +1,14 @@
-use crate::protocol_utils::{create_data_datagram, create_initial_datagram};
+use crate::protocol_utils::{create_data_datagram, create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
+use crate::utils::{handle_sink_read, handle_sink_write};
 use anyhow::Error;
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -20,6 +22,7 @@ pub struct Connection {
   client: TcpStream,
 }
 
+#[cfg(windows)]
 pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
   ClientOptions::new()
     .write(true)
@@ -29,12 +32,14 @@ pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
 }
 
 pub async fn pipe_loop(
-  mut pipe: NamedPipeClient,
+  mut pipe: impl AsyncReadExt + AsyncWriteExt + Unpin,
   pipe_to_client_push: broadcast::Sender<Bytes>,
   mut client_to_pipe_pull: mpsc::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
   let mut pipe_buf = BytesMut::zeroed(3072);
+  let mut stx_index: Option<usize> = None;
+  let mut unprocessed_data_start = 0;
   loop {
     pipe_buf.resize(3072, 0);
     tokio::select! {
@@ -44,26 +49,27 @@ pub async fn pipe_loop(
       }
       data = client_to_pipe_pull.recv() => {
         if let Some(data) = data {
-          if let Err(e) = pipe.write_all(&data).await {
-            error!("Failed to write to pipe: {}", e);
+          if let Err(e) = handle_sink_write(&mut pipe, data).await {
+            error!("Failed to handle sink write: {}", e);
             cancel.cancel();
             break;
           }
         }
       }
-      n = pipe.read(&mut pipe_buf) => {
+      n = pipe.read(&mut pipe_buf[unprocessed_data_start..]) => {
         match n {
           Ok(0) => {
             info!("Pipe disconnected");
             break;
           }
           Ok(n) => {
-            debug!("Read {} bytes from pipe", n);
-            let data = pipe_buf.split_to(n).freeze();
-            if let Err(e) = pipe_to_client_push.send(data) {
-              error!("Failed to send data to clients: {}", e);
-              cancel.cancel();
-              break;
+            match handle_sink_read(n + unprocessed_data_start, &mut pipe_buf, &mut stx_index, pipe_to_client_push.clone()).await {
+              Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
+              Err(e) => {
+                error!("Failed to handle sink read: {}", e);
+                cancel.cancel();
+                break;
+              }
             }
           }
           Err(e) => {
@@ -116,22 +122,6 @@ pub async fn run_listener(
   }
 }
 
-pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<Option<TcpListener>> {
-  let upstream_addresses = lookup_host(upstream).await?;
-  for upstream_address in upstream_addresses {
-    match TcpListener::bind(upstream_address).await {
-      Ok(listener) => {
-        debug!("Listening on {}", upstream_address);
-        return Ok(Some(listener));
-      }
-      Err(e) => {
-        error!("Failed to start listener with address {}. {}", upstream_address, e);
-      }
-    }
-  }
-  Ok(None)
-}
-
 pub async fn connection_initiator(
   mut client_to_pipe_push: mpsc::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
@@ -175,12 +165,13 @@ async fn initiate_connection(
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection.identifier, &connection.target_address);
+  trace!("Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
   if let Err(e) = client_to_pipe_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);
     return false;
   }
   // TODO rework
-  match timeout(Duration::from_secs(2), async {
+  match timeout(Duration::from_secs(5), async {
     loop {
       match pipe_to_client_pull.recv().await {
         Ok(data) => match root_as_datagram(&data) {
@@ -191,8 +182,7 @@ async fn initiate_connection(
             }
           }
           Err(e) => {
-            debug!("Received invalid datagram, will ignore: {}", e);
-            break None;
+            debug!("Received invalid datagram, will ignore: {:?}", e);
           }
         },
         Err(_) => break None,
@@ -204,10 +194,7 @@ async fn initiate_connection(
     Ok(Some(datagram)) => {
       let datagram = root_as_datagram(&datagram)
         .expect("Datagram should have been validated by checking the identifier");
-      let data = datagram.data().map(|d| d.bytes());
-      if datagram.code() != ControlCode::Ack
-        || data.is_some_and(|d| d != connection.target_address.as_bytes())
-      {
+      if datagram.code() != ControlCode::Ack || datagram.identifier() != connection.identifier {
         debug!("Received invalid response from server: {:?}", datagram);
         return false;
       }
@@ -228,8 +215,9 @@ pub async fn connection_loop(
 ) {
   let identifier = connection.identifier;
   let mut client = connection.client;
-  let mut tcp_buf = BytesMut::zeroed(2048);
+  let mut tcp_buf = BytesMut::zeroed(3072);
   loop {
+    tcp_buf.resize(3072, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
@@ -238,12 +226,12 @@ pub async fn connection_loop(
         break;
       }
       data = pipe_to_client_pull.recv() => {
-        if handle_pipe_read(identifier, data, &mut client).await {
+        if process_sink_read(identifier, data, &mut client).await {
           break;
         }
       }
       n = client.read(&mut tcp_buf) => {
-        if handle_client_read(identifier, client_to_pipe_push.clone(), n, &tcp_buf).await {
+        if handle_client_read(identifier, client_to_pipe_push.clone(), n, &mut tcp_buf).await {
           break;
         }
       }
@@ -251,7 +239,7 @@ pub async fn connection_loop(
   }
 }
 
-async fn handle_pipe_read(
+pub async fn process_sink_read(
   identifier: u64,
   data: Result<Bytes, broadcast::error::RecvError>,
   client: &mut TcpStream,
@@ -264,6 +252,12 @@ async fn handle_pipe_read(
             // Not our datagram, ignore it
             return false;
           }
+          if datagram.code() == ControlCode::Close {
+            if let Err(e) = client.shutdown().await {
+              error!("Failed to shutdown client after receiving CLOSE: {}", e);
+              return true;
+            }
+          }
           if let Some(data) = datagram.data() {
             trace!("Sending data to client, size {}", data.len());
             client.write_all(data.bytes()).await.unwrap(); // TODO error handling
@@ -272,7 +266,7 @@ async fn handle_pipe_read(
           false
         }
         Err(e) => {
-          error!("Received malformed datagram: {}, ignoring", e);
+          error!("Received malformed datagram: {:?}, ignoring", e);
           false
         }
       }
@@ -287,11 +281,11 @@ async fn handle_pipe_read(
   }
 }
 
-async fn handle_client_read(
+pub async fn handle_client_read(
   identifier: u64,
   client_to_pipe_push: mpsc::Sender<Bytes>,
   bytes_read: std::io::Result<usize>,
-  read_buf: &BytesMut,
+  read_buf: &mut BytesMut,
 ) -> bool {
   match bytes_read {
     Ok(0) => {
@@ -300,8 +294,9 @@ async fn handle_client_read(
     }
     Ok(n) => {
       debug!("Read {} bytes from client", n);
-      let datagram = create_data_datagram(identifier, &read_buf[..n]);
-      debug!("Sending datagram to pipe {:?}", datagram);
+      let data = read_buf.split_to(n).freeze();
+      let datagram = create_data_datagram(identifier, &data);
+      debug!("Sending datagram to sink {:?}", datagram);
       client_to_pipe_push.send(datagram).await.unwrap(); // TODO error handling
       false
     }
@@ -340,48 +335,49 @@ mod tests {
   #[tokio::test]
   async fn test_handle_client_read_smoke() {
     setup_tracing();
-    let bytes = BytesMut::from("test data");
-    let (pipe_push, mut pipe_pull) = tokio::sync::mpsc::channel(1);
+    let contents = "test data";
+    let mut bytes = BytesMut::from(contents);
+    let (pipe_push, mut pipe_pull) = mpsc::channel(1);
 
     let identifier = 123;
     let bytes_read = Ok(bytes.len());
 
-    assert!(!handle_client_read(identifier, pipe_push, bytes_read, &bytes).await);
+    assert!(!handle_client_read(identifier, pipe_push, bytes_read, &mut bytes).await);
     let pipe_read = pipe_pull.recv().await.unwrap();
     let datagram = root_as_datagram(&pipe_read).expect("Received datagram should be valid");
     assert_eq!(datagram.identifier(), identifier);
     assert_eq!(datagram.code(), ControlCode::Data);
-    assert_eq!(datagram.data().unwrap().bytes(), bytes);
+    assert_eq!(datagram.data().unwrap().bytes(), contents.as_bytes());
   }
 
   #[tokio::test]
   async fn test_handle_client_read_client_disconnect() {
     setup_tracing();
-    let (pipe_push, pipe_pull) = tokio::sync::mpsc::channel(1);
+    let (pipe_push, _pipe_pull) = mpsc::channel(1);
     let identifier = 123;
     let bytes_read = Ok(0);
 
-    assert!(handle_client_read(identifier, pipe_push, bytes_read, &BytesMut::new()).await);
+    assert!(handle_client_read(identifier, pipe_push, bytes_read, &mut BytesMut::new()).await);
   }
 
   #[tokio::test]
   async fn test_handle_client_read_client_error() {
     setup_tracing();
-    let (pipe_push, pipe_pull) = tokio::sync::mpsc::channel(1);
+    let (pipe_push, _pipe_pull) = mpsc::channel(1);
     let identifier = 123;
     let bytes_read = Err(std::io::Error::new(std::io::ErrorKind::Other, "test error"));
 
-    assert!(handle_client_read(identifier, pipe_push, bytes_read, &BytesMut::new()).await);
+    assert!(handle_client_read(identifier, pipe_push, bytes_read, &mut BytesMut::new()).await);
   }
 
   #[tokio::test]
-  async fn test_handle_pipe_read_smoke() {
+  async fn test_handle_sink_read_smoke() {
     setup_tracing();
     let identifier = 123;
     let data = BytesMut::from("test data");
     let datagram = create_data_datagram(identifier, &data);
 
-    let (address_sender, mut address_receiver) = tokio::sync::mpsc::channel::<SocketAddr>(1);
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
     let handle = tokio::spawn(async move {
       let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
       let address = listener.local_addr().unwrap();
@@ -395,7 +391,7 @@ mod tests {
 
     let server_address = address_receiver.recv().await.unwrap();
     let mut client = TcpStream::connect(server_address).await.unwrap();
-    assert!(!handle_pipe_read(identifier, Ok(datagram), &mut client).await);
+    assert!(!process_sink_read(identifier, Ok(datagram), &mut client).await);
     handle.await.unwrap();
   }
 }

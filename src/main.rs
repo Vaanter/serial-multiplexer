@@ -1,23 +1,19 @@
-use crate::server::{
-  Connection, connection_initiator, create_upstream_listener, pipe_loop, run_listener,
-};
-use anyhow::{Context, Error, bail};
+use crate::client::{client_initiator, serial_loop};
+use crate::server::{Connection, connection_initiator, pipe_loop, run_listener};
+use crate::utils::create_upstream_listener;
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures::future::{join_all, maybe_done};
+use futures::join;
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, join};
 use std::time::Duration;
-use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, lookup_host};
 use tokio::signal::ctrl_c;
 use tokio::sync::{broadcast, mpsc};
+use tokio::task;
 use tokio::time::{sleep, timeout};
 use tokio_serial::SerialPortBuilderExt;
-use tokio_serial::SerialStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, debug, error, info, trace, warn};
+use tracing::{Level, debug, error, info, trace};
 use tracing_attributes::instrument;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -29,16 +25,27 @@ mod protocol_utils;
 #[allow(unsafe_op_in_unsafe_fn, unused)]
 mod schema_generated;
 mod server;
+mod utils;
 
 #[derive(Parser, Debug)]
 #[clap(version, about, author)]
 struct Args {
-  #[clap(short, long)]
-  target: String,
-  #[clap(short, long)]
-  serial: String,
+  #[clap(subcommand)]
+  command: Commands,
   #[clap(short, long, default_value_t = 1)]
   verbose: u8,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+  Host {
+    #[arg(short, long)]
+    pipe_path: String,
+  },
+  Client {
+    #[arg(short, long)]
+    serial_path: String,
+  },
 }
 
 fn main() {
@@ -79,7 +86,14 @@ fn main() {
     .build()
     .unwrap()
     .block_on(async {
-      run_server(addresses).await;
+      match args.command {
+        Commands::Client { serial_path } => {
+          setup_client(&serial_path).await;
+        }
+        Commands::Host { pipe_path } => {
+          run_server(&pipe_path, addresses).await;
+        }
+      }
     });
 }
 
@@ -88,14 +102,22 @@ struct AddressPair {
   target_address: String,
 }
 
-async fn run_server(addresses: Vec<AddressPair>) {
+#[cfg(unix)]
+#[instrument(skip_all)]
+async fn run_server(_pipe_path: &str, _addresses: Vec<AddressPair>) {
+  panic!("Running on linux is not supported.");
+}
+
+#[cfg(windows)]
+#[instrument(skip_all)]
+async fn run_server(pipe_path: &str, addresses: Vec<AddressPair>) {
   let cancel = CancellationToken::new();
   let (client_to_pipe_push, client_to_pipe_pull) = mpsc::channel::<Bytes>(128);
   let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(128);
 
   let mut retry_count = 0;
   let pipe = loop {
-    match server::prepare_pipe(r"\\.\pipe\ubuntuvirtual").await {
+    match server::prepare_pipe(pipe_path).await {
       Ok(pipe) => {
         info!("Pipe is ready");
         break pipe;
@@ -188,100 +210,33 @@ async fn setup_address_pair(
   let _ = join!(listener_task, initiator_task);
 }
 
-#[instrument(skip(args))]
-async fn run_serial(args: Args) {
-  let mut serial = tokio_serial::new(&args.serial, 115200)
+#[instrument(skip_all)]
+async fn setup_client(serial_path: &str) {
+  let serial = tokio_serial::new(serial_path, 115200)
     .open_native_async()
     .expect("Failed to open serial port");
 
-  loop {
-    let duplex_result = duplex_loop(&args.target, &mut serial).await;
-    match duplex_result {
-      Ok(_) => {
-        info!("Good bye :)");
-        break;
-      }
-      Err(DuplexError::DownstreamClosed) => {
-        info!("Downstream connection closed. Will try to reconnect.");
-        continue;
-      }
-      Err(err) => {
-        error!("Duplex connection error: {}", err);
-        break;
-      }
-    }
-  }
-}
+  let cancel = CancellationToken::new();
+  let (client_to_serial_push, client_to_serial_pull) = mpsc::channel::<Bytes>(128);
+  let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(128);
 
-#[derive(Error, Debug)]
-enum DuplexError {
-  #[error("Connection to downstream closed")]
-  DownstreamClosed,
-  #[error("Failed to connect to target downstream server")]
-  DownstreamConnectionFailed(anyhow::Error),
-  #[error("Serial port is closed")]
-  SerialClosed,
-  #[error(transparent)]
-  SerialError(anyhow::Error),
-  #[error(transparent)]
-  DownstreamError(anyhow::Error),
-  #[error("System error occurred. {0:?}")]
-  SystemError(anyhow::Error),
-}
+  let serial_task =
+    task::spawn(serial_loop(serial, client_to_serial_pull, serial_to_client_push, cancel.clone()));
 
-async fn duplex_loop(target: &str, serial: &mut SerialStream) -> Result<(), DuplexError> {
-  let mut downstream = connect_downstream(target)
-    .await
-    .map_err(DuplexError::DownstreamConnectionFailed)?;
+  let initiator_task =
+    task::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
 
-  loop {
-    let mut buf_serial = vec![0u8; 2048];
-    let mut buf_tcp = vec![0u8; 2048];
-
-    let read_serial = serial.read(&mut buf_serial);
-    let read_tcp = downstream.read(&mut buf_tcp);
-
-    tokio::select! {
-      n = read_serial => {
-        match n {
-          Ok(0) => return Err(DuplexError::SerialClosed),
-          Ok(n) => {
-            trace!("Read {} bytes from serial stream", n);
-            downstream.write_all(&buf_serial[..n]).await.context("Failed to write to downstream")
-              .map_err(DuplexError::DownstreamError)?;
-          },
-          Err(e) => return Err(DuplexError::SerialError(Error::from(e)))
-        }
-      },
-      n = read_tcp => {
-        match n {
-          Ok(0) => return Err(DuplexError::DownstreamClosed),
-          Ok(n) => {
-            trace!("Read {} bytes from tcp stream", n);
-            serial.write_all(&buf_tcp[..n]).await.context("Failed to write to serial stream")
-              .map_err(DuplexError::SerialError)?;
-          },
-          Err(e) => return Err(DuplexError::DownstreamError(Error::from(e)))
-        }
+  let join = maybe_done(join_all(vec![serial_task, initiator_task]));
+  match ctrl_c().await {
+    Ok(_) => {
+      info!("Received Ctrl+C. Shutting down.");
+      cancel.cancel();
+      if timeout(Duration::from_secs(2), join).await.is_err() {
+        info!("Failed to shutdown gracefully. Forcing shutdown.");
       }
     }
+    Err(e) => {
+      error!("Failed to handle Ctrl+C: {}", e);
+    }
   }
-}
-
-async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {
-  let downstream_addresses = lookup_host(downstream).await?.collect::<Vec<_>>();
-  for downstream_address in downstream_addresses.iter() {
-    let downstream = match TcpStream::connect(downstream_address).await {
-      Ok(downstream) => {
-        debug!("Successfully connected to server");
-        downstream
-      }
-      Err(e) => {
-        warn!("Failed to connect to downstream {}: {}", downstream_address, e);
-        continue;
-      }
-    };
-    return Ok(downstream);
-  }
-  bail!("Failed to connect to downstream {}", downstream);
 }

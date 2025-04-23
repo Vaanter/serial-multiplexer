@@ -1,5 +1,5 @@
 [package]
-name = "serial-proxy"
+name = "serial-multiplexer"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,7 +9,6 @@ bytes = "1.10.1"
 clap = { version = "4.5.36", features = ["derive"] }
 flatbuffers = "25.2.10"
 futures = "0.3.31"
-thiserror = "2.0.12"
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-serial = "5.4.5"
 tokio-util = "0.7.14"
