@@ -310,6 +310,7 @@ pub async fn handle_client_read(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::protocol_utils::create_ack_datagram;
   use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
   use std::net::SocketAddr;
   use std::sync::atomic::{AtomicBool, Ordering};
@@ -393,5 +394,63 @@ mod tests {
     let mut client = TcpStream::connect(server_address).await.unwrap();
     assert!(!process_sink_read(identifier, Ok(datagram), &mut client).await);
     handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_pipe_loop() {
+    let (sink_a, mut sink_b) = tokio::io::duplex(4096);
+    let (pipe_to_client_push, mut pipe_to_client_pull) = broadcast::channel(256);
+    let (_client_to_pipe_push, client_to_pipe_pull) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    let _pipe_loop_handle = tokio::spawn(pipe_loop(
+      sink_a,
+      pipe_to_client_push.clone(),
+      client_to_pipe_pull,
+      cancel.clone(),
+    ));
+
+    let initial_data = "test data";
+    let initial_datagram = create_initial_datagram(1, initial_data);
+    handle_sink_write(&mut sink_b, initial_datagram)
+      .await
+      .unwrap();
+    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+    let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
+    assert_eq!(initial_datagram.identifier(), 1);
+    assert_eq!(initial_datagram.code(), ControlCode::Initial);
+    assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data.as_bytes());
+
+    // write some rubbish between datagrams
+    let data = BytesMut::from("rubbish");
+    sink_b.write_all(&data).await.unwrap();
+    sink_b.flush().await.unwrap();
+
+    let ack_datagram = create_ack_datagram(2);
+    handle_sink_write(&mut sink_b, ack_datagram).await.unwrap();
+    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+    let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
+    assert_eq!(ack_datagram.identifier(), 2);
+    assert_eq!(ack_datagram.code(), ControlCode::Ack);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), &[]);
+
+    // write more rubbish between datagrams
+    let data = BytesMut::from("rubbish2");
+    sink_b.write_all(&data).await.unwrap();
+    sink_b.flush().await.unwrap();
+
+    // write even more rubbish between datagrams
+    let data = BytesMut::from("rubbish3");
+    sink_b.write_all(&data).await.unwrap();
+    sink_b.flush().await.unwrap();
+
+    let mut data = BytesMut::new();
+    data.resize(1000, 100u8);
+    let data_datagram = create_data_datagram(3, &data);
+    handle_sink_write(&mut sink_b, data_datagram).await.unwrap();
+    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
+    assert_eq!(data_datagram.identifier(), 3);
+    assert_eq!(data_datagram.code(), ControlCode::Data);
+    assert_eq!(data_datagram.data().unwrap().bytes(), data);
   }
 }
