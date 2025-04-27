@@ -1,4 +1,4 @@
-use crate::common::{handle_client_read, process_sink_read};
+use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
 use anyhow::Error;
@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
+use tracing_attributes::instrument;
 
 static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -155,6 +156,7 @@ async fn initiate_connection(
   }
 }
 
+#[instrument(skip_all, fields(client_id = %connection.identifier))]
 pub async fn connection_loop(
   connection: Connection,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
@@ -163,13 +165,15 @@ pub async fn connection_loop(
 ) {
   let identifier = connection.identifier;
   let mut client = connection.client;
-  let mut tcp_buf = BytesMut::zeroed(3072);
+  let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
-    tcp_buf.resize(3072, 0);
+    tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
-        client.shutdown().await.unwrap(); // TODO error handling
+        if let Err(e) = client.shutdown().await {
+          error!("Failed to shutdown client after server shutdown: {}", e);
+        }
         info!("Connection cancelled");
         break;
       }
@@ -185,6 +189,7 @@ pub async fn connection_loop(
       }
     }
   }
+  debug!("Connection {} loop ending", identifier);
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::common::{handle_client_read, process_sink_read};
+use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::ControlCode;
 use crate::utils::connect_downstream;
@@ -62,11 +62,11 @@ async fn initiate_client_connection(
 ) -> anyhow::Result<Option<Client>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
-      debug!("Received datagram: {:?}", datagram);
       // Not the first datagram for connection, ignore
       if datagram.code() != ControlCode::Initial {
         return Ok(None);
       }
+      debug!("Connection {} received {:?} datagram", datagram.identifier(), datagram.code());
       let identifier = datagram.identifier();
       let target_address = match datagram
         .data()
@@ -109,9 +109,9 @@ async fn client_loop(
 ) {
   let identifier = client.identifier;
   let mut downstream = client.downstream;
-  let mut tcp_buf = BytesMut::zeroed(3072);
+  let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
-    tcp_buf.resize(3072, 0);
+    tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {

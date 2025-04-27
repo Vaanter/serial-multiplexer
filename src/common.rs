@@ -4,17 +4,21 @@ use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
 use std::cmp::min;
+use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
-use tracing_attributes::instrument;
 use zeroize::Zeroize;
 
+const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
+pub(crate) const CONNECTION_BUFFER_SIZE: usize = 2usize.pow(15);
 const DATAGRAM_HEADER: [u8; 4] = [2, 200, 94, 2];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
 const LENGTH_BYTES: usize = 2;
+static HEADER_FINDER: LazyLock<Finder<'static>> =
+  LazyLock::new(|| Finder::new(&DATAGRAM_HEADER).into_owned());
 
 pub async fn sink_loop(
   mut pipe: impl AsyncReadExt + AsyncWriteExt + Unpin,
@@ -22,10 +26,10 @@ pub async fn sink_loop(
   mut client_to_sink_pull: mpsc::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
-  let mut pipe_buf = BytesMut::zeroed(3072);
+  let mut pipe_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
   let mut unprocessed_data_start = 0;
   loop {
-    pipe_buf.resize(3072, 0);
+    pipe_buf.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
@@ -44,10 +48,11 @@ pub async fn sink_loop(
         match n {
           Ok(0) => {
             info!("Sink disconnected");
+            cancel.cancel();
             break;
           }
           Ok(n) => {
-            match handle_sink_read(n + unprocessed_data_start, &mut pipe_buf, sink_to_client_push.clone()).await {
+            match handle_sink_read(n + unprocessed_data_start, &mut pipe_buf, sink_to_client_push.clone()) {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
               Err(e) => {
                 error!("Failed to handle sink read: {}", e);
@@ -67,17 +72,16 @@ pub async fn sink_loop(
   }
 }
 
-pub async fn handle_sink_read(
+pub fn handle_sink_read(
   n: usize,
   sink_buf: &mut BytesMut,
   sink_to_client_push: broadcast::Sender<Bytes>,
 ) -> anyhow::Result<usize> {
-  debug!("Read {} bytes from sink", n);
+  trace!("Read {} bytes from sink", n);
   let mut read_data = &sink_buf[..n];
   trace!("Data in working buffer: {:?}", &read_data);
   let mut unprocessed_data_start = 0;
-  let start_finder = Finder::new(&DATAGRAM_HEADER);
-  while let Some(header_idx) = start_finder.find(read_data) {
+  while let Some(header_idx) = HEADER_FINDER.find(read_data) {
     trace!("Found HEADER at index {}", header_idx);
     if header_idx + HEADER_BYTES + LENGTH_BYTES > read_data.len() {
       trace!("Buffer is too small to contain datagram size");
@@ -130,6 +134,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   sink: &mut T,
   data: Bytes,
 ) -> anyhow::Result<()> {
+  trace!("Writing {} bytes to sink: {:?}", data.len() + HEADER_BYTES + LENGTH_BYTES, data);
   if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
     bail!("Failed to write HEADER to sink: {}", e);
   }
@@ -137,7 +142,6 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   if let Err(e) = sink.write(&size).await {
     bail!("Failed to write size to sink: {}", e);
   }
-  trace!("Writing {} bytes to sink: {:?}", data.len() + HEADER_BYTES + LENGTH_BYTES, data);
   if let Err(e) = sink.write_all(&data).await {
     bail!("Failed to write data to sink: {}", e);
   }
@@ -147,7 +151,6 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   Ok(())
 }
 
-#[instrument(skip(client_to_pipe_push, bytes_read, read_buf))]
 pub async fn handle_client_read(
   identifier: u64,
   client_to_pipe_push: mpsc::Sender<Bytes>,
@@ -158,15 +161,20 @@ pub async fn handle_client_read(
     Ok(0) => {
       info!("Client {} disconnected", identifier);
       let datagram = create_close_datagram(identifier);
-      client_to_pipe_push.send(datagram).await.unwrap(); // TODO error handling
+      if let Err(e) = client_to_pipe_push.send(datagram).await {
+        error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
+      }
       true
     }
     Ok(n) => {
       debug!("Read {} bytes from client", n);
       let data = read_buf.split_to(n).freeze();
       let datagram = create_data_datagram(identifier, &data);
-      debug!("Sending DATA datagram to sink {:?}", datagram);
-      client_to_pipe_push.send(datagram).await.unwrap(); // TODO error handling
+      trace!("Sending DATA datagram to sink {:?}", datagram);
+      if let Err(e) = client_to_pipe_push.send(datagram).await {
+        error!("Failed to send DATA datagram for connection {}: {}", identifier, e);
+        return true;
+      }
       false
     }
     Err(e) => {
@@ -176,7 +184,6 @@ pub async fn handle_client_read(
   }
 }
 
-#[instrument(skip(client, data))]
 pub async fn process_sink_read(
   identifier: u64,
   data: Result<Bytes, broadcast::error::RecvError>,
@@ -190,7 +197,11 @@ pub async fn process_sink_read(
             // Not our datagram, ignore it
             return false;
           }
-          debug!("Connection {} received datagram: {:?}", identifier, datagram);
+          debug!(
+            "Received {:?} datagram with {} bytes of data",
+            datagram.code(),
+            datagram.data().map(|d| d.len()).unwrap_or(0)
+          );
           if datagram.code() == ControlCode::Close {
             if let Err(e) = client.shutdown().await {
               error!("Failed to shutdown client after receiving CLOSE: {}", e);
@@ -199,8 +210,17 @@ pub async fn process_sink_read(
           }
           if let Some(data) = datagram.data() {
             trace!("Sending data to client, size {}", data.len());
-            client.write_all(data.bytes()).await.unwrap(); // TODO error handling
-            client.flush().await.unwrap();
+            match client.write_all(data.bytes()).await {
+              Ok(_) => {
+                if let Err(e) = client.flush().await {
+                  error!("Failed to flush client data after writing data: {}", e);
+                }
+              }
+              Err(e) => {
+                error!("Failed to write data to client: {}", e);
+                return true;
+              }
+            }
           }
           false
         }
@@ -252,9 +272,7 @@ mod tests {
     let mut buffer_size = sink_buf.len();
 
     let unprocessed_bytes =
-      handle_sink_read(sink_buf.len(), &mut sink_buf, sink_to_client_push.clone())
-        .await
-        .unwrap();
+      handle_sink_read(sink_buf.len(), &mut sink_buf, sink_to_client_push.clone()).unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 3);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[4, 5, 6]));
@@ -267,9 +285,7 @@ mod tests {
     sink_buf.extend_from_slice(&[11, 12, 13, 14, 15]);
     buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(sink_buf.len(), &mut sink_buf, sink_to_client_push.clone())
-        .await
-        .unwrap();
+      handle_sink_read(sink_buf.len(), &mut sink_buf, sink_to_client_push.clone()).unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 5);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[5; 100]));
@@ -297,9 +313,7 @@ mod tests {
 
     let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone())
-        .await
-        .unwrap();
+      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone()).unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
@@ -318,9 +332,7 @@ mod tests {
     let buffer_size = sink_buf.len();
 
     let unprocessed_bytes =
-      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone())
-        .await
-        .unwrap();
+      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone()).unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size);
@@ -339,9 +351,7 @@ mod tests {
     let buffer_size = sink_buf.len();
 
     let unprocessed_bytes =
-      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone())
-        .await
-        .unwrap();
+      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone()).unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size);
