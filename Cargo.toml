@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.97"
 bytes = "1.10.1"
 clap = { version = "4.5.36", features = ["derive"] }
+config = { version = "0.15.11", default-features = false, features = ["toml"] }
 flatbuffers = "25.2.10"
 futures = "0.3.31"
 memchr = "2.7.4"
@@ -16,3 +17,4 @@ tokio-util = "0.7.14"
 tracing = "0.1.41"
 tracing-attributes = "0.1.28"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+zeroize = "1.8.1"

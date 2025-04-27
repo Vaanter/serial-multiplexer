@@ -4,6 +4,7 @@ use crate::utils::create_upstream_listener;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use common::sink_loop;
+use config::Config;
 use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
 use futures::join;
 use futures::stream::FuturesUnordered;
@@ -37,8 +38,10 @@ mod utils;
 struct Args {
   #[clap(subcommand)]
   command: Commands,
-  #[clap(short, long)]
-  verbose: Option<u8>,
+  #[clap(short, long, default_value = "4", action = clap::ArgAction::Count)]
+  verbose: u8,
+  #[clap(short, long, default_value = "config.toml")]
+  config: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -53,13 +56,24 @@ enum Commands {
   },
 }
 
+struct AddressPair {
+  listener_address: String,
+  target_address: String,
+}
+
 fn main() {
   let args = Args::parse();
+  let config = Config::builder()
+    .add_source(config::File::with_name(&args.config))
+    // Add in settings from the environment (with a prefix of SEMUL)
+    .add_source(config::Environment::with_prefix("SEMUL"))
+    .build()
+    .expect("Failed to load config");
 
   let level = match args.verbose {
-    Some(1) => Level::INFO,
-    Some(2) => Level::DEBUG,
-    Some(3) => Level::TRACE,
+    1 => Level::INFO,
+    2 => Level::DEBUG,
+    3 => Level::TRACE,
     _ => Level::WARN,
   };
 
@@ -75,16 +89,23 @@ fn main() {
   Registry::default().with(fmt_layer).init();
   debug!("args: {:?}", args);
 
-  let addresses = vec![
-    AddressPair {
-      listener_address: "127.0.0.1:1234".to_string(),
-      target_address: "tcpbin.com:4242".to_string(),
-    },
-    AddressPair {
-      listener_address: "127.0.0.1:1235".to_string(),
-      target_address: "www.google.com:443".to_string(),
-    },
-  ];
+  let addresses = config
+    .get_array("address_pairs")
+    .unwrap()
+    .into_iter()
+    .filter_map(|row| row.into_table().ok())
+    .enumerate()
+    .map(|(idx, pair)| AddressPair {
+      listener_address: pair
+        .get("listener_address")
+        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the listener address", idx))
+        .to_string(),
+      target_address: pair
+        .get("target_address")
+        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the target address", idx))
+        .to_string(),
+    })
+    .collect::<Vec<AddressPair>>();
 
   tokio::runtime::Builder::new_multi_thread()
     .enable_all()
@@ -100,11 +121,6 @@ fn main() {
         }
       }
     });
-}
-
-struct AddressPair {
-  listener_address: String,
-  target_address: String,
 }
 
 #[cfg(unix)]
