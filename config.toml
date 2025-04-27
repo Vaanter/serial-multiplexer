@@ -2,3 +2,5 @@ address_pairs = [
     {listener_address = "127.0.0.1:1234", target_address = "tcpbin.com:4242"},
     {listener_address = "127.0.0.1:1235", target_address = "google.com:443"},
 ]
+
+log_file = "serial-multiplexer.log"

@@ -8,6 +8,7 @@ use config::Config;
 use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
 use futures::join;
 use futures::stream::FuturesUnordered;
+use std::fs::OpenOptions;
 use std::time::Duration;
 use tokio::signal::ctrl_c;
 use tokio::sync::{broadcast, mpsc};
@@ -77,8 +78,19 @@ fn main() {
     _ => Level::WARN,
   };
 
+  let (writer, _guard) = if let Ok(log_file_name) = config.get_string("log_file") {
+    let mut log_file_options = OpenOptions::new();
+    log_file_options.write(true).truncate(true).create(true);
+    let log_file = log_file_options
+      .open(log_file_name)
+      .expect("Log file should be accessible");
+    tracing_appender::non_blocking(log_file)
+  } else {
+    tracing_appender::non_blocking(std::io::stdout())
+  };
+
   let fmt_layer = tracing_subscriber::fmt::Layer::default()
-    .with_writer(std::io::stdout)
+    .with_writer(writer)
     .with_file(false)
     .with_ansi(true)
     .with_line_number(false)
@@ -91,7 +103,7 @@ fn main() {
 
   let addresses = config
     .get_array("address_pairs")
-    .unwrap()
+    .expect("Config should contain address pairs")
     .into_iter()
     .filter_map(|row| row.into_table().ok())
     .enumerate()
@@ -110,7 +122,7 @@ fn main() {
   tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .build()
-    .unwrap()
+    .expect("Setting up runtime must succeed")
     .block_on(async {
       match args.command {
         Commands::Client { serial_path } => {
