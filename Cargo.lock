@@ -604,6 +604,7 @@ dependencies = [
  "clap",
  "flatbuffers",
  "futures",
+ "memchr",
  "tokio",
  "tokio-serial",
  "tokio-util",

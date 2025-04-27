@@ -1,15 +1,17 @@
-use crate::client::{client_initiator, serial_loop};
-use crate::server::{Connection, connection_initiator, pipe_loop, run_listener};
+use crate::client::client_initiator;
+use crate::server::{Connection, connection_initiator, run_listener};
 use crate::utils::create_upstream_listener;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use futures::future::{join_all, maybe_done};
+use common::sink_loop;
+use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
 use futures::join;
 use futures::stream::FuturesUnordered;
 use std::time::Duration;
 use tokio::signal::ctrl_c;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
@@ -21,10 +23,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
 mod client;
+mod common;
 mod protocol_utils;
 #[allow(unsafe_op_in_unsafe_fn, unused)]
 mod schema_generated;
 mod server;
+#[cfg(test)]
+mod test_utils;
 mod utils;
 
 #[derive(Parser, Debug)]
@@ -32,8 +37,8 @@ mod utils;
 struct Args {
   #[clap(subcommand)]
   command: Commands,
-  #[clap(short, long, default_value_t = 1)]
-  verbose: u8,
+  #[clap(short, long)]
+  verbose: Option<u8>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,12 +55,11 @@ enum Commands {
 
 fn main() {
   let args = Args::parse();
-  debug!("args: {:?}", args);
 
   let level = match args.verbose {
-    1 => Level::INFO,
-    2 => Level::DEBUG,
-    3 => Level::TRACE,
+    Some(1) => Level::INFO,
+    Some(2) => Level::DEBUG,
+    Some(3) => Level::TRACE,
     _ => Level::WARN,
   };
 
@@ -66,9 +70,10 @@ fn main() {
     .with_line_number(false)
     .with_thread_ids(true)
     .with_target(false)
-    .with_filter(EnvFilter::new(format!("serial_proxy={}", level)));
+    .with_filter(EnvFilter::new(format!("serial_multiplexer={}", level)));
 
   Registry::default().with(fmt_layer).init();
+  debug!("args: {:?}", args);
 
   let addresses = vec![
     AddressPair {
@@ -77,7 +82,7 @@ fn main() {
     },
     AddressPair {
       listener_address: "127.0.0.1:1235".to_string(),
-      target_address: "tcpbin.com:4242".to_string(),
+      target_address: "www.google.com:443".to_string(),
     },
   ];
 
@@ -88,7 +93,7 @@ fn main() {
     .block_on(async {
       match args.command {
         Commands::Client { serial_path } => {
-          setup_client(&serial_path).await;
+          run_client(&serial_path).await;
         }
         Commands::Host { pipe_path } => {
           run_server(&pipe_path, addresses).await;
@@ -139,7 +144,7 @@ async fn run_server(pipe_path: &str, addresses: Vec<AddressPair>) {
     let pipe_to_client_push = pipe_to_client_push.clone();
     let client_to_pipe_pull = client_to_pipe_pull;
     async move {
-      pipe_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel).await;
+      sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel).await;
     }
   });
 
@@ -156,18 +161,7 @@ async fn run_server(pipe_path: &str, addresses: Vec<AddressPair>) {
   }
 
   let join = maybe_done(join_all(tasks));
-  match ctrl_c().await {
-    Ok(_) => {
-      info!("Received Ctrl+C. Shutting down.");
-      cancel.cancel();
-      if timeout(Duration::from_secs(2), join).await.is_err() {
-        info!("Failed to shutdown gracefully. Forcing shutdown.");
-      }
-    }
-    Err(e) => {
-      error!("Failed to handle Ctrl+C: {}", e);
-    }
-  }
+  run_indefinitely(cancel.clone(), join).await;
 }
 
 async fn setup_address_pair(
@@ -211,7 +205,7 @@ async fn setup_address_pair(
 }
 
 #[instrument(skip_all)]
-async fn setup_client(serial_path: &str) {
+async fn run_client(serial_path: &str) {
   let serial = tokio_serial::new(serial_path, 115200)
     .open_native_async()
     .expect("Failed to open serial port");
@@ -221,22 +215,38 @@ async fn setup_client(serial_path: &str) {
   let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(128);
 
   let serial_task =
-    task::spawn(serial_loop(serial, client_to_serial_pull, serial_to_client_push, cancel.clone()));
+    task::spawn(sink_loop(serial, serial_to_client_push, client_to_serial_pull, cancel.clone()));
 
   let initiator_task =
     task::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
 
   let join = maybe_done(join_all(vec![serial_task, initiator_task]));
-  match ctrl_c().await {
-    Ok(_) => {
-      info!("Received Ctrl+C. Shutting down.");
-      cancel.cancel();
-      if timeout(Duration::from_secs(2), join).await.is_err() {
+  run_indefinitely(cancel.clone(), join).await;
+}
+
+async fn run_indefinitely(
+  cancel: CancellationToken,
+  running_tasks: MaybeDone<JoinAll<JoinHandle<()>>>,
+) {
+  tokio::select! {
+    _ = cancel.cancelled() => {
+      if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
         info!("Failed to shutdown gracefully. Forcing shutdown.");
       }
     }
-    Err(e) => {
-      error!("Failed to handle Ctrl+C: {}", e);
+    c = ctrl_c() => {
+      info!("Received Ctrl+C. Shutting down.");
+      cancel.cancel();
+      match c {
+        Ok(_) => {
+          if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
+            info!("Failed to shutdown gracefully. Forcing shutdown.");
+          }
+        },
+        Err(e) => {
+          error!("Failed to handle Ctrl+C: {}", e);
+        }
+      }
     }
   }
 }

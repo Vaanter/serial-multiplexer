@@ -1,72 +1,21 @@
+use crate::common::{handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::ControlCode;
-use crate::server::{handle_client_read, process_sink_read};
-use crate::utils::{connect_downstream, handle_sink_read, handle_sink_write};
+use crate::utils::connect_downstream;
+use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
-use tokio_serial::SerialStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
+use tracing_attributes::instrument;
 
 pub struct Client {
   pub identifier: u64,
   pub downstream: TcpStream,
-}
-
-pub async fn serial_loop(
-  mut serial: SerialStream,
-  mut client_to_serial_pull: mpsc::Receiver<Bytes>,
-  serial_to_client_push: broadcast::Sender<Bytes>,
-  cancel: CancellationToken,
-) {
-  let mut serial_buf = BytesMut::zeroed(3072);
-  let mut stx_index: Option<usize> = None;
-  let mut unprocessed_data_start = 0;
-  loop {
-    serial_buf.resize(3072, 0);
-    tokio::select! {
-      biased;
-      _ = cancel.cancelled() => {
-        break;
-      }
-      data = client_to_serial_pull.recv() => {
-        if let Some(data) = data {
-          if let Err(e) = handle_sink_write(&mut serial, data).await {
-            error!("Failed to handle sink write: {}", e);
-            cancel.cancel();
-            break;
-          }
-        }
-      }
-      n = serial.read(&mut serial_buf) => {
-        match n {
-          Ok(0) => {
-            info!("Serial disconnected");
-            break;
-          }
-          Ok(n) => {
-            match handle_sink_read(n + unprocessed_data_start, &mut serial_buf, &mut stx_index, serial_to_client_push.clone()).await {
-              Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
-              Err(e) => {
-                error!("Failed to handle sink read: {}", e);
-                cancel.cancel();
-                break;
-              }
-            }
-          }
-          Err(e) => {
-            error!("Failed to read from serial: {}", e);
-            cancel.cancel();
-            break;
-          }
-        }
-      }
-    }
-  }
 }
 
 pub async fn client_initiator(
@@ -83,11 +32,18 @@ pub async fn client_initiator(
       data = serial_to_client_pull.recv() => {
         match data {
           Ok(data) => {
-            if let Ok(Some(client)) = timeout(Duration::from_secs(3),
+            match timeout(Duration::from_secs(3),
               initiate_client_connection(data, client_to_serial_push.clone())).await {
-              tokio::spawn(client_loop(client, client_to_serial_push.clone(), serial_to_client_pull.resubscribe(), cancel.clone()));
-            } else {
-              error!("Failed to initiate client connection");
+              Ok(Ok(Some(client))) => {
+                tokio::spawn(client_loop(client, client_to_serial_push.clone(), serial_to_client_pull.resubscribe(), cancel.clone()));
+              },
+              Ok(Err(e)) => {
+                error!("Failed to initiate client connection: {}", e);
+              },
+              Err(_) => {
+                error!("Failed to initiate client connection in time");
+              }
+              Ok(Ok(None)) => {}
             }
           }
           Err(e) => {
@@ -103,13 +59,13 @@ pub async fn client_initiator(
 async fn initiate_client_connection(
   data: Bytes,
   client_to_serial_push: mpsc::Sender<Bytes>,
-) -> Option<Client> {
+) -> anyhow::Result<Option<Client>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
       debug!("Received datagram: {:?}", datagram);
       // Not the first datagram for connection, ignore
       if datagram.code() != ControlCode::Initial {
-        return None;
+        return Ok(None);
       }
       let identifier = datagram.identifier();
       let target_address = match datagram
@@ -118,39 +74,33 @@ async fn initiate_client_connection(
       {
         Some(data) => data,
         None => {
-          return None;
+          bail!("Initial datagram did not contain target address");
         }
       };
       debug!("Connecting to downstream: {}", target_address);
-      let mut downstream = match connect_downstream(&target_address).await {
-        Ok(downstream) => downstream,
-        Err(e) => {
-          error!("Failed to connect to downstream: {}", e);
-          return None;
-        }
-      };
+      let mut downstream = connect_downstream(&target_address).await?;
       let ack = create_ack_datagram(identifier);
       let ack_datagram = datagram_from_bytes(&ack);
       debug!("Sending ACK: {:?}", ack_datagram);
       if let Err(e) = client_to_serial_push.send(ack).await {
-        error!("Failed to send ACK: {}", e);
         if let Err(e) = downstream.shutdown().await {
           error!("Failed to shutdown downstream after failing to send ACK: {}", e);
         }
-        return None;
+        bail!("Failed to send ACK : {}", e);
       }
-      Some(Client {
+      Ok(Some(Client {
         identifier,
         downstream,
-      })
+      }))
     }
     Err(e) => {
       debug!("Received invalid datagram, will ignore: {}", e);
-      None
+      Ok(None)
     }
   }
 }
 
+#[instrument(skip_all, fields(client_id = %client.identifier))]
 async fn client_loop(
   client: Client,
   client_to_serial_push: mpsc::Sender<Bytes>,
