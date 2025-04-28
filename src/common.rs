@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 pub(crate) const CONNECTION_BUFFER_SIZE: usize = 2usize.pow(15);
-const DATAGRAM_HEADER: [u8; 4] = [2, 200, 94, 2];
+const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
