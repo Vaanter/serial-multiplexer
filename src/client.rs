@@ -68,10 +68,7 @@ async fn initiate_client_connection(
       }
       debug!("Connection {} received {:?} datagram", datagram.identifier(), datagram.code());
       let identifier = datagram.identifier();
-      let target_address = match datagram
-        .data()
-        .map(|d| String::from_utf8_lossy(d.bytes()).to_string())
-      {
+      let target_address = match datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) {
         Some(data) => data,
         None => {
           bail!("Initial datagram did not contain target address");

@@ -59,11 +59,12 @@ pub async fn run_listener(
             };
 
             if let Err(e) = connection_sender.send(connection).await {
-              error!("Failed to finish setup for upstream {}", e);
+              error!("Failed to finish setup for connection {}: {}", identifier, e);
             }
           }
           Err(e) => {
             error!("Failed to establish client connection: {}", e);
+            break;
           }
         }
       }
@@ -195,6 +196,7 @@ pub async fn connection_loop(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::setup_tracing;
 
   #[tokio::test]
@@ -215,5 +217,38 @@ mod tests {
     assert_eq!(connection.target_address, target_address);
     assert_eq!(0, connection.identifier);
     assert_eq!(connection.client.peer_addr().unwrap(), test_connection.local_addr().unwrap());
+  }
+
+  #[tokio::test]
+  async fn test_initiate_connection_success() {
+    setup_tracing().await;
+    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
+    let (client_to_pipe_push, mut client_to_pipe_pull) = mpsc::channel::<Bytes>(256);
+    let target_address = "test:1234";
+    let identifier = 1;
+    let connection = Box::leak(Box::new(Connection {
+      identifier,
+      target_address: target_address.to_string(),
+      client: TcpStream::connect("tcpbin.com:4242").await.unwrap(),
+    }));
+
+    let initiate_handle = tokio::spawn({
+      let mut client_to_pipe_push = client_to_pipe_push.clone();
+      let mut pipe_to_client_pull = pipe_to_client_pull.resubscribe();
+      async move {
+        initiate_connection(connection, &mut client_to_pipe_push, &mut pipe_to_client_pull).await
+      }
+    });
+
+    let initial_datagram_bytes = client_to_pipe_pull.recv().await.unwrap();
+    let initial_datagram = root_as_datagram(&initial_datagram_bytes).unwrap();
+    let initial_data = initial_datagram.data().unwrap().bytes();
+    assert_eq!(target_address.as_bytes(), initial_data);
+    assert_eq!(identifier, initial_datagram.identifier());
+    pipe_to_client_push
+      .send(create_ack_datagram(initial_datagram.identifier()))
+      .unwrap();
+
+    assert!(initiate_handle.await.unwrap());
   }
 }

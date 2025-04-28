@@ -33,13 +33,18 @@ pub async fn sink_loop(
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
-        break;
+        return;
       }
       data = client_to_sink_pull.recv() => {
-        if let Some(data) = data {
-          if let Err(e) = handle_sink_write(&mut pipe, data).await {
-            error!("Failed to handle sink write: {}", e);
-            cancel.cancel();
+        match data {
+          Some(data) => {
+            if let Err(e) = handle_sink_write(&mut pipe, data).await {
+              error!("Failed to handle sink write: {}", e);
+              break;
+            }
+          },
+          None => {
+            info!("Sink receiver closed");
             break;
           }
         }
@@ -48,7 +53,6 @@ pub async fn sink_loop(
         match n {
           Ok(0) => {
             info!("Sink disconnected");
-            cancel.cancel();
             break;
           }
           Ok(n) => {
@@ -56,20 +60,19 @@ pub async fn sink_loop(
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
               Err(e) => {
                 error!("Failed to handle sink read: {}", e);
-                cancel.cancel();
                 break;
               }
             }
           }
           Err(e) => {
             error!("Failed to read from sink: {}", e);
-            cancel.cancel();
             break;
           }
         }
       }
     }
   }
+  cancel.cancel();
 }
 
 pub fn handle_sink_read(
@@ -215,6 +218,7 @@ pub async fn process_sink_read(
                 if let Err(e) = client.flush().await {
                   error!("Failed to flush client data after writing data: {}", e);
                 }
+                trace!("Sent {} bytes to client", data.len());
               }
               Err(e) => {
                 error!("Failed to write data to client: {}", e);
@@ -257,7 +261,9 @@ mod tests {
   use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
   use crate::test_utils::setup_tracing;
   use std::net::SocketAddr;
+  use std::time::Duration;
   use tokio::net::TcpListener;
+  use tokio::time::timeout;
 
   #[tokio::test]
   async fn test_handle_sink_read() {
@@ -358,7 +364,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_pipe_loop() {
+  async fn test_sink_loop_read_sink() {
     setup_tracing().await;
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
     let (pipe_to_client_push, mut pipe_to_client_pull) = broadcast::channel(256);
@@ -558,5 +564,47 @@ mod tests {
     let mut client = TcpStream::connect(server_address).await.unwrap();
     assert!(!process_sink_read(identifier, Ok(datagram), &mut client).await);
     handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_sink_read_channel_closed() {
+    setup_tracing().await;
+    let (sink_a, _sink_b) = tokio::io::duplex(4096);
+    let (pipe_to_client_push, _pipe_to_client_pull) = broadcast::channel(256);
+    let (_client_to_pipe_push, mut client_to_pipe_pull) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    client_to_pipe_pull.close();
+    let _pipe_loop_handle = tokio::spawn(sink_loop(
+      sink_a,
+      pipe_to_client_push.clone(),
+      client_to_pipe_pull,
+      cancel.clone(),
+    ));
+    assert!(
+      timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .is_ok()
+    );
+  }
+
+  #[tokio::test]
+  async fn test_sink_read_sink_closed() {
+    setup_tracing().await;
+    let (sink_a, mut sink_b) = tokio::io::duplex(4096);
+    let (pipe_to_client_push, _pipe_to_client_pull) = broadcast::channel(256);
+    let (_client_to_pipe_push, client_to_pipe_pull) = mpsc::channel(256);
+    let cancel = CancellationToken::new();
+    sink_b.shutdown().await.unwrap();
+    let _pipe_loop_handle = tokio::spawn(sink_loop(
+      sink_a,
+      pipe_to_client_push.clone(),
+      client_to_pipe_pull,
+      cancel.clone(),
+    ));
+    assert!(
+      timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .is_ok()
+    );
   }
 }
