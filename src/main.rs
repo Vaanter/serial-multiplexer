@@ -101,24 +101,6 @@ fn main() {
   Registry::default().with(fmt_layer).init();
   debug!("args: {:?}", args);
 
-  let addresses = config
-    .get_array("address_pairs")
-    .expect("Config should contain address pairs")
-    .into_iter()
-    .filter_map(|row| row.into_table().ok())
-    .enumerate()
-    .map(|(idx, pair)| AddressPair {
-      listener_address: pair
-        .get("listener_address")
-        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the listener address", idx))
-        .to_string(),
-      target_address: pair
-        .get("target_address")
-        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the target address", idx))
-        .to_string(),
-    })
-    .collect::<Vec<AddressPair>>();
-
   tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .build()
@@ -129,6 +111,27 @@ fn main() {
           run_client(&serial_path).await;
         }
         Commands::Host { pipe_path } => {
+          let addresses = config
+            .get_array("address_pairs")
+            .expect("Config should contain address pairs")
+            .into_iter()
+            .filter_map(|row| row.into_table().ok())
+            .enumerate()
+            .map(|(idx, pair)| AddressPair {
+              listener_address: pair
+                .get("listener_address")
+                .unwrap_or_else(|| {
+                  panic!("Address pair {} doesn't contain the listener address", idx)
+                })
+                .to_string(),
+              target_address: pair
+                .get("target_address")
+                .unwrap_or_else(|| {
+                  panic!("Address pair {} doesn't contain the target address", idx)
+                })
+                .to_string(),
+            })
+            .collect::<Vec<AddressPair>>();
           run_server(&pipe_path, addresses).await;
         }
       }
