@@ -54,6 +54,8 @@ enum Commands {
   Client {
     #[arg(short, long)]
     serial_path: String,
+    #[arg(short, long, default_value = "115200")]
+    baud_rate: u32,
   },
 }
 
@@ -107,8 +109,11 @@ fn main() {
     .expect("Setting up runtime must succeed")
     .block_on(async {
       match args.command {
-        Commands::Client { serial_path } => {
-          run_client(&serial_path).await;
+        Commands::Client {
+          serial_path,
+          baud_rate,
+        } => {
+          run_client(&serial_path, baud_rate).await;
         }
         Commands::Host { pipe_path } => {
           let addresses = config
@@ -236,8 +241,8 @@ async fn setup_address_pair(
 }
 
 #[instrument(skip_all)]
-async fn run_client(serial_path: &str) {
-  let serial = tokio_serial::new(serial_path, 115200)
+async fn run_client(serial_path: &str, baud_rate: u32) {
+  let serial = tokio_serial::new(serial_path, baud_rate)
     .open_native_async()
     .expect("Failed to open serial port");
 
