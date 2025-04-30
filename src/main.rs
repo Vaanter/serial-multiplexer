@@ -86,7 +86,7 @@ fn main() {
   let level = match args.verbose {
     1 => Level::INFO,
     2 => Level::DEBUG,
-    3 => Level::TRACE,
+    n if n > 2 => Level::TRACE,
     _ => Level::WARN,
   };
 
@@ -104,7 +104,7 @@ fn main() {
   let fmt_layer = tracing_subscriber::fmt::Layer::default()
     .with_writer(writer)
     .with_file(false)
-    .with_ansi(true)
+    .with_ansi(config.get_string("log_file").is_err())
     .with_line_number(false)
     .with_thread_ids(true)
     .with_target(false)
