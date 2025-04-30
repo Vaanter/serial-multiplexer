@@ -37,21 +37,31 @@ mod utils;
 #[derive(Parser, Debug)]
 #[clap(version, about, author)]
 struct Args {
+  /// Mode in which the program will run. Either host or guest
   #[clap(subcommand)]
   command: Commands,
-  #[clap(short, long, default_value = "4", action = clap::ArgAction::Count)]
+  /// Logging verbosity, default is WARN, each repetition increases the logging level.
+  /// 1 = INFO, 2 = DEBUG, 3+ = TRACE
+  #[clap(short, long, default_value = "0", action = clap::ArgAction::Count)]
   verbose: u8,
+  /// Path to the config file
   #[clap(short, long, default_value = "config.toml")]
   config: String,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+  /// Initializes the application in host mode to listen on configured network addresses.
+  /// Requires a functional pipe connection from VirtualBox.
+  /// Note: This mode is Windows-exclusive.
   Host {
     #[arg(short, long)]
     pipe_path: String,
   },
-  Client {
+  /// Initializes the application in guest mode awaiting data from serial port.
+  /// Requires a serial port.
+  Guest {
+    /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
     #[arg(short, long)]
     serial_path: String,
     #[arg(short, long, default_value = "115200")]
@@ -109,7 +119,7 @@ fn main() {
     .expect("Setting up runtime must succeed")
     .block_on(async {
       match args.command {
-        Commands::Client {
+        Commands::Guest {
           serial_path,
           baud_rate,
         } => {
