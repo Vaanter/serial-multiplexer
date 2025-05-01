@@ -9,6 +9,7 @@ enum ControlCode: ubyte {
 
 table Datagram {
   identifier: uint64;
+  sequence: uint64;
   code: ControlCode;
   data: [ubyte];
 }

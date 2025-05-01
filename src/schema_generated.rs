@@ -134,8 +134,9 @@ pub mod serial_proxy {
 
   impl<'a> Datagram<'a> {
     pub const VT_IDENTIFIER: flatbuffers::VOffsetT = 4;
-    pub const VT_CODE: flatbuffers::VOffsetT = 6;
-    pub const VT_DATA: flatbuffers::VOffsetT = 8;
+    pub const VT_SEQUENCE: flatbuffers::VOffsetT = 6;
+    pub const VT_CODE: flatbuffers::VOffsetT = 8;
+    pub const VT_DATA: flatbuffers::VOffsetT = 10;
 
     #[inline]
     pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -147,6 +148,7 @@ pub mod serial_proxy {
       args: &'args DatagramArgs<'args>,
     ) -> flatbuffers::WIPOffset<Datagram<'bldr>> {
       let mut builder = DatagramBuilder::new(_fbb);
+      builder.add_sequence(args.sequence);
       builder.add_identifier(args.identifier);
       if let Some(x) = args.data {
         builder.add_data(x);
@@ -164,6 +166,18 @@ pub mod serial_proxy {
         self
           ._tab
           .get::<u64>(Datagram::VT_IDENTIFIER, Some(0))
+          .unwrap()
+      }
+    }
+    #[inline]
+    pub fn sequence(&self) -> u64 {
+      // Safety:
+      // Created from valid Table for this object
+      // which contains a valid value in this slot
+      unsafe {
+        self
+          ._tab
+          .get::<u64>(Datagram::VT_SEQUENCE, Some(0))
           .unwrap()
       }
     }
@@ -201,6 +215,7 @@ pub mod serial_proxy {
       use self::flatbuffers::Verifiable;
       v.visit_table(pos)?
         .visit_field::<u64>("identifier", Self::VT_IDENTIFIER, false)?
+        .visit_field::<u64>("sequence", Self::VT_SEQUENCE, false)?
         .visit_field::<ControlCode>("code", Self::VT_CODE, false)?
         .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
           "data",
@@ -213,6 +228,7 @@ pub mod serial_proxy {
   }
   pub struct DatagramArgs<'a> {
     pub identifier: u64,
+    pub sequence: u64,
     pub code: ControlCode,
     pub data: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
   }
@@ -221,6 +237,7 @@ pub mod serial_proxy {
     fn default() -> Self {
       DatagramArgs {
         identifier: 0,
+        sequence: 0,
         code: ControlCode::Ack,
         data: None,
       }
@@ -237,6 +254,12 @@ pub mod serial_proxy {
       self
         .fbb_
         .push_slot::<u64>(Datagram::VT_IDENTIFIER, identifier, 0);
+    }
+    #[inline]
+    pub fn add_sequence(&mut self, sequence: u64) {
+      self
+        .fbb_
+        .push_slot::<u64>(Datagram::VT_SEQUENCE, sequence, 0);
     }
     #[inline]
     pub fn add_code(&mut self, code: ControlCode) {
@@ -269,6 +292,7 @@ pub mod serial_proxy {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
       let mut ds = f.debug_struct("Datagram");
       ds.field("identifier", &self.identifier());
+      ds.field("sequence", &self.sequence());
       ds.field("code", &self.code());
       ds.field("data", &self.data());
       ds.finish()

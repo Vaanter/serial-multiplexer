@@ -1,5 +1,5 @@
 use crate::client::client_initiator;
-use crate::server::{Connection, connection_initiator, run_listener};
+use crate::server::{connection_initiator, run_listener};
 use crate::utils::create_upstream_listener;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -56,14 +56,14 @@ enum Commands {
   /// Note: This mode is Windows-exclusive.
   Host {
     #[arg(short, long)]
-    pipe_path: String,
+    pipe_path: Vec<String>,
   },
   /// Initializes the application in guest mode awaiting data from serial port.
   /// Requires a serial port.
   Guest {
     /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
     #[arg(short, long)]
-    serial_path: String,
+    serial_path: Vec<String>,
     #[arg(short, long, default_value = "115200")]
     baud_rate: u32,
   },
@@ -123,7 +123,7 @@ fn main() {
           serial_path,
           baud_rate,
         } => {
-          run_client(&serial_path, baud_rate).await;
+          run_client(serial_path, baud_rate).await;
         }
         Commands::Host { pipe_path } => {
           let addresses = config
@@ -147,7 +147,7 @@ fn main() {
                 .to_string(),
             })
             .collect::<Vec<AddressPair>>();
-          run_server(&pipe_path, addresses).await;
+          run_server(pipe_path, addresses).await;
         }
       }
     });
@@ -155,47 +155,53 @@ fn main() {
 
 #[cfg(unix)]
 #[instrument(skip_all)]
-async fn run_server(_pipe_path: &str, _addresses: Vec<AddressPair>) {
+async fn run_server(_pipe_path: Vec<String>, _addresses: Vec<AddressPair>) {
   panic!("Running on linux is not supported.");
 }
 
 #[cfg(windows)]
 #[instrument(skip_all)]
-async fn run_server(pipe_path: &str, addresses: Vec<AddressPair>) {
+async fn run_server(pipe_path: Vec<String>, addresses: Vec<AddressPair>) {
   let cancel = CancellationToken::new();
-  let (client_to_pipe_push, client_to_pipe_pull) = mpsc::channel::<Bytes>(128);
+  let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(128);
   let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(128);
 
+  let mut pipes = Vec::new();
   let mut retry_count = 0;
-  let pipe = loop {
-    match server::prepare_pipe(pipe_path).await {
-      Ok(pipe) => {
-        info!("Pipe is ready");
-        break pipe;
-      }
-      Err(err) => {
-        trace!("Failed to prepare pipe: {}", err);
-        if retry_count >= 10 {
-          return;
+  for pipe_path in pipe_path {
+    loop {
+      match server::prepare_pipe(&pipe_path).await {
+        Ok(pipe) => {
+          info!("Pipe {} is ready", &pipe_path);
+          pipes.push(pipe);
+          break;
         }
-        sleep(Duration::from_millis(100)).await;
-        retry_count += 1;
-        continue;
-      }
-    };
-  };
-
-  let pipe_task = tokio::spawn({
-    let cancel = cancel.clone();
-    let pipe_to_client_push = pipe_to_client_push.clone();
-    let client_to_pipe_pull = client_to_pipe_pull;
-    async move {
-      sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel).await;
+        Err(err) => {
+          trace!("Failed to prepare pipe: {}", err);
+          if retry_count >= 10 {
+            break;
+          }
+          sleep(Duration::from_millis(100)).await;
+          retry_count += 1;
+          continue;
+        }
+      };
     }
-  });
+  }
 
   let tasks = FuturesUnordered::new();
-  tasks.push(pipe_task);
+  for pipe in pipes {
+    let pipe_task = tokio::spawn({
+      let cancel = cancel.clone();
+      let pipe_to_client_push = pipe_to_client_push.clone();
+      let client_to_pipe_pull = client_to_pipe_pull.clone();
+      async move {
+        sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel).await;
+      }
+    });
+    tasks.push(pipe_task);
+  }
+
   for pair in addresses.into_iter() {
     let client_to_pipe_push = client_to_pipe_push.clone();
     let pipe_to_client_pull = pipe_to_client_pull.resubscribe();
@@ -210,18 +216,22 @@ async fn run_server(pipe_path: &str, addresses: Vec<AddressPair>) {
   run_indefinitely(cancel.clone(), join).await;
 }
 
+#[instrument(skip_all)]
 async fn setup_address_pair(
   pair: AddressPair,
-  client_to_pipe_push: mpsc::Sender<Bytes>,
+  client_to_pipe_push: async_channel::Sender<Bytes>,
   pipe_to_client_pull: broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
   let listener_address = pair.listener_address;
   let target_address = pair.target_address;
-  let (connection_sender, connection_receiver) = mpsc::channel::<Connection>(128);
+  let (connection_sender, connection_receiver) = mpsc::channel(128);
 
   let listener = match create_upstream_listener(&listener_address).await {
-    Ok(Some(listener)) => listener,
+    Ok(Some(listener)) => {
+      info!("Created listener at {} for {}", listener_address, target_address);
+      listener
+    }
     Ok(None) => {
       error!("Failed to create listener for address {}.", listener_address);
       return;
@@ -251,22 +261,35 @@ async fn setup_address_pair(
 }
 
 #[instrument(skip_all)]
-async fn run_client(serial_path: &str, baud_rate: u32) {
-  let serial = tokio_serial::new(serial_path, baud_rate)
-    .open_native_async()
-    .expect("Failed to open serial port");
+async fn run_client(serial_paths: Vec<String>, baud_rate: u32) {
+  let mut serials = Vec::new();
+  for serial_path in serial_paths {
+    let serial = tokio_serial::new(serial_path, baud_rate)
+      .open_native_async()
+      .expect("Failed to open serial port");
+    serials.push(serial);
+  }
 
   let cancel = CancellationToken::new();
-  let (client_to_serial_push, client_to_serial_pull) = mpsc::channel::<Bytes>(128);
+  let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded::<Bytes>(128);
   let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(128);
+  let tasks = FuturesUnordered::new();
 
-  let serial_task =
-    task::spawn(sink_loop(serial, serial_to_client_push, client_to_serial_pull, cancel.clone()));
+  for serial in serials {
+    let serial_task = task::spawn(sink_loop(
+      serial,
+      serial_to_client_push.clone(),
+      client_to_serial_pull.clone(),
+      cancel.clone(),
+    ));
+    tasks.push(serial_task);
+  }
 
   let initiator_task =
     task::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
+  tasks.push(initiator_task);
 
-  let join = maybe_done(join_all(vec![serial_task, initiator_task]));
+  let join = maybe_done(join_all(tasks));
   run_indefinitely(cancel.clone(), join).await;
 }
 

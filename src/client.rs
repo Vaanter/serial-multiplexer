@@ -1,3 +1,4 @@
+use crate::common::Connection;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::ControlCode;
@@ -6,21 +7,15 @@ use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 use tracing_attributes::instrument;
 
-pub struct Client {
-  pub identifier: u64,
-  pub downstream: TcpStream,
-}
-
 pub async fn client_initiator(
   mut serial_to_client_pull: broadcast::Receiver<Bytes>,
-  client_to_serial_push: mpsc::Sender<Bytes>,
+  client_to_serial_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
   loop {
@@ -58,8 +53,8 @@ pub async fn client_initiator(
 
 async fn initiate_client_connection(
   data: Bytes,
-  client_to_serial_push: mpsc::Sender<Bytes>,
-) -> anyhow::Result<Option<Client>> {
+  client_to_serial_push: async_channel::Sender<Bytes>,
+) -> anyhow::Result<Option<Connection>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
       // Not the first datagram for connection, ignore
@@ -76,7 +71,7 @@ async fn initiate_client_connection(
       };
       debug!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;
-      let ack = create_ack_datagram(identifier);
+      let ack = create_ack_datagram(identifier, 0);
       let ack_datagram = datagram_from_bytes(&ack);
       debug!("Sending ACK: {:?}", ack_datagram);
       if let Err(e) = client_to_serial_push.send(ack).await {
@@ -85,10 +80,7 @@ async fn initiate_client_connection(
         }
         bail!("Failed to send ACK : {}", e);
       }
-      Ok(Some(Client {
-        identifier,
-        downstream,
-      }))
+      Ok(Some(Connection::new(identifier, downstream)))
     }
     Err(e) => {
       debug!("Received invalid datagram, will ignore: {}", e);
@@ -97,15 +89,13 @@ async fn initiate_client_connection(
   }
 }
 
-#[instrument(skip_all, fields(client_id = %client.identifier))]
+#[instrument(skip_all, fields(client_id = %connection.identifier))]
 async fn client_loop(
-  client: Client,
-  client_to_serial_push: mpsc::Sender<Bytes>,
+  mut connection: Connection,
+  client_to_serial_push: async_channel::Sender<Bytes>,
   mut serial_to_client_pull: broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
-  let identifier = client.identifier;
-  let mut downstream = client.downstream;
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
@@ -115,16 +105,17 @@ async fn client_loop(
         break;
       }
       data = serial_to_client_pull.recv() => {
-        if process_sink_read(identifier, data, &mut downstream).await {
+        if process_sink_read(&mut connection, data).await {
           break;
         }
       }
-      n = downstream.read(&mut tcp_buf) => {
-        if handle_client_read(identifier, client_to_serial_push.clone(), n, &mut tcp_buf).await {
+      n = connection.client.read(&mut tcp_buf) => {
+        connection.sequence += 1;
+        if handle_client_read(connection.identifier, connection.sequence,  client_to_serial_push.clone(), n, &mut tcp_buf).await {
           break;
         }
       }
     }
   }
-  debug!("Client {} disconnected", identifier);
+  debug!("Client {} disconnected", connection.identifier);
 }

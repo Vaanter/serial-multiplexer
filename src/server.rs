@@ -1,3 +1,4 @@
+use crate::common::Connection;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
@@ -6,9 +7,9 @@ use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -16,12 +17,6 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_attributes::instrument;
 
 static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-pub struct Connection {
-  identifier: u64,
-  target_address: String,
-  client: TcpStream,
-}
 
 #[cfg(windows)]
 pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
@@ -32,10 +27,11 @@ pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
     .map_err(|e| e.into())
 }
 
+#[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
 pub async fn run_listener(
   listener: TcpListener,
   target_address: String,
-  connection_sender: mpsc::Sender<Connection>,
+  connection_sender: mpsc::Sender<(Connection, String)>,
   cancel: CancellationToken,
 ) {
   let listener_address = listener.local_addr().unwrap();
@@ -52,13 +48,9 @@ pub async fn run_listener(
             info!("Client connected: {}", client_address);
 
             let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-            let connection = Connection {
-              identifier,
-              target_address: target_address.clone(),
-              client,
-            };
+            let connection = Connection::new(identifier, client);
 
-            if let Err(e) = connection_sender.send(connection).await {
+            if let Err(e) = connection_sender.send((connection, target_address.clone())).await {
               error!("Failed to finish setup for connection {}: {}", identifier, e);
             }
           }
@@ -72,10 +64,11 @@ pub async fn run_listener(
   }
 }
 
+#[instrument(skip_all)]
 pub async fn connection_initiator(
-  mut client_to_pipe_push: mpsc::Sender<Bytes>,
+  mut client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  mut connection_receiver: mpsc::Receiver<Connection>,
+  mut connection_receiver: mpsc::Receiver<(Connection, String)>,
   cancellation_token: CancellationToken,
 ) {
   loop {
@@ -86,10 +79,10 @@ pub async fn connection_initiator(
       }
       data = connection_receiver.recv() => {
         match data {
-          Some(connection) => {
-            info!("Starting connection to {}", connection.target_address);
+          Some((connection, target_address)) => {
+            info!("Starting connection to {}", &target_address);
             pipe_to_client_pull = pipe_to_client_pull.resubscribe(); // clean up previous datagrams
-            if !initiate_connection(&connection, &mut client_to_pipe_push, &mut pipe_to_client_pull).await {
+            if !initiate_connection(&connection, target_address, &mut client_to_pipe_push, &mut pipe_to_client_pull).await {
               info!("Failed to initialize connection, closing client");
               let mut client = connection.client;
               if let Err(e) = client.shutdown().await {
@@ -111,10 +104,11 @@ pub async fn connection_initiator(
 
 async fn initiate_connection(
   connection: &Connection,
-  client_to_pipe_push: &mut mpsc::Sender<Bytes>,
+  target_address: String,
+  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> bool {
-  let initial_datagram = create_initial_datagram(connection.identifier, &connection.target_address);
+  let initial_datagram = create_initial_datagram(connection.identifier, 0, &target_address);
   trace!("Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
   if let Err(e) = client_to_pipe_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);
@@ -159,38 +153,37 @@ async fn initiate_connection(
 
 #[instrument(skip_all, fields(client_id = %connection.identifier))]
 pub async fn connection_loop(
-  connection: Connection,
+  mut connection: Connection,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  client_to_pipe_push: mpsc::Sender<Bytes>,
+  client_to_pipe_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
-  let identifier = connection.identifier;
-  let mut client = connection.client;
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
-        if let Err(e) = client.shutdown().await {
+        if let Err(e) = connection.client.shutdown().await {
           error!("Failed to shutdown client after server shutdown: {}", e);
         }
         info!("Connection cancelled");
         break;
       }
       data = pipe_to_client_pull.recv() => {
-        if process_sink_read(identifier, data, &mut client).await {
+        if process_sink_read(&mut connection, data).await {
           break;
         }
       }
-      n = client.read(&mut tcp_buf) => {
-        if handle_client_read(identifier, client_to_pipe_push.clone(), n, &mut tcp_buf).await {
+      n = connection.client.read(&mut tcp_buf) => {
+        connection.sequence += 1;
+        if handle_client_read(connection.identifier, connection.sequence, client_to_pipe_push.clone(), n, &mut tcp_buf).await {
           break;
         }
       }
     }
   }
-  debug!("Connection {} loop ending", identifier);
+  debug!("Connection {} loop ending", connection.identifier);
 }
 
 #[cfg(test)]
@@ -198,6 +191,7 @@ mod tests {
   use super::*;
   use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::setup_tracing;
+  use tokio::net::TcpStream;
 
   #[tokio::test]
   async fn test_run_listener_smoke() {
@@ -205,7 +199,7 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_address = listener.local_addr().unwrap();
     let target_address = "tcpbin.com:4242".to_string();
-    let (connection_sender, mut connection_receiver) = mpsc::channel::<Connection>(1);
+    let (connection_sender, mut connection_receiver) = mpsc::channel::<(Connection, String)>(1);
     tokio::spawn({
       let target_address = target_address.clone();
       async move {
@@ -213,8 +207,8 @@ mod tests {
       }
     });
     let test_connection = TcpStream::connect(listener_address).await.unwrap();
-    let connection = connection_receiver.recv().await.unwrap();
-    assert_eq!(connection.target_address, target_address);
+    let (connection, target_address_received) = connection_receiver.recv().await.unwrap();
+    assert_eq!(target_address_received, target_address);
     assert_eq!(0, connection.identifier);
     assert_eq!(connection.client.peer_addr().unwrap(), test_connection.local_addr().unwrap());
   }
@@ -223,20 +217,23 @@ mod tests {
   async fn test_initiate_connection_success() {
     setup_tracing().await;
     let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
-    let (client_to_pipe_push, mut client_to_pipe_pull) = mpsc::channel::<Bytes>(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
     let target_address = "test:1234";
     let identifier = 1;
-    let connection = Box::leak(Box::new(Connection {
-      identifier,
-      target_address: target_address.to_string(),
-      client: TcpStream::connect("tcpbin.com:4242").await.unwrap(),
-    }));
+    let connection =
+      Connection::new(identifier, TcpStream::connect("tcpbin.com:4242").await.unwrap());
 
     let initiate_handle = tokio::spawn({
       let mut client_to_pipe_push = client_to_pipe_push.clone();
       let mut pipe_to_client_pull = pipe_to_client_pull.resubscribe();
       async move {
-        initiate_connection(connection, &mut client_to_pipe_push, &mut pipe_to_client_pull).await
+        initiate_connection(
+          &connection,
+          target_address.to_string(),
+          &mut client_to_pipe_push,
+          &mut pipe_to_client_pull,
+        )
+        .await
       }
     });
 
@@ -246,7 +243,7 @@ mod tests {
     assert_eq!(target_address.as_bytes(), initial_data);
     assert_eq!(identifier, initial_datagram.identifier());
     pipe_to_client_push
-      .send(create_ack_datagram(initial_datagram.identifier()))
+      .send(create_ack_datagram(initial_datagram.identifier(), 0))
       .unwrap();
 
     assert!(initiate_handle.await.unwrap());

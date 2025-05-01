@@ -7,7 +7,6 @@ pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<Option<T
   for upstream_address in upstream_addresses {
     match TcpListener::bind(upstream_address).await {
       Ok(listener) => {
-        debug!("Listening on {}", upstream_address);
         return Ok(Some(listener));
       }
       Err(e) => {
