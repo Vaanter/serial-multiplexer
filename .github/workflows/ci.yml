@@ -45,7 +45,7 @@ jobs:
       - name: Strip binary
         run: strip target/release/${{ env.BINARY_NAME }}
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}
           path: target/release/${{ env.BINARY_NAME }}
@@ -71,7 +71,7 @@ jobs:
       - name: Build in release mode
         run: cargo build --release
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}
           path: target/release/${{ env.BINARY_NAME }}.exe
@@ -91,12 +91,12 @@ jobs:
           VERSION=$(grep -m1 'version = ' Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Download Linux artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}
           path: ./
       - name: Download Windows artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}
           path: ./
