@@ -109,7 +109,7 @@ jobs:
           mv ${{ env.BINARY_NAME }} ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux
           mv ${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows.exe
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux
@@ -119,3 +119,4 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          fail_on_unmatched_files: true
