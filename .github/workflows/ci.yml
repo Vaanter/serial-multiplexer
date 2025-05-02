@@ -29,12 +29,14 @@ jobs:
     needs: [test-linux]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Cache
+        uses: actions/cache@v4
         with:
-          profile: minimal
-          toolchain: stable
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/checkout@v4
       - name: Extract version from Cargo.toml
         id: version
         run: |
@@ -56,12 +58,14 @@ jobs:
     needs: [test-windows]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Cache
+        uses: actions/cache@v4
         with:
-          profile: minimal
-          toolchain: stable
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/checkout@v4
       - name: Extract version from Cargo.toml
         id: version
         shell: bash
