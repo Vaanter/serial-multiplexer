@@ -193,9 +193,15 @@ pub async fn handle_client_read(
     }
     Ok(n) => {
       debug!("Read {} bytes from client", n);
-      let data = read_buf.split_to(n).freeze();
+      let data = Bytes::copy_from_slice(&read_buf[..n]);
+      read_buf[..n].zeroize();
       let datagram = create_data_datagram(identifier, sequence, &data);
-      trace!("Sending DATA datagram to sink {:?} with seq: {}", datagram, sequence);
+      trace!(
+        "Sending DATA datagram of {} bytes to sink {:?} with seq: {}",
+        datagram.len(),
+        datagram,
+        sequence
+      );
       if let Err(e) = client_to_pipe_push.send(datagram).await {
         error!("Failed to send DATA datagram for connection {}: {}", identifier, e);
         return true;
@@ -221,7 +227,7 @@ pub async fn process_sink_read(
             // Not our datagram, ignore it
             return false;
           }
-          let mut datagram_sequence = datagram.sequence();
+          let datagram_sequence = datagram.sequence();
           debug!(
             "Received {:?} datagram with seq: {} and {} bytes of data",
             datagram.code(),
@@ -229,35 +235,36 @@ pub async fn process_sink_read(
             datagram.data().map(|d| d.len()).unwrap_or(0)
           );
           trace!("Datagrams in queue: {:?}", connection.datagram_queue);
-          if datagram_sequence >= (connection.largest_sent + 2) {
+          if datagram_sequence >= (connection.largest_processed + 2) {
             trace!(
               "Received datagram out of order, seq: {}, largest sent: {}",
-              datagram_sequence, connection.largest_sent
+              datagram_sequence, connection.largest_processed
             );
             connection
               .datagram_queue
               .insert(datagram_sequence, data_buf);
             return false;
-          } else if datagram_sequence == (connection.largest_sent + 1) {
+          } else if datagram_sequence == (connection.largest_processed + 1) {
             trace!(
               "Received datagram in order, seq: {}, largest sent: {}",
-              datagram_sequence, connection.largest_sent
+              datagram_sequence, connection.largest_processed
             );
-            let mut to_send = Vec::new();
-            to_send.push(data_buf);
-            while let Some(datagram) = connection.datagram_queue.remove(&(datagram_sequence + 1)) {
-              datagram_sequence += 1;
-              to_send.push(datagram);
-            }
-            trace!("Sending {} datagrams to client", to_send.len());
-            for datagram in to_send.iter().filter_map(|dg| root_as_datagram(dg).ok()) {
+            connection
+              .datagram_queue
+              .insert(datagram_sequence, data_buf);
+            while let Some(datagram_buf) = connection
+              .datagram_queue
+              .remove(&(connection.largest_processed + 1))
+            {
+              connection.largest_processed += 1;
+              let datagram = match root_as_datagram(&datagram_buf) {
+                Ok(datagram) => datagram,
+                Err(_) => continue,
+              };
               if let Some(data) = datagram.data() {
                 trace!("Sending data to client, size {}", data.len());
                 match connection.client.write_all(data.bytes()).await {
                   Ok(_) => {
-                    if let Err(e) = connection.client.flush().await {
-                      error!("Failed to flush client data after writing data: {}", e);
-                    }
                     trace!("Sent {} bytes to client", data.len());
                   }
                   Err(e) => {
@@ -266,13 +273,15 @@ pub async fn process_sink_read(
                   }
                 }
               }
-              connection.largest_sent += 1;
               if datagram.code() == ControlCode::Close {
                 if let Err(e) = connection.client.shutdown().await {
                   error!("Failed to shutdown client after receiving CLOSE: {}", e);
                 }
                 return true;
               }
+            }
+            if let Err(e) = connection.client.flush().await {
+              error!("Failed to flush client data after writing data: {}", e);
             }
           }
           false
@@ -569,6 +578,7 @@ mod tests {
     assert_eq!(datagram.identifier(), identifier);
     assert_eq!(datagram.code(), ControlCode::Data);
     assert_eq!(datagram.data().unwrap().bytes(), contents.as_bytes());
+    assert_eq!(bytes, BytesMut::zeroed(bytes.len()));
   }
 
   #[tokio::test]
