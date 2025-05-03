@@ -190,7 +190,7 @@ pub async fn connection_loop(
 mod tests {
   use super::*;
   use crate::protocol_utils::create_ack_datagram;
-  use crate::test_utils::setup_tracing;
+  use crate::test_utils::{run_echo, setup_tracing};
   use tokio::net::TcpStream;
 
   #[tokio::test]
@@ -198,8 +198,8 @@ mod tests {
     setup_tracing().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_address = listener.local_addr().unwrap();
-    let target_address = "tcpbin.com:4242".to_string();
-    let (connection_sender, mut connection_receiver) = mpsc::channel::<(Connection, String)>(1);
+    let (target_address, _) = run_echo().await;
+    let target_address = target_address.to_string();
     let (connection_sender, mut connection_receiver) = mpsc::channel(1);
     tokio::spawn({
       let target_address = target_address.clone();
@@ -217,14 +217,12 @@ mod tests {
   #[tokio::test]
   async fn test_initiate_connection_success() {
     setup_tracing().await;
-    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
     let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel(256);
     let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
+    let (address, _) = run_echo().await;
     let target_address = "test:1234";
     let identifier = 1;
-    let connection =
-      Connection::new(identifier, TcpStream::connect("tcpbin.com:4242").await.unwrap());
+    let connection = Connection::new(identifier, TcpStream::connect(address).await.unwrap());
 
     let initiate_handle = tokio::spawn({
       let mut client_to_pipe_push = client_to_pipe_push.clone();

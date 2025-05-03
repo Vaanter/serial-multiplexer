@@ -1,4 +1,8 @@
+use bytes::BytesMut;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::Level;
 
@@ -19,4 +23,31 @@ pub async fn setup_tracing() {
     .with_target(false)
     .finish();
   let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+pub async fn run_echo() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0")
+    .await
+    .expect("Echo listener should run");
+  let addr = listener.local_addr().expect("Echo listener local_addr");
+  let listener_task = tokio::spawn(async move {
+    loop {
+      let (mut socket, _) = listener.accept().await.expect("Accept failed");
+      tokio::spawn(async move {
+        let mut buf = BytesMut::zeroed(4096);
+        loop {
+          match socket.read(&mut buf).await.expect("Read should succeed") {
+            0 => break,
+            n => {
+              socket
+                .write_all(&buf[..n])
+                .await
+                .expect("Write should succeed");
+            }
+          }
+        }
+      });
+    }
+  });
+  (addr, listener_task)
 }
