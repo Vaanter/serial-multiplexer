@@ -109,9 +109,9 @@ async fn client_loop(
           break;
         }
       }
-      n = connection.client.read(&mut tcp_buf) => {
+      bytes_read = connection.client.read(&mut tcp_buf) => {
         connection.sequence += 1;
-        if handle_client_read(connection.identifier, connection.sequence,  client_to_serial_push.clone(), n, &mut tcp_buf).await {
+        if handle_client_read(connection.identifier, connection.sequence,  client_to_serial_push.clone(), bytes_read, &mut tcp_buf).await {
           break;
         }
       }

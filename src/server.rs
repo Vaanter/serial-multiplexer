@@ -175,9 +175,9 @@ pub async fn connection_loop(
           break;
         }
       }
-      n = connection.client.read(&mut tcp_buf) => {
+      bytes_read = connection.client.read(&mut tcp_buf) => {
         connection.sequence += 1;
-        if handle_client_read(connection.identifier, connection.sequence, client_to_pipe_push.clone(), n, &mut tcp_buf).await {
+        if handle_client_read(connection.identifier, connection.sequence, client_to_pipe_push.clone(), bytes_read, &mut tcp_buf).await {
           break;
         }
       }
@@ -200,6 +200,7 @@ mod tests {
     let listener_address = listener.local_addr().unwrap();
     let target_address = "tcpbin.com:4242".to_string();
     let (connection_sender, mut connection_receiver) = mpsc::channel::<(Connection, String)>(1);
+    let (connection_sender, mut connection_receiver) = mpsc::channel(1);
     tokio::spawn({
       let target_address = target_address.clone();
       async move {
@@ -218,6 +219,8 @@ mod tests {
     setup_tracing().await;
     let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
     let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
     let target_address = "test:1234";
     let identifier = 1;
     let connection =

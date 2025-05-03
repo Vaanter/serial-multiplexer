@@ -25,7 +25,7 @@ pub struct Connection {
   pub identifier: u64,
   pub client: TcpStream,
   pub sequence: u64,
-  pub largest_sent: u64,
+  pub largest_processed: u64,
   pub datagram_queue: BTreeMap<u64, Bytes>,
 }
 
@@ -35,7 +35,7 @@ impl Connection {
       identifier,
       client,
       sequence: 0,
-      largest_sent: 0,
+      largest_processed: 0,
       datagram_queue: BTreeMap::new(),
     }
   }
@@ -145,10 +145,10 @@ pub fn handle_sink_read(
         unprocessed_data_start
       );
       let buffer_end = sink_buf.len();
-      trace!("Buffer before shrinking: {:?}", &sink_buf);
+      trace!("Buffer before copying and zeroing: {:?}", &sink_buf);
       sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
       sink_buf[unprocessed_bytes..buffer_end].zeroize();
-      trace!("Buffer after shrinking: {:?}", &sink_buf);
+      trace!("Buffer after copying and zeroing: {:?}", &sink_buf);
     }
   }
   Ok(unprocessed_bytes)
@@ -626,7 +626,7 @@ mod tests {
     let datagram1 = create_data_datagram(identifier, 1, &data1);
     let datagram2 = create_data_datagram(identifier, 2, &data2);
 
-    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let (address_sender, mut address_receiver) = mpsc::channel(1);
     let handle = tokio::spawn(async move {
       let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
       let address = listener.local_addr().unwrap();
