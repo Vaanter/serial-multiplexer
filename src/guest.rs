@@ -29,8 +29,8 @@ pub async fn client_initiator(
           Ok(data) => {
             match timeout(Duration::from_secs(3),
               initiate_client_connection(data, client_to_serial_push.clone())).await {
-              Ok(Ok(Some(client))) => {
-                tokio::spawn(client_loop(client, client_to_serial_push.clone(), serial_to_client_pull.resubscribe(), cancel.clone()));
+              Ok(Ok(Some(connection))) => {
+                tokio::spawn(guest_loop(connection, client_to_serial_push.clone(), serial_to_client_pull.resubscribe(), cancel.clone()));
               },
               Ok(Err(e)) => {
                 error!("Failed to initiate client connection: {}", e);
@@ -43,6 +43,7 @@ pub async fn client_initiator(
           }
           Err(e) => {
             error!("Failed to receive data from serial port: {}", e);
+            cancel.cancel();
             break;
           }
         }
@@ -89,8 +90,8 @@ async fn initiate_client_connection(
   }
 }
 
-#[instrument(skip_all, fields(client_id = %connection.identifier))]
-async fn client_loop(
+#[instrument(skip_all, fields(connection_id = %connection.identifier))]
+async fn guest_loop(
   mut connection: Connection,
   client_to_serial_push: async_channel::Sender<Bytes>,
   mut serial_to_client_pull: broadcast::Receiver<Bytes>,

@@ -1,5 +1,5 @@
-use crate::client::client_initiator;
-use crate::server::{connection_initiator, run_listener};
+use crate::guest::client_initiator;
+use crate::host::{connection_initiator, run_listener};
 use crate::utils::create_upstream_listener;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -24,12 +24,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-mod client;
 mod common;
+mod guest;
+mod host;
 mod protocol_utils;
 #[allow(unsafe_op_in_unsafe_fn, unused)]
 mod schema_generated;
-mod server;
 #[cfg(test)]
 mod test_utils;
 mod utils;
@@ -123,7 +123,7 @@ fn main() {
           serial_path,
           baud_rate,
         } => {
-          run_client(serial_path, baud_rate).await;
+          run_guest(serial_path, baud_rate).await;
         }
         Commands::Host { pipe_path } => {
           let addresses = config
@@ -170,7 +170,7 @@ async fn run_server(pipe_path: Vec<String>, addresses: Vec<AddressPair>) {
   let mut retry_count = 0;
   for pipe_path in pipe_path {
     loop {
-      match server::prepare_pipe(&pipe_path).await {
+      match host::prepare_pipe(&pipe_path).await {
         Ok(pipe) => {
           info!("Pipe {} is ready", &pipe_path);
           pipes.push(pipe);
@@ -261,7 +261,7 @@ async fn setup_address_pair(
 }
 
 #[instrument(skip_all)]
-async fn run_client(serial_paths: Vec<String>, baud_rate: u32) {
+async fn run_guest(serial_paths: Vec<String>, baud_rate: u32) {
   let mut serials = Vec::new();
   for serial_path in serial_paths {
     let serial = tokio_serial::new(serial_path, baud_rate)

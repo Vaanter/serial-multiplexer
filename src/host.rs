@@ -69,12 +69,12 @@ pub async fn connection_initiator(
   mut client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
   mut connection_receiver: mpsc::Receiver<(Connection, String)>,
-  cancellation_token: CancellationToken,
+  cancel: CancellationToken,
 ) {
   loop {
     tokio::select! {
       biased;
-      _ = cancellation_token.cancelled() => {
+      _ = cancel.cancelled() => {
         break;
       }
       data = connection_receiver.recv() => {
@@ -90,14 +90,16 @@ pub async fn connection_initiator(
               }
               continue;
             }
-            tokio::spawn(connection_loop(connection, pipe_to_client_pull.resubscribe(), client_to_pipe_push.clone(), cancellation_token.clone()));
+            tokio::spawn(connection_loop(connection, pipe_to_client_pull.resubscribe(), client_to_pipe_push.clone(), cancel.clone()));
           }
           None => {
             warn!("Connection receiver closed");
+            cancel.cancel();
             break;
           }
         }
       }
+      _ = pipe_to_client_pull.recv() => {}
     }
   }
 }
@@ -151,7 +153,7 @@ async fn initiate_connection(
   }
 }
 
-#[instrument(skip_all, fields(client_id = %connection.identifier))]
+#[instrument(skip_all, fields(connection_id = %connection.identifier))]
 pub async fn connection_loop(
   mut connection: Connection,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
