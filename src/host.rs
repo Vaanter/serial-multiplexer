@@ -1,7 +1,7 @@
 use crate::common::Connection;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
-use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
+use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use anyhow::Error;
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};

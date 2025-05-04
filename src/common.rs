@@ -1,5 +1,5 @@
 use crate::protocol_utils::{create_close_datagram, create_data_datagram};
-use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
+use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use anyhow::bail;
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;

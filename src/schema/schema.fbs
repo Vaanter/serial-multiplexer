@@ -1,4 +1,4 @@
-namespace serial_proxy;
+namespace serial_multiplexer;
 
 enum ControlCode: ubyte {
   Ack,

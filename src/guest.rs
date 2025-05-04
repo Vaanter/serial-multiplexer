@@ -1,7 +1,7 @@
 use crate::common::Connection;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
-use crate::schema_generated::serial_proxy::ControlCode;
+use crate::schema_generated::serial_multiplexer::ControlCode;
 use crate::utils::connect_downstream;
 use anyhow::bail;
 use bytes::{Bytes, BytesMut};

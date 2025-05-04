@@ -9,7 +9,7 @@ extern crate flatbuffers;
 use self::flatbuffers::{EndianScalar, Follow};
 
 #[allow(unused_imports, dead_code)]
-pub mod serial_proxy {
+pub mod serial_multiplexer {
 
   use core::cmp::Ordering;
   use core::mem;
@@ -375,4 +375,4 @@ pub mod serial_proxy {
   ) {
     fbb.finish_size_prefixed(root, None);
   }
-} // pub mod serial_proxy
+} // pub mod serial_multiplexer

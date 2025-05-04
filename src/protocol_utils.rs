@@ -1,4 +1,4 @@
-use crate::schema_generated::serial_proxy::{
+use crate::schema_generated::serial_multiplexer::{
   ControlCode, Datagram, DatagramArgs, root_as_datagram,
 };
 use bytes::Bytes;
