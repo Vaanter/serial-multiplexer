@@ -120,3 +120,34 @@ async fn guest_loop(
   }
   debug!("Client {} disconnected", connection.identifier);
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::protocol_utils::create_initial_datagram;
+  use crate::schema_generated::serial_multiplexer::root_as_datagram;
+  use crate::test_utils::{run_echo, setup_tracing};
+
+  #[tokio::test]
+  async fn test_initiate_client_connection_smoke() {
+    setup_tracing().await;
+    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
+    let (target_address, _) = run_echo().await;
+    let target_address = target_address.to_string();
+    let datagram = create_initial_datagram(123, 0, &target_address);
+
+    let connection = initiate_client_connection(datagram, client_to_serial_push.clone())
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(connection.identifier, 123);
+    assert_eq!(connection.sequence, 0);
+    assert_eq!(connection.largest_processed, 0);
+    assert_eq!(connection.client.peer_addr().unwrap().to_string(), target_address);
+    let ack_data = client_to_serial_pull.recv().await.unwrap();
+    let ack_datagram = root_as_datagram(&ack_data).unwrap();
+    assert_eq!(ack_datagram.code(), ControlCode::Ack);
+    assert_eq!(ack_datagram.identifier(), 123);
+    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+  }
+}

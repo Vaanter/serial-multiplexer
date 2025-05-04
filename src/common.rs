@@ -220,76 +220,75 @@ pub async fn process_sink_read(
 ) -> bool {
   match data {
     Ok(data_buf) => {
-      match root_as_datagram(&data_buf) {
-        Ok(datagram) => {
-          if datagram.identifier() != connection.identifier {
-            // Not our datagram, ignore it
-            return false;
-          }
-          let datagram_sequence = datagram.sequence();
-          debug!(
-            "Received {:?} datagram with seq: {} and {} bytes of data",
-            datagram.code(),
-            datagram_sequence,
-            datagram.data().map(|d| d.len()).unwrap_or(0)
-          );
-          trace!("Datagrams in queue: {:?}", connection.datagram_queue);
-          if datagram_sequence >= (connection.largest_processed + 2) {
-            trace!(
-              "Received datagram out of order, seq: {}, largest sent: {}",
-              datagram_sequence, connection.largest_processed
-            );
-            connection
-              .datagram_queue
-              .insert(datagram_sequence, data_buf);
-            return false;
-          } else if datagram_sequence == (connection.largest_processed + 1) {
-            trace!(
-              "Received datagram in order, seq: {}, largest sent: {}",
-              datagram_sequence, connection.largest_processed
-            );
-            connection
-              .datagram_queue
-              .insert(datagram_sequence, data_buf);
-            while let Some(datagram_buf) = connection
-              .datagram_queue
-              .remove(&(connection.largest_processed + 1))
-            {
-              connection.largest_processed += 1;
-              let datagram = match root_as_datagram(&datagram_buf) {
-                Ok(datagram) => datagram,
-                Err(_) => continue,
-              };
-              if let Some(data) = datagram.data() {
-                trace!("Sending data to client, size {}", data.len());
-                match connection.client.write_all(data.bytes()).await {
-                  Ok(_) => {
-                    trace!("Sent {} bytes to client", data.len());
-                  }
-                  Err(e) => {
-                    error!("Failed to write data to client: {}", e);
-                    return true;
-                  }
-                }
+      let datagram = match root_as_datagram(&data_buf) {
+        Ok(datagram) => datagram,
+        Err(e) => {
+          error!("Received malformed datagram: {:?}, ignoring", e);
+          return false;
+        }
+      };
+      if datagram.identifier() != connection.identifier {
+        // Not our datagram, ignore it
+        return false;
+      }
+      let datagram_sequence = datagram.sequence();
+      debug!(
+        "Received {:?} datagram with seq: {} and {} bytes of data",
+        datagram.code(),
+        datagram_sequence,
+        datagram.data().map(|d| d.len()).unwrap_or(0)
+      );
+      trace!("Datagrams in queue: {:?}", connection.datagram_queue);
+      if datagram_sequence >= (connection.largest_processed + 2) {
+        trace!(
+          "Received datagram out of order, seq: {}, largest sent: {}",
+          datagram_sequence, connection.largest_processed
+        );
+        connection
+          .datagram_queue
+          .insert(datagram_sequence, data_buf);
+        return false;
+      } else if datagram_sequence == (connection.largest_processed + 1) {
+        trace!(
+          "Received datagram in order, seq: {}, largest sent: {}",
+          datagram_sequence, connection.largest_processed
+        );
+        connection
+          .datagram_queue
+          .insert(datagram_sequence, data_buf);
+        while let Some(datagram_buf) = connection
+          .datagram_queue
+          .remove(&(connection.largest_processed + 1))
+        {
+          connection.largest_processed += 1;
+          let datagram = match root_as_datagram(&datagram_buf) {
+            Ok(datagram) => datagram,
+            Err(_) => continue,
+          };
+          if let Some(data) = datagram.data() {
+            trace!("Sending data to client, size {}", data.len());
+            match connection.client.write_all(data.bytes()).await {
+              Ok(_) => {
+                trace!("Sent {} bytes to client", data.len());
               }
-              if datagram.code() == ControlCode::Close {
-                if let Err(e) = connection.client.shutdown().await {
-                  error!("Failed to shutdown client after receiving CLOSE: {}", e);
-                }
+              Err(e) => {
+                error!("Failed to write data to client: {}", e);
                 return true;
               }
             }
-            if let Err(e) = connection.client.flush().await {
-              error!("Failed to flush client data after writing data: {}", e);
-            }
           }
-          false
+          if datagram.code() == ControlCode::Close {
+            if let Err(e) = connection.client.shutdown().await {
+              error!("Failed to shutdown client after receiving CLOSE: {}", e);
+            }
+            return true;
+          }
         }
-        Err(e) => {
-          error!("Received malformed datagram: {:?}, ignoring", e);
-          false
+        if let Err(e) = connection.client.flush().await {
+          error!("Failed to flush client data after writing data: {}", e);
         }
       }
+      false
     }
     Err(broadcast::error::RecvError::Closed) => {
       if let Err(e) = connection.client.shutdown().await {
@@ -315,8 +314,8 @@ pub const fn join_u8_to_u16(upper: u8, lower: u8) -> u16 {
 mod tests {
   use super::*;
   use crate::protocol_utils::{create_ack_datagram, create_data_datagram, create_initial_datagram};
-  use crate::schema_generated::serial_proxy::{ControlCode, root_as_datagram};
-  use crate::test_utils::setup_tracing;
+  use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
+  use crate::test_utils::{run_echo, setup_tracing};
   use std::net::SocketAddr;
   use std::time::Duration;
   use tokio::net::{TcpListener, TcpStream};
@@ -601,7 +600,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_handle_sink_read_smoke() {
+  async fn test_process_sink_read_smoke() {
     setup_tracing().await;
     let identifier = 123;
     let data = BytesMut::from("test data");
@@ -627,7 +626,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_handle_sink_read_out_of_order() {
+  async fn test_process_sink_read_out_of_order() {
     setup_tracing().await;
     let identifier = 123;
     let data1 = BytesMut::from("test data1");
@@ -655,8 +654,65 @@ mod tests {
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = Connection::new(identifier, client);
     assert!(!process_sink_read(&mut connection, Ok(datagram2)).await);
+    assert!(connection.datagram_queue.contains_key(&2));
+    assert_eq!(1, connection.datagram_queue.len());
     assert!(!process_sink_read(&mut connection, Ok(datagram1)).await);
+    assert!(connection.datagram_queue.is_empty());
     handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_invalid_datagram() {
+    setup_tracing().await;
+    let (target_address, _) = run_echo().await;
+    let identifier = 123;
+    let data = Bytes::from("invalid test data");
+    let client = TcpStream::connect(target_address).await.unwrap();
+    let mut connection = Connection::new(identifier, client);
+
+    assert!(!process_sink_read(&mut connection, Ok(data)).await);
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_different_identifier() {
+    setup_tracing().await;
+    let (target_address, _) = run_echo().await;
+    let identifier = 123;
+    let data = BytesMut::from("test data");
+    let datagram = create_data_datagram(identifier, 1, &data);
+
+    let client = TcpStream::connect(target_address).await.unwrap();
+    let mut connection = Connection::new(500, client);
+    assert!(!process_sink_read(&mut connection, Ok(datagram)).await);
+    let mut client_buf = BytesMut::zeroed(2048);
+    assert_eq!(
+      std::io::ErrorKind::WouldBlock,
+      connection
+        .client
+        .try_read(&mut client_buf)
+        .unwrap_err()
+        .kind()
+    );
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_close_datagram() {
+    setup_tracing().await;
+    let (target_address, _) = run_echo().await;
+    let identifier = 123;
+    let datagram = create_close_datagram(identifier, 1);
+
+    let client = TcpStream::connect(target_address).await.unwrap();
+    let mut connection = Connection::new(identifier, client);
+    assert!(process_sink_read(&mut connection, Ok(datagram)).await);
+    let mut client_buf = BytesMut::zeroed(2048);
+    assert_eq!(
+      0,
+      timeout(Duration::from_secs(1), connection.client.read(&mut client_buf))
+        .await
+        .unwrap()
+        .unwrap()
+    );
   }
 
   #[tokio::test]
