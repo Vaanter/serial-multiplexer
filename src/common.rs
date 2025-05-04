@@ -193,9 +193,8 @@ pub async fn handle_client_read(
     }
     Ok(n) => {
       debug!("Read {} bytes from client", n);
-      let data = Bytes::copy_from_slice(&read_buf[..n]);
+      let datagram = create_data_datagram(identifier, sequence, &read_buf[..n]);
       read_buf[..n].zeroize();
-      let datagram = create_data_datagram(identifier, sequence, &data);
       trace!(
         "Sending DATA datagram of {} bytes to sink {:?} with seq: {}",
         datagram.len(),
