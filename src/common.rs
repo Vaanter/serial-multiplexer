@@ -15,13 +15,27 @@ use zeroize::Zeroize;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 pub(crate) const CONNECTION_BUFFER_SIZE: usize = 2usize.pow(15);
+/// An array representing a header used to identify the start of a datagram in a byte stream
 const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
+/// Number of bytes used to store the size of a datagram
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
   LazyLock::new(|| Finder::new(&DATAGRAM_HEADER).into_owned());
 
-pub struct Connection {
+/// Represents the state of a network connection, holding information about the
+/// connection identifier, client communication stream, sequence tracking, and
+/// a queue for storing datagram received out-of-order.
+///
+/// # Fields
+///
+/// * `identifier` (`u64`) - A unique identifier assigned to the connection.
+/// * `client` (`TcpStream`) - The TCP communication stream associated with the client.
+/// * `sequence` (`u64`) - A counter tracking the sequence of the last sent datagram for the connection.
+/// * `largest_processed` (`u64`) - The largest sequence number that has been processed.
+/// * `datagram_queue` (`BTreeMap<u64, Bytes>`) - A map (ordered by sequence number) storing datagrams
+///   that are awaiting processing because they arrived out-of-order.
+pub struct ConnectionState {
   pub identifier: u64,
   pub client: TcpStream,
   pub sequence: u64,
@@ -29,7 +43,7 @@ pub struct Connection {
   pub datagram_queue: BTreeMap<u64, Bytes>,
 }
 
-impl Connection {
+impl ConnectionState {
   pub fn new(identifier: u64, client: TcpStream) -> Self {
     Self {
       identifier,
@@ -41,16 +55,82 @@ impl Connection {
   }
 }
 
+/// Asynchronous loop for handling communication between a `sink` and clients.
+///
+/// This function manages bidirectional communication between a `sink` (a stream
+/// implementing both `AsyncRead` and `AsyncWrite`) and clients using channels.
+/// It reads data from the sink and pushes it to the client via a broadcast channel,
+/// while also receiving data from the client and writing it to the sink.
+/// The loop terminates on a cancellation signal, sink disconnection, or an error during
+/// read/write operations.
+///
+/// # Parameters
+///
+/// * `sink`: An object implementing [`AsyncReadExt`] and [`AsyncWriteExt`],
+///   currently, this will either be [`SerialStream`] or [`NamedPipeClient`].
+/// * `sink_to_client_push`: A [`broadcast::Sender`] used to send data from the sink to
+///   clients.
+/// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
+///   function receives data sent by the client to be written to the sink.
+/// * `cancel`: A [`CancellationToken`] used to signal when this loop should terminate.
+///
+/// # Behaviour
+///
+/// - Continuously reads from the `sink` using a buffer of size [`SINK_BUFFER_SIZE`] and
+///   sends the processed data to clients via the `sink_to_client_push` channel.
+/// - Continuously listens for data from the `client_to_sink_pull` channel to write
+///   to the `sink`.
+/// - Exits the loop gracefully when the cancellation token is triggered, the sink is
+///   disconnected, or an error occurs during read/write operations.
+///
+/// # Key Operations:
+///
+/// * `sink.read()`:
+///   - Reads data from the `sink` into an internal buffer.
+///   - Processes any unprocessed bytes in the buffer and sends them to the client
+///     broadcast channel.
+///   - Handles errors or disconnects from the `sink`, breaking the loop if necessary.
+///
+/// * `client_to_sink_pull.recv()`:
+///   - Receives data from a client to write into the `sink`
+///   - Uses the `handle_sink_write()` function to handle the actual write to the `sink`.
+///
+/// * `cancel.cancelled()`:
+///   - Terminates the loop immediately when cancellation is triggered.
+///
+/// # Errors
+///
+/// - Logs errors that occur while reading from or writing to the `sink`.
+/// - Logs any errors that occur when handling the client-to-sink channel.
+///
+/// # Logging
+///
+/// - Logs details when the loop terminates due to sink disconnection, receiver closure,
+///   or error conditions.
+///
+/// # Notes
+///
+/// - This function depends on external helper functions, such as [`handle_sink_write`]
+///   and [`handle_sink_read`], which are expected to manage specific operations for
+///   writing to and reading from the `sink`.
+///   These functions must return appropriate
+///   error types when an operation fails.
+///
+/// - [`SINK_BUFFER_SIZE`] needs to be defined in the outer scope with an appropriate
+///   buffer size for reading the sink.
+///
+/// [`SerialStream`]: tokio_serial::SerialStream
+/// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
 pub async fn sink_loop(
-  mut pipe: impl AsyncReadExt + AsyncWriteExt + Unpin,
+  mut sink: impl AsyncReadExt + AsyncWriteExt + Unpin,
   sink_to_client_push: broadcast::Sender<Bytes>,
   client_to_sink_pull: async_channel::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
-  let mut pipe_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
+  let mut sink_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
   let mut unprocessed_data_start = 0;
   loop {
-    pipe_buf.resize(SINK_BUFFER_SIZE, 0);
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       _ = cancel.cancelled() => {
@@ -59,7 +139,7 @@ pub async fn sink_loop(
       data = client_to_sink_pull.recv() => {
         match data {
           Ok(data) => {
-            if let Err(e) = handle_sink_write(&mut pipe, data).await {
+            if let Err(e) = handle_sink_write(&mut sink, data).await {
               error!("Failed to handle sink write: {}", e);
               break;
             }
@@ -70,14 +150,14 @@ pub async fn sink_loop(
           }
         }
       }
-      n = pipe.read(&mut pipe_buf[unprocessed_data_start..]) => {
+      n = sink.read(&mut sink_buf[unprocessed_data_start..]) => {
         match n {
           Ok(0) => {
             info!("Sink disconnected");
             break;
           }
           Ok(n) => {
-            match handle_sink_read(n + unprocessed_data_start, &mut pipe_buf, sink_to_client_push.clone()) {
+            match handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone()) {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
               Err(e) => {
                 error!("Failed to handle sink read: {}", e);
@@ -96,13 +176,70 @@ pub async fn sink_loop(
   cancel.cancel();
 }
 
+/// Handles reading data from a sink buffer, processes complete datagrams, and forwards them
+/// to clients via a broadcast channel.
+/// Any unprocessed data is preserved for subsequent reads.
+///
+/// # Arguments
+///
+/// * `bytes_read` - The number of bytes read into the sink buffer from the sink.
+/// * `sink_buf` -
+///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
+/// * `sink_to_client_push` - A [`broadcast::Sender<Bytes>`]
+///   used to send processed datagrams to clients.
+///
+/// # Behaviour
+///
+/// 1. Reads data from the provided buffer `sink_buf` up to `bytes_read` bytes.
+/// 2. Searches for a specific header ([`HEADER_FINDER`])
+///    within the buffer to identify the start of datagrams.
+/// 3. Extracts each datagram from the buffer if it is complete
+///    (based on the size after the header).
+/// 4. Sends the processed datagram to clients via the `sink_to_client_push` channel.
+/// 5. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
+///    Ensures already processed
+///    data is removed or cleared appropriately.
+///
+/// # Returns
+///
+/// Returns `Ok(unprocessed_bytes)`
+/// where `unprocessed_bytes` is the number of bytes in the `sink_buf`
+/// that could not be processed (i.e. incomplete or insufficient data for a datagram).
+///
+/// # Errors
+///
+/// Returns an error if there is an issue with sending the datagram to the `sink_to_client_push`
+/// channel.
+/// The error is propagated using [`anyhow::Result`].
+///
+/// # Notes
+///
+/// - Datagram format assumptions:
+///   * Datagram headers are identified using the [`HEADER_FINDER`].
+///   * The size of the datagram is determined by bytes immediately following the header.
+///     The number of bytes is specified by [`LENGTH_BYTES`].
+///
+/// - Buffer behaviour:
+///   * If the entire buffer was processed, the buffer will be zeroed out.
+///   * If some bytes remain unprocessed, they will be copied to the beginning of the buffer
+///     and the rest of the buffer will be zeroed out.
+///
+/// # Logging
+///
+/// - Logs detailed trace information about the state of the processing, including
+///   * Read bytes
+///   * Found headers and sizes
+///   * Processed datagrams
+///   * Buffer adjustments
+///
+/// - Ensure the appropriate logging level is configured to utilize the `trace!` statements.
 pub fn handle_sink_read(
-  n: usize,
+  bytes_read: usize,
   sink_buf: &mut BytesMut,
   sink_to_client_push: broadcast::Sender<Bytes>,
 ) -> anyhow::Result<usize> {
-  trace!("Read {} bytes from sink", n);
-  let mut read_data = &sink_buf[..n];
+  trace!("Read {} bytes from sink", bytes_read);
+  let mut read_data = &sink_buf[..bytes_read];
   trace!("Data in working buffer: {:?}", &read_data);
   let mut unprocessed_data_start = 0;
   while let Some(header_idx) = HEADER_FINDER.find(read_data) {
@@ -128,15 +265,18 @@ pub fn handle_sink_read(
       bail!("Failed to send data to clients. {}", e);
     }
     unprocessed_data_start += datagram_end + 1;
-    trace!("Shrinking buffer to size {} to remove processed data", min(n, unprocessed_data_start));
-    read_data = &sink_buf[min(n, unprocessed_data_start)..n];
+    trace!(
+      "Removing processed data in the working buffer at index {}",
+      min(bytes_read, unprocessed_data_start)
+    );
+    read_data = &sink_buf[min(bytes_read, unprocessed_data_start)..bytes_read];
     trace!("Data in buffer after reading datagram: {:?}", &read_data);
   }
 
-  let mut unprocessed_bytes = n;
+  let mut unprocessed_bytes = bytes_read;
   if unprocessed_data_start > 0 {
-    unprocessed_bytes = n - unprocessed_data_start;
-    if unprocessed_data_start >= n {
+    unprocessed_bytes = bytes_read - unprocessed_data_start;
+    if unprocessed_data_start >= bytes_read {
       trace!("Whole buffer was read, zeroing out processed data");
       sink_buf.zeroize();
     } else {
@@ -154,6 +294,47 @@ pub fn handle_sink_read(
   Ok(unprocessed_bytes)
 }
 
+/// Handles writing datagrams to the sink.
+/// This function writes a predefined header,
+/// the length of the datagram, and the actual datagram in order.
+///
+/// # Parameters
+/// * `sink`:
+///   A mutable reference to any type (`T`)
+///   that is used as a sink and where the data will be written.
+///   Currently, this will either be [`SerialStream`] or [`NamedPipeClient`].
+/// * `data`:
+///   A [`Bytes`] object representing the datagram that will be written to the sink.
+///
+/// # Behaviour
+/// The function follows these steps:
+/// 1. Writes a constant [`DATAGRAM_HEADER`] (the header) to the sink.
+/// 2. Writes the size of the `data` as a 2-byte value to the sink.
+/// 3. Writes the `datagram` itself to the sink.
+/// 4. Flushes the sink to ensure everything is written out.
+///
+/// # Errors
+/// This function returns an `anyhow::Result<()>`, which will contain an error
+/// if any of the following operations fail:
+/// - Writing the [`DATAGRAM_HEADER`] to the sink.
+/// - Writing the length of the datagram to the sink.
+/// - Writing the `datagram` itself to the sink.
+/// - Flushing the sink after all writes.
+///
+/// The error message will include details about which operation failed.
+///
+/// # Logging
+/// Outputs a trace log with the total number of bytes being written (including the header
+/// and length bytes) and the datagram payload.
+///
+/// # Notes
+/// The size of the data is written as a 2-byte value using the [`split_u16_to_u8`]
+/// function.
+/// The [`HEADER_BYTES`] and [`LENGTH_BYTES`] constants are used in calculation
+/// for logging but are not directly involved in the logic.
+///
+/// [`SerialStream`]: tokio_serial::SerialStream
+/// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
 pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   sink: &mut T,
   data: Bytes,
@@ -175,6 +356,49 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   Ok(())
 }
 
+///
+/// Handles reads from client connections.
+///
+/// This function processes the result of a read operation from a client and performs actions
+/// based on whether the read was successful, encountered an error, or if the client disconnected.
+/// It sends appropriate datagrams to be handled downstream via the provided channel.
+///
+/// # Arguments
+///
+/// * `identifier` - A unique identifier for the client connection.
+/// * `sequence` - The current datagram sequence number for the connection, used for ordering data.
+/// * `client_to_pipe_push` - An async channel sender used to send datagrams to [`sink_loop`].
+/// * `bytes_read` - The result of a read operation indicating the number of bytes read or an error.
+/// * `read_buf` - A mutable buffer containing the bytes read from the client connection.
+///
+/// # Returns
+///
+/// A boolean indicating whether the connection should be closed:
+/// - `true` if the connection should be terminated (e.g. client disconnected or read error).
+/// - `false` if the connection remains active.
+///
+/// # Behaviour
+///
+/// - If `bytes_read` is `Ok(0)`, the client has disconnected. A "CLOSE" datagram is created
+///   and sent via the channel. The function returns `true`.
+///
+/// - If `bytes_read` is `Ok(n)`, where `n > 0`, the bytes are processed, and a "DATA" datagram
+///   is created and sent via the channel. The read buffer is cleared, and the function returns `false`.
+///
+/// - If `bytes_read` is `Err(e)`, an error occurred while reading from the client. The error
+///   is logged, and the function returns `true`.
+///
+/// # Logging
+///
+/// - Logs client disconnection at the `info` level.
+/// - Logs the number of bytes read at the `debug` level.
+/// - Logs detailed trace information for the created "DATA" datagram.
+/// - Logs errors at the `error` level if issues occur while sending datagrams or reading.
+///
+/// # Zeroization
+///
+/// The portion of the read buffer containing the bytes read is securely zeroed to clear
+/// any sensitive data after processing.
 pub async fn handle_client_read(
   identifier: u64,
   sequence: u64,
@@ -214,8 +438,73 @@ pub async fn handle_client_read(
   }
 }
 
+/// Processes incoming datagrams for a connection and handles
+/// their sequencing, processing, and appropriate action based on their control code.
+///
+/// This function accepts a [`ConnectionState`] object and a [`Result`] containing either
+/// a [`Bytes`] buffer of the datagram payload or an error.
+/// It processes the datagrams based on their sequence number
+/// and performs operations such as forwarding data
+/// to the client or closing the connection if a [`Close`] datagram is received.
+///
+/// # Arguments
+///
+/// * `connection` - A mutable reference to a [`ConnectionState`] object, which represents
+///   the current connection state.
+/// * `data` - A [`Result`] containing the incoming datagram payload encapsulated in [`Bytes`]
+///   or an error of type [`broadcast::error::RecvError`].
+///
+/// # Returns
+/// A `bool` indicating:
+/// * `true` - if the connection should be terminated, either due to receiving a `CLOSE`
+///   control code from the client or because the sink channel is closed.
+/// * `false` - if the connection should remain active.
+///
+/// # Behaviour
+///
+/// 1. **Datagram Validation**:
+///     - If the datagram's identifier does not match the connection's, it is ignored.
+///     - If the received datagram is malformed, it is logged and ignored.
+///
+/// 2. **Sequencing and Queuing**:
+///     - If the datagram's sequence is higher than the expected next sequence, it is
+///       queued for future processing (out-of-order reception).
+///     - If the datagram is in sequence, it and any subsequent queued datagrams are processed
+///       in order until no more in-sequence datagrams remain.
+///
+/// 3. **Processing and Actions**:
+///     - If valid payload data is present in a datagram:
+///         - Attempts to forward it to the client.
+///         - Any write or flush errors are logged and terminate the function with `true`.
+///     - If a [`Close`] control code is received, the client connection is shut down, the
+///       termination is logged, and the function returns `true`.
+///
+/// 4. **Error Handling**:
+///     - If a [`broadcast::error::RecvError::Closed`] is encountered, it shuts down the client
+///       connection and returns `true`.
+///
+/// # Logging
+/// The function logs extensively using `debug`, `trace`, and `error` levels to provide insight
+/// into the state of datagram handling, sequencing, data transmission, and error conditions.
+///
+/// # Example Workflow
+/// 1. Receives incoming datagrams from a sink.
+/// 2. Validates the datagrams' identifier and integrity.
+/// 3. Orders incoming datagrams by their sequence number, queuing out-of-order ones.
+/// 4. Forwards valid data to the client.
+/// 5. Handles special control codes like [`Close`] by shutting down the connection.
+///
+/// # Errors
+/// - Logs errors encountered during writing, flushing, or shutting down the client.
+/// - Malformed datagrams are logged and ignored.
+///
+/// # Notes
+/// - It leverages a connection's `datagram_queue` and `largest_processed` to ensure in-order
+///   delivery of datagrams.
+///
+/// [`Close`]: ControlCode::Close
 pub async fn process_sink_read(
-  connection: &mut Connection,
+  connection: &mut ConnectionState,
   data: Result<Bytes, broadcast::error::RecvError>,
 ) -> bool {
   match data {
@@ -300,12 +589,38 @@ pub async fn process_sink_read(
   }
 }
 
+/// Splits a 16-bit unsigned integer (`u16`) into two 8-bit unsigned integers (`u8`)
+/// and returns them as an array.
+///
+/// # Parameters
+/// - `n`: A 16-bit unsigned integer (`u16`) to be split.
+///
+/// # Returns
+/// - An array of two `u8` values:
+///   - `[upper, lower]`, where:
+///     - `upper` is the most significant byte of the input `u16`.
+///     - `lower` is the least significant byte of the input `u16`.
+///
+/// # Note
+/// The actual length of the returned array is specified by [`LENGTH_BYTES`].
 pub const fn split_u16_to_u8(n: u16) -> [u8; LENGTH_BYTES] {
   let upper = (n >> 8) as u8;
   let lower = n as u8;
   [upper, lower]
 }
 
+/// Combines two 8-bit unsigned integers (`u8`) into a single 16-bit unsigned integer (`u16`).
+///
+/// # Arguments
+///
+/// * `upper` - An 8-bit unsigned integer (`u8`) representing the upper byte of the 16-bit result.
+/// * `lower` - An 8-bit unsigned integer (`u8`) representing the lower byte of the 16-bit result.
+///
+/// # Returns
+///
+/// A 16-bit unsigned integer (`u16`) created by combining `upper` and `lower`.
+/// The `upper` value is shifted left by 8 bits to occupy the high byte, and
+/// the `lower` value occupies the low byte.
 pub const fn join_u8_to_u16(upper: u8, lower: u8) -> u16 {
   ((upper as u16) << 8) | lower as u16
 }
@@ -620,7 +935,7 @@ mod tests {
 
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
-    let mut connection = Connection::new(identifier, client);
+    let mut connection = ConnectionState::new(identifier, client);
     assert!(!process_sink_read(&mut connection, Ok(datagram),).await);
     handle.await.unwrap();
   }
@@ -652,7 +967,7 @@ mod tests {
 
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
-    let mut connection = Connection::new(identifier, client);
+    let mut connection = ConnectionState::new(identifier, client);
     assert!(!process_sink_read(&mut connection, Ok(datagram2)).await);
     assert!(connection.datagram_queue.contains_key(&2));
     assert_eq!(1, connection.datagram_queue.len());
@@ -668,7 +983,7 @@ mod tests {
     let identifier = 123;
     let data = Bytes::from("invalid test data");
     let client = TcpStream::connect(target_address).await.unwrap();
-    let mut connection = Connection::new(identifier, client);
+    let mut connection = ConnectionState::new(identifier, client);
 
     assert!(!process_sink_read(&mut connection, Ok(data)).await);
   }
@@ -682,7 +997,7 @@ mod tests {
     let datagram = create_data_datagram(identifier, 1, &data);
 
     let client = TcpStream::connect(target_address).await.unwrap();
-    let mut connection = Connection::new(500, client);
+    let mut connection = ConnectionState::new(500, client);
     assert!(!process_sink_read(&mut connection, Ok(datagram)).await);
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(
@@ -703,7 +1018,7 @@ mod tests {
     let datagram = create_close_datagram(identifier, 1);
 
     let client = TcpStream::connect(target_address).await.unwrap();
-    let mut connection = Connection::new(identifier, client);
+    let mut connection = ConnectionState::new(identifier, client);
     assert!(process_sink_read(&mut connection, Ok(datagram)).await);
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(

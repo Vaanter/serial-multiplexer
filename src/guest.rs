@@ -1,4 +1,4 @@
-use crate::common::Connection;
+use crate::common::ConnectionState;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
@@ -55,7 +55,7 @@ pub async fn client_initiator(
 async fn initiate_client_connection(
   data: Bytes,
   client_to_serial_push: async_channel::Sender<Bytes>,
-) -> anyhow::Result<Option<Connection>> {
+) -> anyhow::Result<Option<ConnectionState>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
       // Not the first datagram for connection, ignore
@@ -81,7 +81,7 @@ async fn initiate_client_connection(
         }
         bail!("Failed to send ACK : {}", e);
       }
-      Ok(Some(Connection::new(identifier, downstream)))
+      Ok(Some(ConnectionState::new(identifier, downstream)))
     }
     Err(e) => {
       debug!("Received invalid datagram, will ignore: {}", e);
@@ -92,7 +92,7 @@ async fn initiate_client_connection(
 
 #[instrument(skip_all, fields(connection_id = %connection.identifier))]
 async fn guest_loop(
-  mut connection: Connection,
+  mut connection: ConnectionState,
   client_to_serial_push: async_channel::Sender<Bytes>,
   mut serial_to_client_pull: broadcast::Receiver<Bytes>,
   cancel: CancellationToken,

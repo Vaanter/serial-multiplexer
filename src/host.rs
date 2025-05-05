@@ -1,4 +1,4 @@
-use crate::common::Connection;
+use crate::common::ConnectionState;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
@@ -31,7 +31,7 @@ pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
 pub async fn run_listener(
   listener: TcpListener,
   target_address: String,
-  connection_sender: mpsc::Sender<(Connection, String)>,
+  connection_sender: mpsc::Sender<(ConnectionState, String)>,
   cancel: CancellationToken,
 ) {
   let listener_address = listener.local_addr().unwrap();
@@ -48,7 +48,7 @@ pub async fn run_listener(
             info!("Client connected: {}", client_address);
 
             let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-            let connection = Connection::new(identifier, client);
+            let connection = ConnectionState::new(identifier, client);
 
             if let Err(e) = connection_sender.send((connection, target_address.clone())).await {
               error!("Failed to finish setup for connection {}: {}", identifier, e);
@@ -68,7 +68,7 @@ pub async fn run_listener(
 pub async fn connection_initiator(
   mut client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  mut connection_receiver: mpsc::Receiver<(Connection, String)>,
+  mut connection_receiver: mpsc::Receiver<(ConnectionState, String)>,
   cancel: CancellationToken,
 ) {
   loop {
@@ -105,7 +105,7 @@ pub async fn connection_initiator(
 }
 
 async fn initiate_connection(
-  connection: &Connection,
+  connection: &ConnectionState,
   target_address: String,
   client_to_pipe_push: &mut async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
@@ -155,7 +155,7 @@ async fn initiate_connection(
 
 #[instrument(skip_all, fields(connection_id = %connection.identifier))]
 pub async fn connection_loop(
-  mut connection: Connection,
+  mut connection: ConnectionState,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
   client_to_pipe_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
@@ -224,7 +224,7 @@ mod tests {
     let (address, _) = run_echo().await;
     let target_address = "test:1234";
     let identifier = 1;
-    let connection = Connection::new(identifier, TcpStream::connect(address).await.unwrap());
+    let connection = ConnectionState::new(identifier, TcpStream::connect(address).await.unwrap());
 
     let initiate_handle = tokio::spawn({
       let mut client_to_pipe_push = client_to_pipe_push.clone();
