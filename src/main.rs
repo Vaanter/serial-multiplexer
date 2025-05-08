@@ -126,33 +126,35 @@ fn main() {
           run_guest(serial_path, baud_rate).await;
         }
         Commands::Host { pipe_path } => {
-          let direct_connections = config
-            .get_array("address_pairs")
-            .expect("Config should contain address pairs")
-            .into_iter()
-            .filter_map(|row| row.into_table().ok())
-            .enumerate()
-            .map(|(idx, pair)| AddressPair {
-              listener_address: pair
-                .get("listener_address")
-                .unwrap_or_else(|| {
-                  panic!("Address pair {} doesn't contain the listener address", idx)
-                })
-                .to_string(),
-              target_address: pair
-                .get("target_address")
-                .unwrap_or_else(|| {
-                  panic!("Address pair {} doesn't contain the target address", idx)
-                })
-                .to_string(),
-            })
-            .collect::<Vec<AddressPair>>();
-
+          let direct_connections = load_direct_connections(&config);
           let socks5_proxy = config.get_string("socks5_proxy").ok();
+          if direct_connections.is_empty() && socks5_proxy.is_none() {
+            panic!("No address pairs or socks5 proxy configured");
+          }
           run_host(pipe_path, direct_connections, socks5_proxy).await;
         }
       }
     });
+}
+
+fn load_direct_connections(config: &Config) -> Vec<AddressPair> {
+  config
+    .get_array("address_pairs")
+    .expect("Config should contain address pairs")
+    .into_iter()
+    .filter_map(|row| row.into_table().ok())
+    .enumerate()
+    .map(|(idx, pair)| AddressPair {
+      listener_address: pair
+        .get("listener_address")
+        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the listener address", idx))
+        .to_string(),
+      target_address: pair
+        .get("target_address")
+        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the target address", idx))
+        .to_string(),
+    })
+    .collect::<Vec<AddressPair>>()
 }
 
 #[cfg(unix)]
