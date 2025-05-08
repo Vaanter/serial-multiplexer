@@ -339,7 +339,8 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   sink: &mut T,
   data: Bytes,
 ) -> anyhow::Result<()> {
-  trace!("Writing {} bytes to sink: {:?}", data.len() + HEADER_BYTES + LENGTH_BYTES, data);
+  debug!("Writing {} bytes to sink", data.len() + HEADER_BYTES + LENGTH_BYTES);
+  trace!("Writing datagram to sink: {:?}", data);
   if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
     bail!("Failed to write HEADER to sink: {}", e);
   }
@@ -392,7 +393,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 ///
 /// - Logs client disconnection at the `info` level.
 /// - Logs the number of bytes read at the `debug` level.
-/// - Logs detailed trace information for the created "DATA" datagram.
+/// - Logs debug information for the created "DATA" datagram.
 /// - Logs errors at the `error` level if issues occur while sending datagrams or reading.
 ///
 /// # Zeroization
@@ -406,36 +407,35 @@ pub async fn handle_client_read(
   bytes_read: std::io::Result<usize>,
   read_buf: &mut BytesMut,
 ) -> bool {
-  match bytes_read {
+  let connection_ending = match bytes_read {
     Ok(0) => {
       info!("Client {} disconnected", identifier);
-      let datagram = create_close_datagram(identifier, sequence);
-      if let Err(e) = client_to_pipe_push.send(datagram).await {
-        error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
-      }
       true
     }
     Ok(n) => {
       debug!("Read {} bytes from client", n);
       let datagram = create_data_datagram(identifier, sequence, &read_buf[..n]);
       read_buf[..n].zeroize();
-      trace!(
-        "Sending DATA datagram of {} bytes to sink {:?} with seq: {}",
-        datagram.len(),
-        datagram,
-        sequence
-      );
+      debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
       if let Err(e) = client_to_pipe_push.send(datagram).await {
         error!("Failed to send DATA datagram for connection {}: {}", identifier, e);
-        return true;
+        true
+      } else {
+        false
       }
-      false
     }
     Err(e) => {
       error!("Failed to read from client: {}", e);
       true
     }
+  };
+  if connection_ending {
+    let datagram = create_close_datagram(identifier, sequence);
+    if let Err(e) = client_to_pipe_push.send(datagram).await {
+      error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
+    }
   }
+  connection_ending
 }
 
 /// Processes incoming datagrams for a connection and handles
