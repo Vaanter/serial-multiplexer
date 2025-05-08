@@ -1,20 +1,15 @@
 use anyhow::bail;
 use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
-pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<Option<TcpListener>> {
+pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<TcpListener> {
   let upstream_addresses = lookup_host(upstream).await?;
   for upstream_address in upstream_addresses {
-    match TcpListener::bind(upstream_address).await {
-      Ok(listener) => {
-        return Ok(Some(listener));
-      }
-      Err(e) => {
-        error!("Failed to start listener with address {}. {}", upstream_address, e);
-      }
+    if let Ok(listener) = TcpListener::bind(upstream_address).await {
+      return Ok(listener);
     }
   }
-  Ok(None)
+  bail!("Failed to start listener with address {}", upstream);
 }
 
 pub async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {

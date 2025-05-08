@@ -159,7 +159,7 @@ fn load_direct_connections(config: &Config) -> Vec<AddressPair> {
 
 #[cfg(unix)]
 #[instrument(skip_all)]
-async fn run_server(
+async fn run_host(
   pipe_path: Vec<String>,
   direct_connections: Vec<AddressPair>,
   socks5_proxy: Option<String>,
@@ -201,6 +201,10 @@ async fn run_host(
     }
   }
 
+  if pipes.is_empty() {
+    panic!("No pipes available");
+  }
+
   let tasks = FuturesUnordered::new();
   for pipe in pipes {
     let pipe_task = tokio::spawn({
@@ -216,75 +220,74 @@ async fn run_host(
 
   let (connection_sender, connection_receiver) = mpsc::channel(128);
 
-  for pair_direct in direct_connections.into_iter() {
-    let cancel = cancel.clone();
-    let connection_sender = connection_sender.clone();
-    let pair_task = tokio::spawn(async move {
-      setup_listener(
-        pair_direct.listener_address,
-        ConnectionType::new_direct(pair_direct.target_address),
-        connection_sender,
-        cancel,
-      )
-      .await;
-    });
-    tasks.push(pair_task);
-  }
-
   let initiator_task = tokio::spawn({
     let cancel = cancel.clone();
     connection_initiator(client_to_pipe_push, pipe_to_client_pull, connection_receiver, cancel)
   });
   tasks.push(initiator_task);
 
+  let listener_tasks = FuturesUnordered::new();
+  for pair_direct in direct_connections.into_iter() {
+    let cancel = cancel.clone();
+    let connection_sender = connection_sender.clone();
+    match setup_listener(
+      &pair_direct.listener_address,
+      ConnectionType::new_direct(pair_direct.target_address),
+      connection_sender,
+      cancel,
+    )
+    .await
+    {
+      Ok(pair_task) => {
+        listener_tasks.push(pair_task);
+      }
+      Err(e) => {
+        error!("Failed to setup listener for {}: {}", pair_direct.listener_address, e);
+      }
+    };
+  }
+
   if let Some(socks5_proxy) = socks5_proxy {
     let cancel = cancel.clone();
     let connection_sender = connection_sender.clone();
-    let socks5_task = tokio::spawn(async move {
-      setup_listener(socks5_proxy, ConnectionType::new_socks5(), connection_sender, cancel).await;
-    });
-    tasks.push(socks5_task);
+    match setup_listener(&socks5_proxy, ConnectionType::new_socks5(), connection_sender, cancel)
+      .await
+    {
+      Ok(socks5_task) => {
+        listener_tasks.push(socks5_task);
+      }
+      Err(e) => {
+        error!("Failed to setup socks5 listener at {}: {}", socks5_proxy, e);
+      }
+    }
   }
 
-  let joined_tasks = maybe_done(join_all(tasks));
-  run_indefinitely(cancel.clone(), joined_tasks).await;
+  if listener_tasks.is_empty() {
+    panic!("All listeners failed to start");
+  }
+
+  let joined_tasks = maybe_done(join_all(tasks.into_iter().chain(listener_tasks)));
+  run_indefinitely(cancel, joined_tasks).await;
 }
 
 #[instrument(skip_all)]
 async fn setup_listener(
-  listener_address: String,
+  listener_address: &str,
   connection_type: ConnectionType,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
-) -> Option<JoinHandle<()>> {
-  let listener = match create_upstream_listener(&listener_address).await {
-    Ok(Some(listener)) => {
-      match connection_type {
-        ConnectionType::Socks5 => {
-          info!("Created Socks5 listener at {}", listener_address);
-        }
-        ConnectionType::Direct { ref target_address } => {
-          info!("Created listener at {} for {}", listener_address, target_address);
-        }
-      }
-      listener
+) -> anyhow::Result<JoinHandle<()>> {
+  let listener = create_upstream_listener(listener_address).await?;
+  match connection_type {
+    ConnectionType::Socks5 => {
+      info!("Created Socks5 listener at {}", listener_address);
     }
-    Ok(None) => {
-      error!("Failed to create listener for address {}.", listener_address);
-      return None;
+    ConnectionType::Direct { ref target_address } => {
+      info!("Created listener at {} for {}", listener_address, target_address);
     }
-    Err(e) => {
-      error!("Failed to create listener for address {}: {}", listener_address, e);
-      return None;
-    }
-  };
+  }
 
-  Some(tokio::spawn({
-    let cancel = cancel.clone();
-    async move {
-      run_listener(listener, connection_type, connection_sender, cancel).await;
-    }
-  }))
+  Ok(tokio::spawn(run_listener(listener, connection_type, connection_sender, cancel)))
 }
 
 #[instrument(skip_all)]
