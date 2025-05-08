@@ -2,8 +2,11 @@ use crate::common::ConnectionState;
 use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
-use anyhow::Error;
+use anyhow::{Context, Error};
 use bytes::{Bytes, BytesMut};
+use fast_socks5::ReplyError;
+use fast_socks5::server::Socks5ServerProtocol;
+use futures::TryFutureExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,6 +21,22 @@ use tracing_attributes::instrument;
 
 static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum ConnectionType {
+  Direct { target_address: String },
+  Socks5,
+}
+
+impl ConnectionType {
+  pub fn new_direct(target_address: String) -> Self {
+    Self::Direct { target_address }
+  }
+
+  pub fn new_socks5() -> Self {
+    Self::Socks5
+  }
+}
+
 #[cfg(windows)]
 pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
   ClientOptions::new()
@@ -30,8 +49,8 @@ pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
 #[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
 pub async fn run_listener(
   listener: TcpListener,
-  target_address: String,
-  connection_sender: mpsc::Sender<(ConnectionState, String)>,
+  connection_type: ConnectionType,
+  connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
   let listener_address = listener.local_addr().unwrap();
@@ -50,7 +69,7 @@ pub async fn run_listener(
             let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
             let connection = ConnectionState::new(identifier, client);
 
-            if let Err(e) = connection_sender.send((connection, target_address.clone())).await {
+            if let Err(e) = connection_sender.send((connection, connection_type.clone())).await {
               error!("Failed to finish setup for connection {}: {}", identifier, e);
             }
           }
@@ -66,11 +85,12 @@ pub async fn run_listener(
 
 #[instrument(skip_all)]
 pub async fn connection_initiator(
-  mut client_to_pipe_push: async_channel::Sender<Bytes>,
+  client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  mut connection_receiver: mpsc::Receiver<(ConnectionState, String)>,
+  mut connection_receiver: mpsc::Receiver<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
+  debug!("Starting connection initiator");
   loop {
     tokio::select! {
       biased;
@@ -79,18 +99,14 @@ pub async fn connection_initiator(
       }
       data = connection_receiver.recv() => {
         match data {
-          Some((connection, target_address)) => {
-            info!("Starting connection to {}", &target_address);
-            pipe_to_client_pull = pipe_to_client_pull.resubscribe(); // clean up previous datagrams
-            if !initiate_connection(&connection, target_address, &mut client_to_pipe_push, &mut pipe_to_client_pull).await {
-              info!("Failed to initialize connection, closing client");
-              let mut client = connection.client;
-              if let Err(e) = client.shutdown().await {
-                error!("Failed to shutdown client after initialization failed: {}", e);
-              }
-              continue;
-            }
-            tokio::spawn(connection_loop(connection, pipe_to_client_pull.resubscribe(), client_to_pipe_push.clone(), cancel.clone()));
+          Some((connection_state, connection_type)) => {
+            handle_new_connection(
+              connection_state,
+              connection_type,
+              client_to_pipe_push.clone(),
+              pipe_to_client_pull.resubscribe(),
+              cancel.clone()
+            ).await;
           }
           None => {
             warn!("Connection receiver closed");
@@ -104,13 +120,114 @@ pub async fn connection_initiator(
   }
 }
 
+async fn handle_new_connection(
+  mut connection_state: ConnectionState,
+  connection_type: ConnectionType,
+  mut client_to_pipe_push: async_channel::Sender<Bytes>,
+  mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
+  cancel: CancellationToken,
+) {
+  let connect_result = match connection_type {
+    ConnectionType::Direct { target_address } => {
+      initiate_direct_connection(
+        &mut connection_state,
+        target_address,
+        &mut client_to_pipe_push,
+        &mut pipe_to_client_pull,
+      )
+      .await
+    }
+    ConnectionType::Socks5 => {
+      initiate_socks5_connection(
+        &mut connection_state,
+        &mut client_to_pipe_push,
+        &mut pipe_to_client_pull,
+      )
+      .await
+    }
+  };
+  if let Err(e) = connect_result {
+    info!("Failed to initialize connection, closing client. {}", e);
+    if let Err(e) = connection_state.client.shutdown().await {
+      error!("Failed to shutdown client after initialization failed: {}", e);
+    }
+  } else {
+    tokio::spawn(connection_loop(
+      connection_state,
+      pipe_to_client_pull.resubscribe(),
+      client_to_pipe_push.clone(),
+      cancel.clone(),
+    ));
+  }
+}
+
+async fn initiate_direct_connection(
+  connection_state: &mut ConnectionState,
+  target_address: String,
+  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
+  pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
+) -> anyhow::Result<()> {
+  info!("Starting direct connection to {}", &target_address);
+  match initiate_connection(
+    connection_state.identifier,
+    target_address,
+    client_to_pipe_push,
+    pipe_to_client_pull,
+  )
+  .await
+  {
+    true => Ok(()),
+    false => Err(anyhow::anyhow!("Failed to initialize direct connection")),
+  }
+}
+
+async fn initiate_socks5_connection(
+  connection_state: &mut ConnectionState,
+  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
+  pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
+) -> anyhow::Result<()> {
+  // Use the local address as the guest does not reply with the actual address of it's connection
+  let local_address = connection_state.client.local_addr()?;
+  debug!("Setting up socks5 connection for {}", &local_address);
+  match Socks5ServerProtocol::accept_no_auth(&mut connection_state.client)
+    .and_then(|prot| prot.read_command())
+    .await
+  {
+    Ok((socks5_prot, _, addr)) => {
+      info!("Starting socks5 connection to {}", &addr);
+      if initiate_connection(
+        connection_state.identifier,
+        addr.to_string(),
+        client_to_pipe_push,
+        pipe_to_client_pull,
+      )
+      .await
+      {
+        debug!("Guest connection established, notifying socks5 client");
+        socks5_prot
+          .reply_success(local_address)
+          .await
+          .map(|_| ())
+          .context("Failed to notify client of successful socks5 connection")
+      } else {
+        debug!("Guest connection failed, notifying socks5 client");
+        if let Err(e) = socks5_prot.reply_error(&ReplyError::HostUnreachable).await {
+          error!("Failed to notify client of failed socks5 connection: {}", e);
+        }
+        Err(anyhow::anyhow!("Failed to initialize guest connection"))
+      }
+    }
+    Err(e) => Err(anyhow::Error::new(e)),
+  }
+}
+
 async fn initiate_connection(
-  connection: &ConnectionState,
+  connection_identifier: u64,
   target_address: String,
   client_to_pipe_push: &mut async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> bool {
-  let initial_datagram = create_initial_datagram(connection.identifier, 0, &target_address);
+  let initial_datagram = create_initial_datagram(connection_identifier, 0, &target_address);
   trace!("Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
   if let Err(e) = client_to_pipe_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);
@@ -123,7 +240,7 @@ async fn initiate_connection(
         Ok(data) => match root_as_datagram(&data) {
           Ok(datagram) => {
             trace!("Received datagram from server: {:?}", datagram);
-            if datagram.identifier() == connection.identifier {
+            if datagram.identifier() == connection_identifier {
               break Some(data);
             }
           }
@@ -140,7 +257,7 @@ async fn initiate_connection(
     Ok(Some(datagram)) => {
       let datagram = root_as_datagram(&datagram)
         .expect("Datagram should have been validated by checking the identifier");
-      if datagram.code() != ControlCode::Ack || datagram.identifier() != connection.identifier {
+      if datagram.code() != ControlCode::Ack || datagram.identifier() != connection_identifier {
         debug!("Received invalid response from server: {:?}", datagram);
         return false;
       }
@@ -169,7 +286,6 @@ pub async fn connection_loop(
         if let Err(e) = connection.client.shutdown().await {
           error!("Failed to shutdown client after server shutdown: {}", e);
         }
-        info!("Connection cancelled");
         break;
       }
       data = pipe_to_client_pull.recv() => {
@@ -193,6 +309,7 @@ mod tests {
   use super::*;
   use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::{run_echo, setup_tracing};
+  use fast_socks5::client::{Config, Socks5Stream};
   use tokio::net::TcpStream;
 
   #[tokio::test]
@@ -201,17 +318,17 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_address = listener.local_addr().unwrap();
     let (target_address, _) = run_echo().await;
-    let target_address = target_address.to_string();
+    let connection_type = ConnectionType::new_direct(target_address.to_string());
     let (connection_sender, mut connection_receiver) = mpsc::channel(1);
     tokio::spawn({
-      let target_address = target_address.clone();
+      let connection_type = connection_type.clone();
       async move {
-        run_listener(listener, target_address, connection_sender, CancellationToken::new()).await;
+        run_listener(listener, connection_type, connection_sender, CancellationToken::new()).await;
       }
     });
     let test_connection = TcpStream::connect(listener_address).await.unwrap();
-    let (connection, target_address_received) = connection_receiver.recv().await.unwrap();
-    assert_eq!(target_address_received, target_address);
+    let (connection, connection_type_received) = connection_receiver.recv().await.unwrap();
+    assert_eq!(connection_type_received, connection_type);
     assert_eq!(0, connection.identifier);
     assert_eq!(connection.client.peer_addr().unwrap(), test_connection.local_addr().unwrap());
   }
@@ -231,7 +348,7 @@ mod tests {
       let mut pipe_to_client_pull = pipe_to_client_pull.resubscribe();
       async move {
         initiate_connection(
-          &connection,
+          connection.identifier,
           target_address.to_string(),
           &mut client_to_pipe_push,
           &mut pipe_to_client_pull,
@@ -250,5 +367,62 @@ mod tests {
       .unwrap();
 
     assert!(initiate_handle.await.unwrap());
+  }
+
+  #[tokio::test]
+  async fn initiate_socks5_connection_success() {
+    setup_tracing().await;
+    let (pipe_to_client_push, mut pipe_to_client_pull) = broadcast::channel(256);
+    let (mut client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (connection_sender, mut connection_receiver) = mpsc::channel(128);
+
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_address = local_listener.local_addr().unwrap();
+    let listener_socks5_task = tokio::spawn(async move {
+      let connection = local_listener.accept().await.unwrap().0;
+      connection_sender
+        .send((ConnectionState::new(0, connection), ConnectionType::Socks5))
+        .await
+        .unwrap();
+    });
+    let socks5_client_task = tokio::spawn(Socks5Stream::connect(
+      local_address,
+      "target.test".to_string(),
+      1234,
+      Config::default(),
+    ));
+    let (mut connection_state, connection_type) = connection_receiver.recv().await.unwrap();
+
+    assert_eq!(connection_type, ConnectionType::Socks5);
+
+    let guest_task = tokio::spawn(async move {
+      let initial = client_to_pipe_pull.recv().await.unwrap();
+      let initial_datagram = root_as_datagram(&initial).unwrap();
+      let ack = create_ack_datagram(initial_datagram.identifier(), 0);
+      pipe_to_client_push.send(ack).unwrap();
+    });
+
+    assert!(
+      initiate_socks5_connection(
+        &mut connection_state,
+        &mut client_to_pipe_push,
+        &mut pipe_to_client_pull
+      )
+      .await
+      .is_ok()
+    );
+    timeout(Duration::from_secs(1), socks5_client_task)
+      .await
+      .unwrap()
+      .unwrap()
+      .unwrap();
+    timeout(Duration::from_secs(1), guest_task)
+      .await
+      .unwrap()
+      .unwrap();
+    timeout(Duration::from_secs(1), listener_socks5_task)
+      .await
+      .unwrap()
+      .unwrap();
   }
 }

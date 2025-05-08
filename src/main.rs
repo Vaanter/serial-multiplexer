@@ -1,12 +1,12 @@
+use crate::common::ConnectionState;
 use crate::guest::client_initiator;
-use crate::host::{connection_initiator, run_listener};
+use crate::host::{ConnectionType, connection_initiator, run_listener};
 use crate::utils::create_upstream_listener;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use common::sink_loop;
 use config::Config;
 use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
-use futures::join;
 use futures::stream::FuturesUnordered;
 use std::fs::OpenOptions;
 use std::time::Duration;
@@ -126,7 +126,7 @@ fn main() {
           run_guest(serial_path, baud_rate).await;
         }
         Commands::Host { pipe_path } => {
-          let addresses = config
+          let direct_connections = config
             .get_array("address_pairs")
             .expect("Config should contain address pairs")
             .into_iter()
@@ -147,7 +147,9 @@ fn main() {
                 .to_string(),
             })
             .collect::<Vec<AddressPair>>();
-          run_server(pipe_path, addresses).await;
+
+          let socks5_proxy = config.get_string("socks5_proxy").ok();
+          run_host(pipe_path, direct_connections, socks5_proxy).await;
         }
       }
     });
@@ -155,13 +157,21 @@ fn main() {
 
 #[cfg(unix)]
 #[instrument(skip_all)]
-async fn run_server(_pipe_path: Vec<String>, _addresses: Vec<AddressPair>) {
+async fn run_server(
+  pipe_path: Vec<String>,
+  direct_connections: Vec<AddressPair>,
+  socks5_proxy: Option<String>,
+) {
   panic!("Running on linux is not supported.");
 }
 
 #[cfg(windows)]
 #[instrument(skip_all)]
-async fn run_server(pipe_path: Vec<String>, addresses: Vec<AddressPair>) {
+async fn run_host(
+  pipe_path: Vec<String>,
+  direct_connections: Vec<AddressPair>,
+  socks5_proxy: Option<String>,
+) {
   let cancel = CancellationToken::new();
   let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(128);
   let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(128);
@@ -202,62 +212,77 @@ async fn run_server(pipe_path: Vec<String>, addresses: Vec<AddressPair>) {
     tasks.push(pipe_task);
   }
 
-  for pair in addresses.into_iter() {
-    let client_to_pipe_push = client_to_pipe_push.clone();
-    let pipe_to_client_pull = pipe_to_client_pull.resubscribe();
+  let (connection_sender, connection_receiver) = mpsc::channel(128);
+
+  for pair_direct in direct_connections.into_iter() {
     let cancel = cancel.clone();
+    let connection_sender = connection_sender.clone();
     let pair_task = tokio::spawn(async move {
-      setup_address_pair(pair, client_to_pipe_push, pipe_to_client_pull, cancel).await;
+      setup_listener(
+        pair_direct.listener_address,
+        ConnectionType::new_direct(pair_direct.target_address),
+        connection_sender,
+        cancel,
+      )
+      .await;
     });
     tasks.push(pair_task);
   }
 
-  let join = maybe_done(join_all(tasks));
-  run_indefinitely(cancel.clone(), join).await;
+  let initiator_task = tokio::spawn({
+    let cancel = cancel.clone();
+    connection_initiator(client_to_pipe_push, pipe_to_client_pull, connection_receiver, cancel)
+  });
+  tasks.push(initiator_task);
+
+  if let Some(socks5_proxy) = socks5_proxy {
+    let cancel = cancel.clone();
+    let connection_sender = connection_sender.clone();
+    let socks5_task = tokio::spawn(async move {
+      setup_listener(socks5_proxy, ConnectionType::new_socks5(), connection_sender, cancel).await;
+    });
+    tasks.push(socks5_task);
+  }
+
+  let joined_tasks = maybe_done(join_all(tasks));
+  run_indefinitely(cancel.clone(), joined_tasks).await;
 }
 
 #[instrument(skip_all)]
-async fn setup_address_pair(
-  pair: AddressPair,
-  client_to_pipe_push: async_channel::Sender<Bytes>,
-  pipe_to_client_pull: broadcast::Receiver<Bytes>,
+async fn setup_listener(
+  listener_address: String,
+  connection_type: ConnectionType,
+  connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
-) {
-  let listener_address = pair.listener_address;
-  let target_address = pair.target_address;
-  let (connection_sender, connection_receiver) = mpsc::channel(128);
-
+) -> Option<JoinHandle<()>> {
   let listener = match create_upstream_listener(&listener_address).await {
     Ok(Some(listener)) => {
-      info!("Created listener at {} for {}", listener_address, target_address);
+      match connection_type {
+        ConnectionType::Socks5 => {
+          info!("Created Socks5 listener at {}", listener_address);
+        }
+        ConnectionType::Direct { ref target_address } => {
+          info!("Created listener at {} for {}", listener_address, target_address);
+        }
+      }
       listener
     }
     Ok(None) => {
       error!("Failed to create listener for address {}.", listener_address);
-      return;
+      return None;
     }
     Err(e) => {
       error!("Failed to create listener for address {}: {}", listener_address, e);
-      return;
+      return None;
     }
   };
 
-  let listener_task = tokio::spawn({
+  Some(tokio::spawn({
     let cancel = cancel.clone();
     async move {
-      run_listener(listener, target_address, connection_sender, cancel).await;
+      run_listener(listener, connection_type, connection_sender, cancel).await;
     }
-  });
-
-  let initiator_task = tokio::spawn({
-    let cancel = cancel.clone();
-    async move {
-      connection_initiator(client_to_pipe_push, pipe_to_client_pull, connection_receiver, cancel)
-        .await;
-    }
-  });
-
-  let _ = join!(listener_task, initiator_task);
+  }))
 }
 
 #[instrument(skip_all)]
