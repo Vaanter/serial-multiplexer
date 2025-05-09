@@ -112,7 +112,13 @@ async fn guest_loop(
       }
       bytes_read = connection.client.read(&mut tcp_buf) => {
         connection.sequence += 1;
-        if handle_client_read(connection.identifier, connection.sequence,  client_to_serial_push.clone(), bytes_read, &mut tcp_buf).await {
+        if handle_client_read(
+          connection.identifier,
+          connection.sequence,
+          client_to_serial_push.clone(),
+          bytes_read,
+          &mut tcp_buf,
+        ).await {
           break;
         }
       }
@@ -149,5 +155,76 @@ mod tests {
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.identifier(), 123);
     assert_eq!(ack_datagram.data().unwrap().len(), 0);
+  }
+
+  #[tokio::test]
+  async fn test_initiate_client_connection_invalid_datagram() {
+    setup_tracing().await;
+    let (client_to_serial_push, _) = async_channel::bounded(10);
+
+    let connection = initiate_client_connection(Bytes::new(), client_to_serial_push.clone()).await;
+    assert!(matches!(connection, Ok(None)));
+  }
+
+  #[tokio::test]
+  async fn test_client_initiator_success() {
+    setup_tracing().await;
+    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
+    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let (target_address, _) = run_echo().await;
+    let target_address = target_address.to_string();
+    let initial = create_initial_datagram(123, 0, &target_address);
+
+    tokio::spawn(client_initiator(
+      serial_to_client_pull,
+      client_to_serial_push,
+      CancellationToken::new(),
+    ));
+
+    serial_to_client_push.send(initial).unwrap();
+    let ack = client_to_serial_pull.recv().await.unwrap();
+    let ack_datagram = root_as_datagram(&ack).unwrap();
+    assert_eq!(ack_datagram.code(), ControlCode::Ack);
+    assert_eq!(ack_datagram.identifier(), 123);
+    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+  }
+
+  #[tokio::test]
+  async fn test_client_initiator_target_unreachable() {
+    setup_tracing().await;
+    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
+    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let target_address = "127.0.0.1:0".to_string();
+    let initial = create_initial_datagram(123, 0, &target_address);
+
+    tokio::spawn(client_initiator(
+      serial_to_client_pull,
+      client_to_serial_push,
+      CancellationToken::new(),
+    ));
+
+    serial_to_client_push.send(initial).unwrap();
+    assert!(
+      timeout(Duration::from_secs(1), client_to_serial_pull.recv())
+        .await
+        .is_err()
+    );
+  }
+
+  #[tokio::test]
+  async fn test_client_initiator_pipe_closed() {
+    setup_tracing().await;
+    let (client_to_serial_push, _) = async_channel::bounded(10);
+    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let cancel = CancellationToken::new();
+
+    tokio::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
+
+    drop(serial_to_client_push);
+    assert!(
+      timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .is_ok()
+    );
   }
 }

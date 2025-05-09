@@ -295,7 +295,13 @@ pub async fn connection_loop(
       }
       bytes_read = connection.client.read(&mut tcp_buf) => {
         connection.sequence += 1;
-        if handle_client_read(connection.identifier, connection.sequence, client_to_pipe_push.clone(), bytes_read, &mut tcp_buf).await {
+        if handle_client_read(
+          connection.identifier,
+          connection.sequence,
+          client_to_pipe_push.clone(),
+          bytes_read,
+          &mut tcp_buf,
+        ).await {
           break;
         }
       }
@@ -308,7 +314,7 @@ pub async fn connection_loop(
 mod tests {
   use super::*;
   use crate::protocol_utils::create_ack_datagram;
-  use crate::test_utils::{run_echo, setup_tracing};
+  use crate::test_utils::{receive_initial_ack_data, run_echo, setup_tracing};
   use fast_socks5::client::{Config, Socks5Stream};
   use tokio::net::TcpStream;
 
@@ -421,6 +427,114 @@ mod tests {
       .unwrap()
       .unwrap();
     timeout(Duration::from_secs(1), listener_socks5_task)
+      .await
+      .unwrap()
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_handle_new_connection_direct_success() {
+    setup_tracing().await;
+    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let cancel = CancellationToken::new();
+    let (target_addr, _) = run_echo().await;
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_address = local_listener.local_addr().unwrap();
+    let data_datagram_contents = Bytes::from_static(b"test");
+
+    let client_task = tokio::spawn({
+      let data_datagram_contents = data_datagram_contents.clone();
+      async move {
+        let mut client = TcpStream::connect(local_address).await.unwrap();
+        client.write_all(&data_datagram_contents).await.unwrap();
+      }
+    });
+
+    let connection_type = ConnectionType::new_direct(target_addr.to_string());
+    let connection_state = ConnectionState::new(0, local_listener.accept().await.unwrap().0);
+
+    let guest_task = receive_initial_ack_data(
+      connection_state.identifier,
+      Bytes::from(target_addr.to_string()),
+      client_to_pipe_pull,
+      pipe_to_client_push,
+      data_datagram_contents,
+    );
+
+    handle_new_connection(
+      connection_state,
+      connection_type,
+      client_to_pipe_push,
+      pipe_to_client_pull,
+      cancel,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), guest_task)
+      .await
+      .unwrap()
+      .unwrap();
+    timeout(Duration::from_secs(3), client_task)
+      .await
+      .unwrap()
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_handle_new_connection_socks5_success() {
+    setup_tracing().await;
+    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let cancel = CancellationToken::new();
+    let (target_addr, _) = run_echo().await;
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_address = local_listener.local_addr().unwrap();
+    let data_datagram_contents = Bytes::from_static(b"test");
+
+    let client_task = tokio::spawn({
+      let data_datagram_contents = data_datagram_contents.clone();
+      async move {
+        let mut socks5_stream = Socks5Stream::connect(
+          local_address,
+          target_addr.ip().to_string(),
+          target_addr.port(),
+          Config::default(),
+        )
+        .await
+        .unwrap();
+        socks5_stream
+          .write_all(&data_datagram_contents)
+          .await
+          .unwrap();
+      }
+    });
+
+    let connection_type = ConnectionType::Socks5;
+    let connection_state = ConnectionState::new(0, local_listener.accept().await.unwrap().0);
+
+    let guest_task = receive_initial_ack_data(
+      connection_state.identifier,
+      Bytes::from(target_addr.to_string()),
+      client_to_pipe_pull,
+      pipe_to_client_push,
+      data_datagram_contents,
+    );
+
+    handle_new_connection(
+      connection_state,
+      connection_type,
+      client_to_pipe_push,
+      pipe_to_client_pull,
+      cancel,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), guest_task)
+      .await
+      .unwrap()
+      .unwrap();
+    timeout(Duration::from_secs(3), client_task)
       .await
       .unwrap()
       .unwrap();
