@@ -1,17 +1,15 @@
-use crate::common::ConnectionState;
-use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
+use crate::common::{ConnectionState, connection_loop};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
 use crate::utils::connect_downstream;
 use anyhow::bail;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
-use tracing_attributes::instrument;
 
 pub async fn client_initiator(
   mut serial_to_client_pull: broadcast::Receiver<Bytes>,
@@ -30,7 +28,12 @@ pub async fn client_initiator(
             match timeout(Duration::from_secs(3),
               initiate_client_connection(data, client_to_serial_push.clone())).await {
               Ok(Ok(Some(connection))) => {
-                tokio::spawn(guest_loop(connection, client_to_serial_push.clone(), serial_to_client_pull.resubscribe(), cancel.clone()));
+                tokio::spawn(connection_loop(
+                  connection,
+                  serial_to_client_pull.resubscribe(),
+                  client_to_serial_push.clone(),
+                  cancel.clone()
+                ));
               },
               Ok(Err(e)) => {
                 error!("Failed to initiate client connection: {}", e);
@@ -88,43 +91,6 @@ async fn initiate_client_connection(
       Ok(None)
     }
   }
-}
-
-#[instrument(skip_all, fields(connection_id = %connection.identifier))]
-async fn guest_loop(
-  mut connection: ConnectionState,
-  client_to_serial_push: async_channel::Sender<Bytes>,
-  mut serial_to_client_pull: broadcast::Receiver<Bytes>,
-  cancel: CancellationToken,
-) {
-  let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
-  loop {
-    tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
-    tokio::select! {
-      biased;
-      _ = cancel.cancelled() => {
-        break;
-      }
-      data = serial_to_client_pull.recv() => {
-        if process_sink_read(&mut connection, data).await {
-          break;
-        }
-      }
-      bytes_read = connection.client.read(&mut tcp_buf) => {
-        connection.sequence += 1;
-        if handle_client_read(
-          connection.identifier,
-          connection.sequence,
-          client_to_serial_push.clone(),
-          bytes_read,
-          &mut tcp_buf,
-        ).await {
-          break;
-        }
-      }
-    }
-  }
-  debug!("Client {} disconnected", connection.identifier);
 }
 
 #[cfg(test)]

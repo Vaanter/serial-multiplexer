@@ -11,6 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
+use tracing_attributes::instrument;
 use zeroize::Zeroize;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
@@ -587,6 +588,78 @@ pub async fn process_sink_read(
     }
     Err(_) => false,
   }
+}
+
+/// Handles reading and processing data to/from the client and serial port(s).
+///
+/// # Parameters
+///
+/// * `connection` - The current [`ConnectionState`] that holds the client's state and identifier.
+/// * `pipe_to_client_pull` -
+///   A [`broadcast::Receiver<Bytes>`] to receive datagrams from the sink for processing.
+/// * `client_to_pipe_push` -
+///   An [`async_channel::Sender`] for sending data received from the client to the sink(s).
+/// * `cancel` -
+///   A [`CancellationToken`] used to signal loop termination due to the app shutting down.
+///
+/// # Behaviour
+///
+/// The function runs in a loop that listens for three primary conditions:
+/// 1. **Cancellation signal**: If `cancel.cancelled()` is triggered, the connection is closed
+///    gracefully by shutting down the client, sending a [`Close`] datagram and exiting the loop.
+/// 2. **Incoming data from the server**:
+///    When [`pipe_to_client_pull.recv()`] receives data from sink,
+///    it uses [`process_sink_read()`] to handle and forward the data to the client.
+///    The processing might signal connection termination, which breaks the loop.
+/// 3. **Incoming data from the client**:
+///    When [`connection.client.read()`] receives data from the client,
+///    it processes the data with [`handle_client_read()`].
+///    The processing might signal connection termination, which breaks the loop.
+///
+/// [`Close`]: ControlCode::Close
+#[instrument(skip_all, fields(connection_id = %connection.identifier))]
+pub async fn connection_loop(
+  mut connection: ConnectionState,
+  mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
+  client_to_pipe_push: async_channel::Sender<Bytes>,
+  cancel: CancellationToken,
+) {
+  let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
+  loop {
+    tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
+    tokio::select! {
+      biased;
+      _ = cancel.cancelled() => {
+        if let Err(e) = connection.client.shutdown().await {
+          error!("Failed to shutdown client after server shutdown: {}", e);
+        }
+        connection.sequence += 1;
+        let datagram = create_close_datagram(connection.identifier, connection.sequence);
+        if let Err(e) = client_to_pipe_push.send(datagram).await {
+          error!("Failed to send CLOSE datagram for connection {}: {}", connection.identifier, e);
+        }
+        break;
+      }
+      data = pipe_to_client_pull.recv() => {
+        if process_sink_read(&mut connection, data).await {
+          break;
+        }
+      }
+      bytes_read = connection.client.read(&mut tcp_buf) => {
+        connection.sequence += 1;
+        if handle_client_read(
+          connection.identifier,
+          connection.sequence,
+          client_to_pipe_push.clone(),
+          bytes_read,
+          &mut tcp_buf,
+        ).await {
+          break;
+        }
+      }
+    }
+  }
+  debug!("Connection {} loop ending", connection.identifier);
 }
 
 /// Splits a 16-bit unsigned integer (`u16`) into two 8-bit unsigned integers (`u8`)

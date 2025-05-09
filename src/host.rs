@@ -1,15 +1,14 @@
-use crate::common::ConnectionState;
-use crate::common::{CONNECTION_BUFFER_SIZE, handle_client_read, process_sink_read};
+use crate::common::{ConnectionState, connection_loop};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use anyhow::{Context, Error};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use fast_socks5::ReplyError;
 use fast_socks5::server::Socks5ServerProtocol;
 use futures::TryFutureExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
@@ -217,7 +216,7 @@ async fn initiate_socks5_connection(
         Err(anyhow::anyhow!("Failed to initialize guest connection"))
       }
     }
-    Err(e) => Err(anyhow::Error::new(e)),
+    Err(e) => Err(Error::new(e)),
   }
 }
 
@@ -268,46 +267,6 @@ async fn initiate_connection(
       false
     }
   }
-}
-
-#[instrument(skip_all, fields(connection_id = %connection.identifier))]
-pub async fn connection_loop(
-  mut connection: ConnectionState,
-  mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  client_to_pipe_push: async_channel::Sender<Bytes>,
-  cancel: CancellationToken,
-) {
-  let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
-  loop {
-    tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
-    tokio::select! {
-      biased;
-      _ = cancel.cancelled() => {
-        if let Err(e) = connection.client.shutdown().await {
-          error!("Failed to shutdown client after server shutdown: {}", e);
-        }
-        break;
-      }
-      data = pipe_to_client_pull.recv() => {
-        if process_sink_read(&mut connection, data).await {
-          break;
-        }
-      }
-      bytes_read = connection.client.read(&mut tcp_buf) => {
-        connection.sequence += 1;
-        if handle_client_read(
-          connection.identifier,
-          connection.sequence,
-          client_to_pipe_push.clone(),
-          bytes_read,
-          &mut tcp_buf,
-        ).await {
-          break;
-        }
-      }
-    }
-  }
-  debug!("Connection {} loop ending", connection.identifier);
 }
 
 #[cfg(test)]
