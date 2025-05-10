@@ -30,10 +30,6 @@ impl ConnectionType {
   pub fn new_direct(target_address: String) -> Self {
     Self::Direct { target_address }
   }
-
-  pub fn new_socks5() -> Self {
-    Self::Socks5
-  }
 }
 
 #[cfg(windows)]

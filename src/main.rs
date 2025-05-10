@@ -250,9 +250,7 @@ async fn run_host(
   if let Some(socks5_proxy) = socks5_proxy {
     let cancel = cancel.clone();
     let connection_sender = connection_sender.clone();
-    match setup_listener(&socks5_proxy, ConnectionType::new_socks5(), connection_sender, cancel)
-      .await
-    {
+    match setup_listener(&socks5_proxy, ConnectionType::Socks5, connection_sender, cancel).await {
       Ok(socks5_task) => {
         listener_tasks.push(socks5_task);
       }
