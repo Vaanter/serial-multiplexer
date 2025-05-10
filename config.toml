@@ -3,4 +3,6 @@ address_pairs = [
     {listener_address = "127.0.0.1:1235", target_address = "google.com:443"},
 ]
 
-log_file = "serial-multiplexer.log"
+socks5_proxy = "127.0.0.1:2345"
+
+# log_file = "serial-multiplexer.log"
