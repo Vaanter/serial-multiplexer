@@ -595,9 +595,9 @@ pub async fn process_sink_read(
 /// # Parameters
 ///
 /// * `connection` - The current [`ConnectionState`] that holds the client's state and identifier.
-/// * `pipe_to_client_pull` -
+/// * `sink_to_client_pull` -
 ///   A [`broadcast::Receiver<Bytes>`] to receive datagrams from the sink for processing.
-/// * `client_to_pipe_push` -
+/// * `client_to_sink_push` -
 ///   An [`async_channel::Sender`] for sending data received from the client to the sink(s).
 /// * `cancel` -
 ///   A [`CancellationToken`] used to signal loop termination due to the app shutting down.
@@ -620,8 +620,8 @@ pub async fn process_sink_read(
 #[instrument(skip_all, fields(connection_id = %connection.identifier))]
 pub async fn connection_loop(
   mut connection: ConnectionState,
-  mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
-  client_to_pipe_push: async_channel::Sender<Bytes>,
+  mut sink_to_client_pull: broadcast::Receiver<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
@@ -635,12 +635,12 @@ pub async fn connection_loop(
         }
         connection.sequence += 1;
         let datagram = create_close_datagram(connection.identifier, connection.sequence);
-        if let Err(e) = client_to_pipe_push.send(datagram).await {
+        if let Err(e) = client_to_sink_push.send(datagram).await {
           error!("Failed to send CLOSE datagram for connection {}: {}", connection.identifier, e);
         }
         break;
       }
-      data = pipe_to_client_pull.recv() => {
+      data = sink_to_client_pull.recv() => {
         if process_sink_read(&mut connection, data).await {
           break;
         }
@@ -650,7 +650,7 @@ pub async fn connection_loop(
         if handle_client_read(
           connection.identifier,
           connection.sequence,
-          client_to_pipe_push.clone(),
+          client_to_sink_push.clone(),
           bytes_read,
           &mut tcp_buf,
         ).await {
@@ -711,7 +711,7 @@ mod tests {
   use tokio::time::timeout;
 
   #[tokio::test]
-  async fn test_handle_sink_read() {
+  async fn test_handle_sink_read_double_with_rubbish() {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
@@ -770,6 +770,27 @@ mod tests {
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram3);
+    assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+  }
+
+  #[tokio::test]
+  async fn test_handle_sink_read_large() {
+    setup_tracing().await;
+    let mut sink_buf = BytesMut::new();
+    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+
+    let datagram_data = BytesMut::zeroed(CONNECTION_BUFFER_SIZE + 64);
+    let datagram = create_data_datagram(0, 1, &datagram_data);
+    sink_buf.extend_from_slice(&DATAGRAM_HEADER);
+    sink_buf.extend_from_slice(&split_u16_to_u8(datagram.len() as u16));
+    sink_buf.extend_from_slice(&datagram);
+
+    let buffer_size = sink_buf.len();
+    let unprocessed_bytes =
+      handle_sink_read(buffer_size, &mut sink_buf, sink_to_client_push.clone()).unwrap();
+    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(unprocessed_bytes, 0);
+    assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram);
     assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
   }
 
@@ -886,7 +907,7 @@ mod tests {
 
     info!("Sending large datagram 3");
     let mut data = BytesMut::new();
-    data.resize(1000, 100u8);
+    data.resize(10000, 100u8);
     let data_datagram = create_data_datagram(3, 4, &data);
     handle_sink_write(&mut sink_b, data_datagram).await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
@@ -897,7 +918,7 @@ mod tests {
 
     info!("Sending large datagram 4");
     let mut data = BytesMut::new();
-    data.resize(1000, 100u8);
+    data.resize(15000, 100u8);
     let data_datagram = create_data_datagram(3, 3, &data);
     handle_sink_write(&mut sink_b, data_datagram).await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
@@ -908,7 +929,7 @@ mod tests {
 
     info!("Sending large datagram 5");
     let mut data = BytesMut::new();
-    data.resize(1000, 100u8);
+    data.resize(CONNECTION_BUFFER_SIZE, 100u8);
     let data_datagram = create_data_datagram(3, 5, &data);
     handle_sink_write(&mut sink_b, data_datagram).await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
