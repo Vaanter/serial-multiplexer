@@ -1,14 +1,14 @@
 [package]
 name = "serial-multiplexer"
 authors = ["Valentín Bolfík <valentin.bolfik@gmail.com>"]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
 async-channel = "2.3.1"
 bytes = "1.10.1"
-clap = { version = "4.5.37", features = ["derive"] }
+clap = { version = "4.5.38", features = ["derive"] }
 config = { version = "0.15.11", default-features = false, features = ["toml"] }
 fast-socks5 = "1.0.0-rc.0"
 flatbuffers = "25.2.10"
