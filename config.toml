@@ -6,3 +6,4 @@ address_pairs = [
 socks5_proxy = "127.0.0.1:2345"
 
 # log_file = "serial-multiplexer.log"
+tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info"

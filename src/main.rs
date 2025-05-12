@@ -83,13 +83,6 @@ fn main() {
     .build()
     .expect("Failed to load config");
 
-  let level = match args.verbose {
-    1 => Level::INFO,
-    2 => Level::DEBUG,
-    n if n > 2 => Level::TRACE,
-    _ => Level::WARN,
-  };
-
   let (writer, _guard) = if let Ok(log_file_name) = config.get_string("log_file") {
     let mut log_file_options = OpenOptions::new();
     log_file_options.write(true).truncate(true).create(true);
@@ -101,6 +94,8 @@ fn main() {
     tracing_appender::non_blocking(std::io::stdout())
   };
 
+  let tracing_filter = config.get_string("tracing_filter").ok();
+
   let fmt_layer = tracing_subscriber::fmt::Layer::default()
     .with_writer(writer)
     .with_file(false)
@@ -108,7 +103,7 @@ fn main() {
     .with_line_number(false)
     .with_thread_ids(true)
     .with_target(false)
-    .with_filter(EnvFilter::new(format!("serial_multiplexer={}", level)));
+    .with_filter(build_filter(tracing_filter, args.verbose));
 
   Registry::default().with(fmt_layer).init();
   debug!("args: {:?}", args);
@@ -135,6 +130,17 @@ fn main() {
         }
       }
     });
+}
+
+fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
+  let level = match verbosity {
+    1 => Level::INFO,
+    2 => Level::DEBUG,
+    n if n > 2 => Level::TRACE,
+    _ => Level::WARN,
+  };
+  let filter_string = filter_string.unwrap_or(format!("{}={}", env!("CARGO_CRATE_NAME"), level));
+  EnvFilter::new(filter_string)
 }
 
 fn load_direct_connections(config: &Config) -> Vec<AddressPair> {
