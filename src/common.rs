@@ -19,6 +19,7 @@ pub(crate) const CONNECTION_BUFFER_SIZE: usize = 2usize.pow(15);
 /// An array representing a header used to identify the start of a datagram in a byte stream
 const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
+pub const HUGE_DATA_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::huge_data");
 /// Number of bytes used to store the size of a datagram
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
@@ -241,7 +242,7 @@ pub fn handle_sink_read(
 ) -> anyhow::Result<usize> {
   trace!("Read {} bytes from sink", bytes_read);
   let mut read_data = &sink_buf[..bytes_read];
-  trace!("Data in working buffer: {:?}", &read_data);
+  trace!(target: HUGE_DATA_TARGET, "Data in working buffer: {:?}", &read_data);
   let mut unprocessed_data_start = 0;
   while let Some(header_idx) = HEADER_FINDER.find(read_data) {
     trace!("Found HEADER at index {}", header_idx);
@@ -261,7 +262,7 @@ pub fn handle_sink_read(
     let datagram_start = header_idx + HEADER_BYTES + LENGTH_BYTES;
     let datagram_end = datagram_start + size as usize - 1;
     let datagram_bytes = Bytes::copy_from_slice(&read_data[datagram_start..=datagram_end]);
-    trace!("Read datagram: {:?}", datagram_bytes);
+    trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes);
     if let Err(e) = sink_to_client_push.send(datagram_bytes) {
       bail!("Failed to send data to clients. {}", e);
     }
@@ -271,7 +272,7 @@ pub fn handle_sink_read(
       min(bytes_read, unprocessed_data_start)
     );
     read_data = &sink_buf[min(bytes_read, unprocessed_data_start)..bytes_read];
-    trace!("Data in buffer after reading datagram: {:?}", &read_data);
+    trace!(target: HUGE_DATA_TARGET, "Data in buffer after reading datagram: {:?}", &read_data);
   }
 
   let mut unprocessed_bytes = bytes_read;
@@ -286,10 +287,10 @@ pub fn handle_sink_read(
         unprocessed_data_start
       );
       let buffer_end = sink_buf.len();
-      trace!("Buffer before copying and zeroing: {:?}", &sink_buf);
+      trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", &sink_buf);
       sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
       sink_buf[unprocessed_bytes..buffer_end].zeroize();
-      trace!("Buffer after copying and zeroing: {:?}", &sink_buf);
+      trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", &sink_buf);
     }
   }
   Ok(unprocessed_bytes)
@@ -341,7 +342,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   data: Bytes,
 ) -> anyhow::Result<()> {
   debug!("Writing {} bytes to sink", data.len() + HEADER_BYTES + LENGTH_BYTES);
-  trace!("Writing datagram to sink: {:?}", data);
+  trace!(target: HUGE_DATA_TARGET, "Writing datagram to sink: {:?}", data);
   if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
     bail!("Failed to write HEADER to sink: {}", e);
   }
@@ -528,7 +529,7 @@ pub async fn process_sink_read(
         datagram_sequence,
         datagram.data().map(|d| d.len()).unwrap_or(0)
       );
-      trace!("Datagrams in queue: {:?}", connection.datagram_queue);
+      trace!(target: HUGE_DATA_TARGET, "Datagrams in queue: {:?}", connection.datagram_queue);
       if datagram_sequence >= (connection.largest_processed + 2) {
         trace!(
           "Received datagram out of order, seq: {}, largest sent: {}",
@@ -708,7 +709,7 @@ mod tests {
   use std::time::Duration;
   use tokio::net::{TcpListener, TcpStream};
   use tokio::sync::mpsc;
-  use tokio::time::timeout;
+  use tokio::time::{sleep, timeout};
 
   #[tokio::test]
   async fn test_handle_sink_read_double_with_rubbish() {
@@ -941,7 +942,7 @@ mod tests {
     // Write datagram in parts
     info!("Sending split datagram");
     let mut data = BytesMut::new();
-    data.resize(1000, 100u8);
+    data.resize(1000, 5u8);
     let data_datagram = create_data_datagram(3, 6, &data);
     sink_b.write_all(&DATAGRAM_HEADER).await.unwrap();
     sink_b.flush().await.unwrap();
@@ -950,16 +951,22 @@ mod tests {
     sink_b.flush().await.unwrap();
     sink_b.write_all(&data_datagram[0..100]).await.unwrap();
     sink_b.flush().await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.write_all(&data_datagram[100..400]).await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.flush().await.unwrap();
     sink_b.write_all(&data_datagram[400..405]).await.unwrap();
     sink_b.flush().await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.write_all(&data_datagram[405..800]).await.unwrap();
     sink_b.flush().await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.write_all(&data_datagram[800..801]).await.unwrap();
     sink_b.flush().await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.write_all(&data_datagram[801..802]).await.unwrap();
     sink_b.flush().await.unwrap();
+    sleep(Duration::from_millis(10)).await;
     sink_b.write_all(&data_datagram[802..]).await.unwrap();
     sink_b.flush().await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();

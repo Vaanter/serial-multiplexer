@@ -1,4 +1,4 @@
-use crate::common::{ConnectionState, connection_loop};
+use crate::common::{ConnectionState, HUGE_DATA_TARGET, connection_loop};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use anyhow::{Context, Error};
@@ -223,7 +223,7 @@ async fn initiate_connection(
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection_identifier, 0, &target_address);
-  trace!("Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
+  trace!(target: HUGE_DATA_TARGET, "Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
   if let Err(e) = client_to_pipe_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);
     return false;
@@ -234,7 +234,7 @@ async fn initiate_connection(
       match pipe_to_client_pull.recv().await {
         Ok(data) => match root_as_datagram(&data) {
           Ok(datagram) => {
-            trace!("Received datagram from server: {:?}", datagram);
+            trace!(target: HUGE_DATA_TARGET, "Received datagram from server: {:?}", datagram);
             if datagram.identifier() == connection_identifier {
               break Some(data);
             }
@@ -253,7 +253,7 @@ async fn initiate_connection(
       let datagram = root_as_datagram(&datagram)
         .expect("Datagram should have been validated by checking the identifier");
       if datagram.code() != ControlCode::Ack || datagram.identifier() != connection_identifier {
-        debug!("Received invalid response from server: {:?}", datagram);
+        debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
         return false;
       }
       true
