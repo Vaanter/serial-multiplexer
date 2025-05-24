@@ -115,27 +115,6 @@ impl ConnectionState {
 /// * `cancel.cancelled()`:
 ///   - Terminates the loop immediately when cancellation is triggered.
 ///
-/// # Errors
-///
-/// - Logs errors that occur while reading from or writing to the `sink`.
-/// - Logs any errors that occur when handling the client-to-sink channel.
-///
-/// # Logging
-///
-/// - Logs details when the loop terminates due to sink disconnection, receiver closure,
-///   or error conditions.
-///
-/// # Notes
-///
-/// - This function depends on external helper functions, such as [`handle_sink_write`]
-///   and [`handle_sink_read`], which are expected to manage specific operations for
-///   writing to and reading from the `sink`.
-///   These functions must return appropriate
-///   error types when an operation fails.
-///
-/// - [`SINK_BUFFER_SIZE`] needs to be defined in the outer scope with an appropriate
-///   buffer size for reading the sink.
-///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
 pub async fn sink_loop(
@@ -205,6 +184,8 @@ pub async fn sink_loop(
 ///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
 /// * `sink_to_client_push` - A [`broadcast::Sender<Bytes>`]
 ///   used to send processed datagrams to clients.
+/// * `decompression_buffer` - A mutable reference to a buffer ([`BytesMut`]) for storing
+///   the datagram after decompression
 ///
 /// # Behaviour
 ///
@@ -213,8 +194,9 @@ pub async fn sink_loop(
 ///    within the buffer to identify the start of datagrams.
 /// 3. Extracts each datagram from the buffer if it is complete
 ///    (based on the size after the header).
-/// 4. Sends the processed datagram to clients via the `sink_to_client_push` channel.
-/// 5. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
+/// 4. Decompresses the datagram
+/// 5. Sends the decompressed datagram to clients via the `sink_to_client_push` channel.
+/// 6. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
 ///    Ensures already processed
 ///    data is removed or cleared appropriately.
 ///
@@ -241,16 +223,6 @@ pub async fn sink_loop(
 ///   * If the entire buffer was processed, the buffer will be zeroed out.
 ///   * If some bytes remain unprocessed, they will be copied to the beginning of the buffer
 ///     and the rest of the buffer will be zeroed out.
-///
-/// # Logging
-///
-/// - Logs detailed trace information about the state of the processing, including
-///   * Read bytes
-///   * Found headers and sizes
-///   * Processed datagrams
-///   * Buffer adjustments
-///
-/// - Ensure the appropriate logging level is configured to utilize the `trace!` statements.
 pub fn handle_sink_read(
   bytes_read: usize,
   sink_buf: &mut BytesMut,
@@ -333,13 +305,16 @@ pub fn handle_sink_read(
 ///   Currently, this will either be [`SerialStream`] or [`NamedPipeClient`].
 /// * `data`:
 ///   A [`Bytes`] object representing the datagram that will be written to the sink.
+/// * `compression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
+///   the datagram after compression
 ///
 /// # Behaviour
 /// The function follows these steps:
-/// 1. Writes a constant [`DATAGRAM_HEADER`] (the header) to the sink.
-/// 2. Writes the size of the `data` as a 2-byte value to the sink.
-/// 3. Writes the `datagram` itself to the sink.
-/// 4. Flushes the sink to ensure everything is written out.
+/// 1. Compresses the datagram using [`zstd_safe`] into `compression_buffer`
+/// 2. Writes a constant [`DATAGRAM_HEADER`] (the header) to the sink.
+/// 3. Writes the size of the `data` as a 2-byte value to the sink.
+/// 4. Writes the `datagram` itself to the sink.
+/// 5. Flushes the sink to ensure everything is written out.
 ///
 /// # Errors
 /// This function returns an `anyhow::Result<()>`, which will contain an error
@@ -351,15 +326,9 @@ pub fn handle_sink_read(
 ///
 /// The error message will include details about which operation failed.
 ///
-/// # Logging
-/// Outputs a trace log with the total number of bytes being written (including the header
-/// and length bytes) and the datagram payload.
-///
 /// # Notes
 /// The size of the data is written as a 2-byte value using the [`split_u16_to_u8`]
 /// function.
-/// The [`HEADER_BYTES`] and [`LENGTH_BYTES`] constants are used in calculation
-/// for logging but are not directly involved in the logic.
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
@@ -422,16 +391,9 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 /// - If `bytes_read` is `Err(e)`, an error occurred while reading from the client. The error
 ///   is logged, and the function returns `true`.
 ///
-/// # Logging
-///
-/// - Logs client disconnection at the `info` level.
-/// - Logs the number of bytes read at the `debug` level.
-/// - Logs debug information for the created "DATA" datagram.
-/// - Logs errors at the `error` level if issues occur while sending datagrams or reading.
-///
 /// # Zeroization
 ///
-/// The portion of the read buffer containing the bytes read is securely zeroed to clear
+/// The portion of the read buffer containing the bytes read is zeroed to clear
 /// any sensitive data after processing.
 pub async fn handle_client_read(
   identifier: u64,
@@ -516,10 +478,6 @@ pub async fn handle_client_read(
 ///     - If a [`broadcast::error::RecvError::Closed`] is encountered, it shuts down the client
 ///       connection and returns `true`.
 ///
-/// # Logging
-/// The function logs extensively using `debug`, `trace`, and `error` levels to provide insight
-/// into the state of datagram handling, sequencing, data transmission, and error conditions.
-///
 /// # Example Workflow
 /// 1. Receives incoming datagrams from a sink.
 /// 2. Validates the datagrams' identifier and integrity.
@@ -528,11 +486,10 @@ pub async fn handle_client_read(
 /// 5. Handles special control codes like [`Close`] by shutting down the connection.
 ///
 /// # Errors
-/// - Logs errors encountered during writing, flushing, or shutting down the client.
 /// - Malformed datagrams are logged and ignored.
 ///
 /// # Notes
-/// - It leverages a connection's `datagram_queue` and `largest_processed` to ensure in-order
+/// - Connection's `datagram_queue` and `largest_processed` are used to ensure in-order
 ///   delivery of datagrams.
 ///
 /// [`Close`]: ControlCode::Close
