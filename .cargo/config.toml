@@ -1,4 +1,10 @@
-[profile.release]
-lto = "fat"
-codegen-units = 1
-debug = 0
+# statically link MSVC stuff
+# check https://github.com/microsoft/edit/blob/1cbb4cb1ad7a044eadb4cf49592d797266358951/.cargo/release-windows-ms.toml
+[target.'cfg(target_os = "windows")']
+rustflags = [
+    "-Ctarget-feature=+crt-static",
+    "-Clink-args=/DEFAULTLIB:ucrt.lib",
+    "-Clink-args=/NODEFAULTLIB:vcruntime.lib",
+    "-Clink-args=/NODEFAULTLIB:msvcrt.lib",
+    "-Clink-args=/NODEFAULTLIB:libucrt.lib",
+]

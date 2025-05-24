@@ -4,6 +4,14 @@ authors = ["Valentín Bolfík <valentin.bolfik@gmail.com>"]
 version = "0.4.0"
 edition = "2024"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "full"
+strip = "debuginfo"
+opt-level = 3
+incremental = true
+
 [dependencies]
 anyhow = "1.0.98"
 async-channel = "2.3.1"
