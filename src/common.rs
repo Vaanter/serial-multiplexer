@@ -259,7 +259,7 @@ pub fn handle_sink_read(
     .inspect(|n| debug!("Decompressed {} to {} byte", size, n))
     .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
-    decompression_buffer[..decompressed_size].zeroize();
+    decompression_buffer.zeroize();
     trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes);
     if let Err(e) = sink_to_client_push.send(datagram_bytes) {
       bail!("Failed to send data to clients. {}", e);
@@ -356,6 +356,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   if let Err(e) = sink.flush().await {
     bail!("Failed to flush sink after writing: {}", e);
   }
+  compression_buffer[..compressed_size].zeroize();
   Ok(())
 }
 
@@ -724,6 +725,7 @@ mod tests {
     assert_eq!(unprocessed_bytes, 3);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[4, 5, 6]));
     assert_eq!(sink_buf[3..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
     sink_buf.resize(unprocessed_bytes, 0);
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
@@ -743,6 +745,7 @@ mod tests {
     assert_eq!(unprocessed_bytes, 5);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[5; 100]));
     assert_eq!(sink_buf[5..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
@@ -782,6 +785,7 @@ mod tests {
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram3);
     assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
@@ -791,7 +795,7 @@ mod tests {
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
 
-    let datagram_data = BytesMut::zeroed(CONNECTION_BUFFER_SIZE + 64);
+    let datagram_data = BytesMut::from(vec![65u8; CONNECTION_BUFFER_SIZE].as_slice());
     let datagram = create_data_datagram(0, 1, &datagram_data);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram, 9).unwrap();
@@ -810,6 +814,7 @@ mod tests {
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram);
     assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(&compression_buf, &BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
@@ -832,6 +837,8 @@ mod tests {
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size);
+    assert_ne!(sink_buf, BytesMut::zeroed(sink_buf.len()));
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
@@ -857,6 +864,7 @@ mod tests {
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
@@ -888,6 +896,7 @@ mod tests {
     assert_eq!(initial_datagram.identifier(), 1);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data.as_bytes());
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     // write some rubbish between datagrams
     info!("Sending rubbish data");
@@ -905,6 +914,7 @@ mod tests {
     assert_eq!(ack_datagram.identifier(), 2);
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.data().unwrap().bytes(), &[]);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     // write more rubbish between datagrams
     info!("Sending rubbish data");
@@ -931,6 +941,7 @@ mod tests {
     assert_eq!(data_datagram.identifier(), 3);
     assert_eq!(data_datagram.code(), ControlCode::Data);
     assert_eq!(data_datagram.data().unwrap().bytes(), data);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     info!("Sending large datagram 2");
     let mut data = BytesMut::new();
@@ -944,6 +955,7 @@ mod tests {
     assert_eq!(data_datagram.identifier(), 3);
     assert_eq!(data_datagram.code(), ControlCode::Data);
     assert_eq!(data_datagram.data().unwrap().bytes(), data);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     info!("Sending large datagram 3");
     let mut data = BytesMut::new();
@@ -957,6 +969,7 @@ mod tests {
     assert_eq!(data_datagram.identifier(), 3);
     assert_eq!(data_datagram.code(), ControlCode::Data);
     assert_eq!(data_datagram.data().unwrap().bytes(), data);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     info!("Sending large datagram 4");
     let mut data = BytesMut::new();
@@ -970,6 +983,7 @@ mod tests {
     assert_eq!(data_datagram.identifier(), 3);
     assert_eq!(data_datagram.code(), ControlCode::Data);
     assert_eq!(data_datagram.data().unwrap().bytes(), data);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     info!("Sending large datagram 5");
     let mut data = BytesMut::new();
@@ -983,6 +997,7 @@ mod tests {
     assert_eq!(data_datagram.identifier(), 3);
     assert_eq!(data_datagram.code(), ControlCode::Data);
     assert_eq!(data_datagram.data().unwrap().bytes(), data);
+    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
   #[tokio::test]
