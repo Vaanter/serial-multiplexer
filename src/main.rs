@@ -55,14 +55,14 @@ enum Commands {
   /// Requires a functional pipe connection from VirtualBox.
   /// Note: This mode is Windows-exclusive.
   Host {
-    #[arg(short, long)]
+    #[arg(short, long, required = true)]
     pipe_path: Vec<String>,
   },
   /// Initializes the application in guest mode awaiting data from serial port.
   /// Requires a serial port.
   Guest {
     /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
-    #[arg(short, long)]
+    #[arg(short, long, required = true)]
     serial_path: Vec<String>,
     #[arg(short, long, default_value = "115200")]
     baud_rate: u32,
@@ -107,6 +107,7 @@ fn main() {
 
   Registry::default().with(fmt_layer).init();
   debug!("args: {:?}", args);
+  debug!("config: {:?}", config);
 
   tokio::runtime::Builder::new_multi_thread()
     .enable_all()
@@ -197,7 +198,7 @@ async fn run_host(
         Err(err) => {
           trace!("Failed to prepare pipe: {}", err);
           if retry_count >= 10 {
-            break;
+            panic!("Failed to prepare pipe {} after 10 attempts", &pipe_path);
           }
           sleep(Duration::from_millis(100)).await;
           retry_count += 1;
