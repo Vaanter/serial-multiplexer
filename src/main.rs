@@ -234,34 +234,27 @@ async fn run_host(
   for pair_direct in direct_connections.into_iter() {
     let cancel = cancel.clone();
     let connection_sender = connection_sender.clone();
-    match setup_listener(
+    let pair_task = setup_listener(
       &pair_direct.listener_address,
       ConnectionType::new_direct(pair_direct.target_address),
       connection_sender,
       cancel,
     )
     .await
-    {
-      Ok(pair_task) => {
-        listener_tasks.push(pair_task);
-      }
-      Err(e) => {
-        error!("Failed to setup listener for {}: {}", pair_direct.listener_address, e);
-      }
-    }
+    .unwrap_or_else(|e| {
+      panic!("Failed to setup listener for {}: {}", pair_direct.listener_address, e)
+    });
+    listener_tasks.push(pair_task);
   }
 
   if let Some(socks5_proxy) = socks5_proxy {
     let cancel = cancel.clone();
     let connection_sender = connection_sender.clone();
-    match setup_listener(&socks5_proxy, ConnectionType::Socks5, connection_sender, cancel).await {
-      Ok(socks5_task) => {
-        listener_tasks.push(socks5_task);
-      }
-      Err(e) => {
-        error!("Failed to setup socks5 listener at {}: {}", socks5_proxy, e);
-      }
-    }
+    let socks5_task =
+      setup_listener(&socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to setup socks5 listener at {}: {}", socks5_proxy, e));
+    listener_tasks.push(socks5_task);
   }
 
   assert!(!listener_tasks.is_empty(), "All listeners failed to start");
