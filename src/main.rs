@@ -124,9 +124,10 @@ fn main() {
         Commands::Host { pipe_path } => {
           let direct_connections = load_direct_connections(&config);
           let socks5_proxy = config.get_string("socks5_proxy").ok();
-          if direct_connections.is_empty() && socks5_proxy.is_none() {
-            panic!("No address pairs or socks5 proxy configured");
-          }
+          assert!(
+            !(direct_connections.is_empty() && socks5_proxy.is_none()),
+            "No address pairs or socks5 proxy configured"
+          );
           run_host(pipe_path, direct_connections, socks5_proxy).await;
         }
       }
@@ -140,7 +141,8 @@ fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
     n if n > 2 => Level::TRACE,
     _ => Level::WARN,
   };
-  let filter_string = filter_string.unwrap_or(format!("{}={}", env!("CARGO_CRATE_NAME"), level));
+  let filter_string =
+    filter_string.unwrap_or_else(|| format!("{}={}", env!("CARGO_CRATE_NAME"), level));
   EnvFilter::new(filter_string)
 }
 
@@ -154,11 +156,11 @@ fn load_direct_connections(config: &Config) -> Vec<AddressPair> {
     .map(|(idx, pair)| AddressPair {
       listener_address: pair
         .get("listener_address")
-        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the listener address", idx))
+        .unwrap_or_else(|| panic!("Address pair {idx} doesn't contain the listener address"))
         .to_string(),
       target_address: pair
         .get("target_address")
-        .unwrap_or_else(|| panic!("Address pair {} doesn't contain the target address", idx))
+        .unwrap_or_else(|| panic!("Address pair {idx} doesn't contain the target address"))
         .to_string(),
     })
     .collect::<Vec<AddressPair>>()
@@ -189,7 +191,7 @@ async fn run_host(
   let mut retry_count = 0;
   for pipe_path in pipe_path {
     loop {
-      match host::prepare_pipe(&pipe_path).await {
+      match host::prepare_pipe(&pipe_path) {
         Ok(pipe) => {
           info!("Pipe {} is ready", &pipe_path);
           pipes.push(pipe);
@@ -197,20 +199,15 @@ async fn run_host(
         }
         Err(err) => {
           trace!("Failed to prepare pipe: {}", err);
-          if retry_count >= 10 {
-            panic!("Failed to prepare pipe {} after 10 attempts", &pipe_path);
-          }
+          assert!(retry_count < 10, "Failed to prepare pipe {} after 10 attempts", &pipe_path);
           sleep(Duration::from_millis(100)).await;
           retry_count += 1;
-          continue;
         }
-      };
+      }
     }
   }
 
-  if pipes.is_empty() {
-    panic!("No pipes available");
-  }
+  assert!(!pipes.is_empty(), "No pipes available");
 
   let tasks = FuturesUnordered::new();
   for pipe in pipes {
@@ -251,7 +248,7 @@ async fn run_host(
       Err(e) => {
         error!("Failed to setup listener for {}: {}", pair_direct.listener_address, e);
       }
-    };
+    }
   }
 
   if let Some(socks5_proxy) = socks5_proxy {
@@ -267,9 +264,7 @@ async fn run_host(
     }
   }
 
-  if listener_tasks.is_empty() {
-    panic!("All listeners failed to start");
-  }
+  assert!(!listener_tasks.is_empty(), "All listeners failed to start");
 
   let joined_tasks = maybe_done(join_all(tasks.into_iter().chain(listener_tasks)));
   run_indefinitely(cancel, joined_tasks).await;
@@ -333,7 +328,7 @@ async fn run_indefinitely(
   running_tasks: MaybeDone<JoinAll<JoinHandle<()>>>,
 ) {
   tokio::select! {
-    _ = cancel.cancelled() => {
+    () = cancel.cancelled() => {
       if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
         info!("Failed to shutdown gracefully. Forcing shutdown.");
       }
@@ -342,7 +337,7 @@ async fn run_indefinitely(
       info!("Received Ctrl+C. Shutting down.");
       cancel.cancel();
       match c {
-        Ok(_) => {
+        Ok(()) => {
           if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
             info!("Failed to shutdown gracefully. Forcing shutdown.");
           }

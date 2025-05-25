@@ -27,13 +27,13 @@ pub enum ConnectionType {
 }
 
 impl ConnectionType {
-  pub fn new_direct(target_address: String) -> Self {
+  pub const fn new_direct(target_address: String) -> Self {
     Self::Direct { target_address }
   }
 }
 
 #[cfg(windows)]
-pub async fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
+pub fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
   ClientOptions::new()
     .write(true)
     .read(true)
@@ -52,7 +52,7 @@ pub async fn run_listener(
   loop {
     tokio::select! {
       biased;
-      _ = cancel.cancelled() => {
+      () = cancel.cancelled() => {
         info!("Closing listener {}", listener_address);
         break;
       }
@@ -89,25 +89,22 @@ pub async fn connection_initiator(
   loop {
     tokio::select! {
       biased;
-      _ = cancel.cancelled() => {
+      () = cancel.cancelled() => {
         break;
       }
       data = connection_receiver.recv() => {
-        match data {
-          Some((connection_state, connection_type)) => {
-            handle_new_connection(
-              connection_state,
-              connection_type,
-              client_to_pipe_push.clone(),
-              pipe_to_client_pull.resubscribe(),
-              cancel.clone()
-            ).await;
-          }
-          None => {
-            warn!("Connection receiver closed");
-            cancel.cancel();
-            break;
-          }
+        if let Some((connection_state, connection_type)) = data {
+          handle_new_connection(
+            connection_state,
+            connection_type,
+            client_to_pipe_push.clone(),
+            pipe_to_client_pull.resubscribe(),
+            cancel.clone()
+          ).await;
+        } else {
+          warn!("Connection receiver closed");
+          cancel.cancel();
+          break;
         }
       }
       _ = pipe_to_client_pull.recv() => {}
@@ -118,16 +115,16 @@ pub async fn connection_initiator(
 async fn handle_new_connection(
   mut connection_state: ConnectionState,
   connection_type: ConnectionType,
-  mut client_to_pipe_push: async_channel::Sender<Bytes>,
+  client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
   let connect_result = match connection_type {
     ConnectionType::Direct { target_address } => {
       initiate_direct_connection(
-        &mut connection_state,
+        &connection_state,
         target_address,
-        &mut client_to_pipe_push,
+        &client_to_pipe_push,
         &mut pipe_to_client_pull,
       )
       .await
@@ -135,7 +132,7 @@ async fn handle_new_connection(
     ConnectionType::Socks5 => {
       initiate_socks5_connection(
         &mut connection_state,
-        &mut client_to_pipe_push,
+        &client_to_pipe_push,
         &mut pipe_to_client_pull,
       )
       .await
@@ -157,13 +154,13 @@ async fn handle_new_connection(
 }
 
 async fn initiate_direct_connection(
-  connection_state: &mut ConnectionState,
+  connection_state: &ConnectionState,
   target_address: String,
-  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
+  client_to_pipe_push: &async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> anyhow::Result<()> {
   info!("Starting direct connection to {}", &target_address);
-  match initiate_connection(
+  if initiate_connection(
     connection_state.identifier,
     target_address,
     client_to_pipe_push,
@@ -171,14 +168,15 @@ async fn initiate_direct_connection(
   )
   .await
   {
-    true => Ok(()),
-    false => Err(anyhow::anyhow!("Failed to initialize direct connection")),
+    Ok(())
+  } else {
+    Err(anyhow::anyhow!("Failed to initialize direct connection"))
   }
 }
 
 async fn initiate_socks5_connection(
   connection_state: &mut ConnectionState,
-  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
+  client_to_pipe_push: &async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> anyhow::Result<()> {
   // Use the local address as the guest does not reply with the actual address of it's connection
@@ -219,7 +217,7 @@ async fn initiate_socks5_connection(
 async fn initiate_connection(
   connection_identifier: u64,
   target_address: String,
-  client_to_pipe_push: &mut async_channel::Sender<Bytes>,
+  client_to_pipe_push: &async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut broadcast::Receiver<Bytes>,
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection_identifier, 0, &target_address);
@@ -229,7 +227,7 @@ async fn initiate_connection(
     return false;
   }
   // TODO rework
-  match timeout(Duration::from_secs(5), async {
+  if let Ok(Some(datagram)) = timeout(Duration::from_secs(5), async {
     loop {
       match pipe_to_client_pull.recv().await {
         Ok(data) => match root_as_datagram(&data) {
@@ -249,19 +247,16 @@ async fn initiate_connection(
   })
   .await
   {
-    Ok(Some(datagram)) => {
-      let datagram = root_as_datagram(&datagram)
-        .expect("Datagram should have been validated by checking the identifier");
-      if datagram.code() != ControlCode::Ack || datagram.identifier() != connection_identifier {
-        debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
-        return false;
-      }
-      true
+    let datagram = root_as_datagram(&datagram)
+      .expect("Datagram should have been validated by checking the identifier");
+    if datagram.code() != ControlCode::Ack || datagram.identifier() != connection_identifier {
+      debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
+      return false;
     }
-    Ok(None) | Err(_) => {
-      debug!("Failed to initialize connection, pipe is closed or failed to receive response");
-      false
-    }
+    true
+  } else {
+    debug!("Failed to initialize connection, pipe is closed or failed to receive response");
+    false
   }
 }
 
@@ -305,13 +300,13 @@ mod tests {
     let connection = ConnectionState::new(identifier, TcpStream::connect(address).await.unwrap());
 
     let initiate_handle = tokio::spawn({
-      let mut client_to_pipe_push = client_to_pipe_push.clone();
+      let client_to_pipe_push = client_to_pipe_push.clone();
       let mut pipe_to_client_pull = pipe_to_client_pull.resubscribe();
       async move {
         initiate_connection(
           connection.identifier,
           target_address.to_string(),
-          &mut client_to_pipe_push,
+          &client_to_pipe_push,
           &mut pipe_to_client_pull,
         )
         .await
@@ -334,7 +329,7 @@ mod tests {
   async fn initiate_socks5_connection_success() {
     setup_tracing().await;
     let (pipe_to_client_push, mut pipe_to_client_pull) = broadcast::channel(256);
-    let (mut client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, mut connection_receiver) = mpsc::channel(128);
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -366,7 +361,7 @@ mod tests {
     assert!(
       initiate_socks5_connection(
         &mut connection_state,
-        &mut client_to_pipe_push,
+        &client_to_pipe_push,
         &mut pipe_to_client_pull
       )
       .await

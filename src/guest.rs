@@ -47,7 +47,7 @@ pub async fn client_initiator(
   loop {
     tokio::select! {
       biased;
-      _ = cancel.cancelled() => {
+      () = cancel.cancelled() => {
         break;
       }
       data = serial_to_client_pull.recv() => {
@@ -123,11 +123,8 @@ async fn initiate_client_connection(
       }
       debug!("Connection {} received {:?} datagram", datagram.identifier(), datagram.code());
       let identifier = datagram.identifier();
-      let target_address = match datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) {
-        Some(data) => data,
-        None => {
-          bail!("Initial datagram did not contain target address");
-        }
+      let Some(target_address) = datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) else {
+        bail!("Initial datagram did not contain target address");
       };
       debug!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;

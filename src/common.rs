@@ -17,7 +17,7 @@ use zeroize::Zeroize;
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
 const SINK_COMPRESSION_BUFFER_SIZE: usize = 2usize.pow(15);
-pub(crate) const CONNECTION_BUFFER_SIZE: usize = SINK_COMPRESSION_BUFFER_SIZE - 256;
+pub const CONNECTION_BUFFER_SIZE: usize = SINK_COMPRESSION_BUFFER_SIZE - 256;
 const _: () = {
   // Comptime check that the size of data after compression doesn't exceed the compression buffer
   // Formula for maximum size taken from zstd source code
@@ -61,7 +61,7 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
-  pub fn new(identifier: u64, client: TcpStream) -> Self {
+  pub const fn new(identifier: u64, client: TcpStream) -> Self {
     Self {
       identifier,
       client,
@@ -130,7 +130,7 @@ pub async fn sink_loop(
     sink_buf.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
-      _ = cancel.cancelled() => {
+      () = cancel.cancelled() => {
         return;
       }
       data = client_to_sink_pull.recv() => {
@@ -516,7 +516,7 @@ pub async fn process_sink_read(
         "Received {:?} datagram with seq: {} and {} bytes of data",
         datagram.code(),
         datagram_sequence,
-        datagram.data().map(|d| d.len()).unwrap_or(0)
+        datagram.data().map_or(0, |d| d.len())
       );
       trace!(target: HUGE_DATA_TARGET, "Datagrams in queue: {:?}", connection.datagram_queue);
       if datagram_sequence >= (connection.largest_processed + 2) {
@@ -541,14 +541,13 @@ pub async fn process_sink_read(
           .remove(&(connection.largest_processed + 1))
         {
           connection.largest_processed += 1;
-          let datagram = match root_as_datagram(&datagram_buf) {
-            Ok(datagram) => datagram,
-            Err(_) => continue,
+          let Ok(datagram) = root_as_datagram(&datagram_buf) else {
+            continue;
           };
           if let Some(data) = datagram.data() {
             trace!("Sending data to client, size {}", data.len());
             match connection.client.write_all(data.bytes()).await {
-              Ok(_) => {
+              Ok(()) => {
                 trace!("Sent {} bytes to client", data.len());
               }
               Err(e) => {
@@ -619,7 +618,7 @@ pub async fn connection_loop(
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
-      _ = cancel.cancelled() => {
+      () = cancel.cancelled() => {
         if let Err(e) = connection.client.shutdown().await {
           error!("Failed to shutdown client after server shutdown: {}", e);
         }
@@ -755,9 +754,9 @@ mod tests {
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
 
-    let datagram1 = create_data_datagram(0, 1, "datagram1".as_bytes());
-    let datagram2 = create_data_datagram(1, 2, "datagram2".as_bytes());
-    let datagram3 = create_data_datagram(2, 3, "datagram3".as_bytes());
+    let datagram1 = create_data_datagram(0, 1, b"datagram1");
+    let datagram2 = create_data_datagram(1, 2, b"datagram2");
+    let datagram3 = create_data_datagram(2, 3, b"datagram3");
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram1, 9).unwrap();
     sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
