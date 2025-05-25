@@ -1,6 +1,6 @@
 # Serial Multiplexer
 
-A command line tool that allows tunnelling/proxying TCP traffic through a VirtualBox VM using windows named pipe(s)
+A command line tool that allows tunnelling/proxying TCP traffic through a VirtualBox VM using Windows named pipe(s)
 and serial port(s).
 
 # Getting started
@@ -8,27 +8,28 @@ and serial port(s).
 ## Prerequisites
 
 - A Windows host, Linux is not supported
-- VirtualBox with a Linux VM (Tested with Ubuntu 24 TLS and Fedora 42 Xfce spin), a Windows VM might work (not tested)
+- VirtualBox with Linux or Windows VM (Tested with Ubuntu 24 TLS, Fedora 42 Xfce spin and Windows 10 and 11)
 
 ## Usage
 
-This application has two run modes:
+This application is runnable in two modes:
 
-- host - This mode listens for connections and proxies data between client programs (e.g. Google Chrome, DBeaver)
+- host - This mode listens for connections and proxies data between client programs (e.g. Google Chrome, DBeaver, etc.)
   and the VM via [Windows Named Pipes](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipes)
 - guest - This mode is used inside the VM to read and write data between serial port(s) and a target server (e.g.
-  Database, Website)
+  Database, Website, etc.)
 
 ### VirtualBox setup
 
-- [Set up a Linux VM](https://www.virtualbox.org/manual/topics/Introduction.html#create-vm-wizard)
+- [Set up a Linux/Windows VM](https://www.virtualbox.org/manual/topics/Introduction.html#create-vm-wizard)
 - In the VirtualBox VM settings switch to the Expert tab
 - Create a serial port:
     - Enable the port
     - Port number and COM numbers should match. Meaning port 1 uses COM1, port 2 - COM2, port3 - COM3 and port4 - COM4
     - Port Mode: Host Pipe
     - Connect to existing pipe/socket - unchecked
-    - Path/Address: Pipe path MUST start with "\\\\.\pipe\" followed by a custom name e.g. \\\\.\pipe\myAmazingPipe123
+    - Path/Address: Pipe path MUST start with "\\\\.\\pipe\\" followed by a custom name e.g.
+      \\\\.\\pipe\\myAmazingPipe123
 - Multiple serial ports can be used concurrently
 
 ### Host setup
@@ -50,12 +51,32 @@ This application has two run modes:
 1. Download a prebuilt binary from [Releases](https://github.com/Vaanter/serial-multiplexer/releases/)
 2. (Optional) Create a config file. A sample with supported configuration keys is provided in the repository
    ([config.toml](https://github.com/Vaanter/serial-multiplexer/blob/main/config.toml))
-3. Set the downloaded binary as executable:
+3. (Linux only) Set the downloaded binary as executable:
    ```shell
    chmod +x serial-multiplexer-0.4.0-linux
    ```
-4. Start the proxy in guest mode (requires sudo):
+4. Start the proxy in guest mode (requires sudo on Linux):
    ```shell
    # --serial-port parameter can be repeated to use multiple serial ports
+   # Linux
    sudo ./serial-multiplexer-0.4.0-linux --serial-port "/dev/ttyS0"
+   # Windows
+   ./serial-multiplexer-0.4.0-windows.exe guest --serial-port "COM1"
    ```
+
+### Connecting
+
+Applications can connect through the proxy in two ways:
+
+- The application connects directly to the multiplexer.
+  An address pair must be specified in the config file.
+  This pair consists of a listener address - the IP:port combination on which the multiplexer listens and
+  where the application connects and a target address - the IP/hostname:port to which the guest in VM will connect.
+- Using the multiplexer as a Socks5 proxy.
+  The client application must support and be configured to connect via socks5.
+  A socks5 proxy listener must be specified in the config file.
+
+### Additional info
+
+Sometimes the Windows Pipe might be occupied by another process preventing its use.
+Restarting the VM usually helps.
