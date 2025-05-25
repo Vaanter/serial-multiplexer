@@ -43,7 +43,7 @@ This application is runnable in two modes:
 4. Start the proxy in host mode:
     ```shell
     # --pipe-path parameter can be repeated to use multiple pipes
-    ./serial-multiplexer-0.4.0-windows.exe host --pipe-path "\\.\pipe\myAmazingPipe123"
+    ./serial-multiplexer-0.4.1-windows.exe host --pipe-path "\\.\pipe\myAmazingPipe123"
     ```
 
 ### Guest setup
@@ -53,15 +53,15 @@ This application is runnable in two modes:
    ([config.toml](https://github.com/Vaanter/serial-multiplexer/blob/main/config.toml))
 3. (Linux only) Set the downloaded binary as executable:
    ```shell
-   chmod +x serial-multiplexer-0.4.0-linux
+   chmod +x serial-multiplexer-0.4.1-linux
    ```
 4. Start the proxy in guest mode (requires sudo on Linux):
    ```shell
    # --serial-port parameter can be repeated to use multiple serial ports
    # Linux
-   sudo ./serial-multiplexer-0.4.0-linux --serial-port "/dev/ttyS0"
+   sudo ./serial-multiplexer-0.4.1-linux --serial-port "/dev/ttyS0"
    # Windows
-   ./serial-multiplexer-0.4.0-windows.exe guest --serial-port "COM1"
+   ./serial-multiplexer-0.4.1-windows.exe guest --serial-port "COM1"
    ```
 
 ### Connecting
