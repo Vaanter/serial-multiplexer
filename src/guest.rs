@@ -44,6 +44,7 @@ pub async fn client_initiator(
   client_to_serial_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
+  debug!("Starting client initiator");
   loop {
     tokio::select! {
       biased;
