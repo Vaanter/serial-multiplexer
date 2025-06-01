@@ -131,6 +131,9 @@ pub async fn sink_loop(
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
+        if let Err(e) = sink.shutdown().await {
+          error!("Failed to shutdown sink: {}", e);
+        }
         return;
       }
       data = client_to_sink_pull.recv() => {
