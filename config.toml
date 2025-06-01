@@ -1,9 +1,14 @@
+#log_file = "serial-multiplexer.log"
+tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info"
+
+[mode.Host]
+pipe_paths = ['\\.\pipe\myPipe1', '\\.\pipe\myPipe2', '\\.\pipe\myPipe3', '\\.\pipe\myPipe4']
 address_pairs = [
     {listener_address = "127.0.0.1:1234", target_address = "tcpbin.com:4242"},
     {listener_address = "127.0.0.1:1235", target_address = "google.com:443"},
 ]
-
 socks5_proxy = "127.0.0.1:2345"
 
-# log_file = "serial-multiplexer.log"
-tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info"
+#[mode.Guest]
+#serial_paths = ['COM1', 'COM2', 'COM3', 'COM4']
+#serial_paths = ['/dev/ttyS0', '/dev/ttyS1', '/dev/ttyS2', '/dev/ttyS3']
