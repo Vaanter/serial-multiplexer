@@ -103,7 +103,6 @@ fn default_config_path() -> String {
 impl ConfigArgs {
   pub fn build_config() -> Result<Self, figment::Error> {
     let args = ConfigArgs::parse();
-    println!("{:?}", args);
 
     let config_file_path = args.config.clone();
     Figment::new()
