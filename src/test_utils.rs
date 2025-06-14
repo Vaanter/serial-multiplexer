@@ -29,9 +29,7 @@ pub async fn setup_tracing() {
 }
 
 pub async fn run_echo() -> (SocketAddr, JoinHandle<()>) {
-  let listener = TcpListener::bind("127.0.0.1:0")
-    .await
-    .expect("Echo listener should run");
+  let listener = TcpListener::bind("127.0.0.1:0").await.expect("Echo listener should run");
   let addr = listener.local_addr().expect("Echo listener local_addr");
   let listener_task = tokio::spawn(async move {
     loop {
@@ -42,10 +40,7 @@ pub async fn run_echo() -> (SocketAddr, JoinHandle<()>) {
           match socket.read(&mut buf).await.expect("Read should succeed") {
             0 => break,
             n => {
-              socket
-                .write_all(&buf[..n])
-                .await
-                .expect("Write should succeed");
+              socket.write_all(&buf[..n]).await.expect("Write should succeed");
             }
           }
         }

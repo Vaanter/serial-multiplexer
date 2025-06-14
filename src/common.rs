@@ -259,7 +259,7 @@ pub fn handle_sink_read(
       decompression_buffer.as_mut(),
       &read_data[datagram_start..=datagram_end],
     )
-    .inspect(|n| debug!("Decompressed {} to {} byte", size, n))
+    .inspect(|n| debug!("Decompressed {} to {} bytes", size, n))
     .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
@@ -342,7 +342,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 ) -> anyhow::Result<()> {
   trace!("Maximum compressed size: {}", zstd_safe::compress_bound(data.len()));
   let compressed_size = zstd_safe::compress(compression_buffer.as_mut(), &data, 9)
-    .inspect(|n| debug!("Compressed {} to {} byte", data.len(), n))
+    .inspect(|n| debug!("Compressed {} to {} bytes", data.len(), n))
     .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
   debug!("Writing {} bytes to sink", compressed_size + HEADER_BYTES + LENGTH_BYTES);
   trace!(target: HUGE_DATA_TARGET, "Writing compressed datagram to sink: {:?}", &compression_buffer[..compressed_size]);
@@ -527,21 +527,16 @@ pub async fn process_sink_read(
           "Received datagram out of order, seq: {}, largest sent: {}",
           datagram_sequence, connection.largest_processed
         );
-        connection
-          .datagram_queue
-          .insert(datagram_sequence, data_buf);
+        connection.datagram_queue.insert(datagram_sequence, data_buf);
         return false;
       } else if datagram_sequence == (connection.largest_processed + 1) {
         trace!(
           "Received datagram in order, seq: {}, largest sent: {}",
           datagram_sequence, connection.largest_processed
         );
-        connection
-          .datagram_queue
-          .insert(datagram_sequence, data_buf);
-        while let Some(datagram_buf) = connection
-          .datagram_queue
-          .remove(&(connection.largest_processed + 1))
+        connection.datagram_queue.insert(datagram_sequence, data_buf);
+        while let Some(datagram_buf) =
+          connection.datagram_queue.remove(&(connection.largest_processed + 1))
         {
           connection.largest_processed += 1;
           let Ok(datagram) = root_as_datagram(&datagram_buf) else {
@@ -887,13 +882,9 @@ mod tests {
     info!("Sending initial datagram");
     let initial_data = "test data";
     let initial_datagram = create_initial_datagram(1, 0, initial_data);
-    handle_sink_write(&mut sink_b, initial_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = timeout(Duration::from_secs(1), pipe_to_client_pull.recv())
-      .await
-      .unwrap()
-      .unwrap();
+    handle_sink_write(&mut sink_b, initial_datagram, &mut compression_buf).await.unwrap();
+    let datagram_bytes =
+      timeout(Duration::from_secs(1), pipe_to_client_pull.recv()).await.unwrap().unwrap();
     let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(initial_datagram.identifier(), 1);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
@@ -908,9 +899,7 @@ mod tests {
 
     info!("Sending ACK datagram");
     let ack_datagram = create_ack_datagram(2, 0);
-    handle_sink_write(&mut sink_b, ack_datagram, &mut compression_buf)
-      .await
-      .unwrap();
+    handle_sink_write(&mut sink_b, ack_datagram, &mut compression_buf).await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(ack_datagram.identifier(), 2);
@@ -1129,11 +1118,7 @@ mod tests {
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(
       std::io::ErrorKind::WouldBlock,
-      connection
-        .client
-        .try_read(&mut client_buf)
-        .unwrap_err()
-        .kind()
+      connection.client.try_read(&mut client_buf).unwrap_err().kind()
     );
   }
 
@@ -1171,11 +1156,7 @@ mod tests {
       client_to_pipe_pull,
       cancel.clone(),
     ));
-    assert!(
-      timeout(Duration::from_secs(1), cancel.cancelled())
-        .await
-        .is_ok()
-    );
+    assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 
   #[tokio::test]
@@ -1192,10 +1173,6 @@ mod tests {
       client_to_pipe_pull,
       cancel.clone(),
     ));
-    assert!(
-      timeout(Duration::from_secs(1), cancel.cancelled())
-        .await
-        .is_ok()
-    );
+    assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

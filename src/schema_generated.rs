@@ -32,12 +32,8 @@ pub mod serial_multiplexer {
     note = "Use associated constants instead. This will no longer be generated in 2021."
   )]
   #[allow(non_camel_case_types)]
-  pub const ENUM_VALUES_CONTROL_CODE: [ControlCode; 4] = [
-    ControlCode::Ack,
-    ControlCode::Close,
-    ControlCode::Data,
-    ControlCode::Initial,
-  ];
+  pub const ENUM_VALUES_CONTROL_CODE: [ControlCode; 4] =
+    [ControlCode::Ack, ControlCode::Close, ControlCode::Data, ControlCode::Initial];
 
   #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
   #[repr(transparent)]
@@ -162,36 +158,21 @@ pub mod serial_multiplexer {
       // Safety:
       // Created from valid Table for this object
       // which contains a valid value in this slot
-      unsafe {
-        self
-          ._tab
-          .get::<u64>(Datagram::VT_IDENTIFIER, Some(0))
-          .unwrap()
-      }
+      unsafe { self._tab.get::<u64>(Datagram::VT_IDENTIFIER, Some(0)).unwrap() }
     }
     #[inline]
     pub fn sequence(&self) -> u64 {
       // Safety:
       // Created from valid Table for this object
       // which contains a valid value in this slot
-      unsafe {
-        self
-          ._tab
-          .get::<u64>(Datagram::VT_SEQUENCE, Some(0))
-          .unwrap()
-      }
+      unsafe { self._tab.get::<u64>(Datagram::VT_SEQUENCE, Some(0)).unwrap() }
     }
     #[inline]
     pub fn code(&self) -> ControlCode {
       // Safety:
       // Created from valid Table for this object
       // which contains a valid value in this slot
-      unsafe {
-        self
-          ._tab
-          .get::<ControlCode>(Datagram::VT_CODE, Some(ControlCode::Ack))
-          .unwrap()
-      }
+      unsafe { self._tab.get::<ControlCode>(Datagram::VT_CODE, Some(ControlCode::Ack)).unwrap() }
     }
     #[inline]
     pub fn data(&self) -> Option<flatbuffers::Vector<'a, u8>> {
@@ -251,27 +232,19 @@ pub mod serial_multiplexer {
   impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> DatagramBuilder<'a, 'b, A> {
     #[inline]
     pub fn add_identifier(&mut self, identifier: u64) {
-      self
-        .fbb_
-        .push_slot::<u64>(Datagram::VT_IDENTIFIER, identifier, 0);
+      self.fbb_.push_slot::<u64>(Datagram::VT_IDENTIFIER, identifier, 0);
     }
     #[inline]
     pub fn add_sequence(&mut self, sequence: u64) {
-      self
-        .fbb_
-        .push_slot::<u64>(Datagram::VT_SEQUENCE, sequence, 0);
+      self.fbb_.push_slot::<u64>(Datagram::VT_SEQUENCE, sequence, 0);
     }
     #[inline]
     pub fn add_code(&mut self, code: ControlCode) {
-      self
-        .fbb_
-        .push_slot::<ControlCode>(Datagram::VT_CODE, code, ControlCode::Ack);
+      self.fbb_.push_slot::<ControlCode>(Datagram::VT_CODE, code, ControlCode::Ack);
     }
     #[inline]
     pub fn add_data(&mut self, data: flatbuffers::WIPOffset<flatbuffers::Vector<'b, u8>>) {
-      self
-        .fbb_
-        .push_slot_always::<flatbuffers::WIPOffset<_>>(Datagram::VT_DATA, data);
+      self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(Datagram::VT_DATA, data);
     }
     #[inline]
     pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> DatagramBuilder<'a, 'b, A> {

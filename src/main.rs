@@ -41,9 +41,7 @@ fn main() {
   let (writer, _guard) = if let Some(ref log_file_name) = config.log_file {
     let mut log_file_options = OpenOptions::new();
     log_file_options.write(true).truncate(true).create(true);
-    let log_file = log_file_options
-      .open(log_file_name)
-      .expect("Log file should be accessible");
+    let log_file = log_file_options.open(log_file_name).expect("Log file should be accessible");
     tracing_appender::non_blocking(log_file)
   } else {
     tracing_appender::non_blocking(std::io::stdout())

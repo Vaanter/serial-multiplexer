@@ -162,10 +162,8 @@ mod tests {
     let target_address = target_address.to_string();
     let datagram = create_initial_datagram(123, 0, &target_address);
 
-    let connection = initiate_client_connection(datagram, client_to_serial_push.clone())
-      .await
-      .unwrap()
-      .unwrap();
+    let connection =
+      initiate_client_connection(datagram, client_to_serial_push.clone()).await.unwrap().unwrap();
     assert_eq!(connection.identifier, 123);
     assert_eq!(connection.sequence, 0);
     assert_eq!(connection.largest_processed, 0);
@@ -224,11 +222,7 @@ mod tests {
     ));
 
     serial_to_client_push.send(initial).unwrap();
-    assert!(
-      timeout(Duration::from_secs(1), client_to_serial_pull.recv())
-        .await
-        .is_err()
-    );
+    assert!(timeout(Duration::from_secs(1), client_to_serial_pull.recv()).await.is_err());
   }
 
   #[tokio::test]
@@ -241,10 +235,6 @@ mod tests {
     tokio::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
 
     drop(serial_to_client_push);
-    assert!(
-      timeout(Duration::from_secs(1), cancel.cancelled())
-        .await
-        .is_ok()
-    );
+    assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

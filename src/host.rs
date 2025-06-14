@@ -34,11 +34,7 @@ impl ConnectionType {
 
 #[cfg(windows)]
 pub fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
-  ClientOptions::new()
-    .write(true)
-    .read(true)
-    .open(pipe_path)
-    .map_err(|e| e.into())
+  ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
 }
 
 #[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
@@ -318,9 +314,7 @@ mod tests {
     let initial_data = initial_datagram.data().unwrap().bytes();
     assert_eq!(target_address.as_bytes(), initial_data);
     assert_eq!(identifier, initial_datagram.identifier());
-    pipe_to_client_push
-      .send(create_ack_datagram(initial_datagram.identifier(), 0))
-      .unwrap();
+    pipe_to_client_push.send(create_ack_datagram(initial_datagram.identifier(), 0)).unwrap();
 
     assert!(initiate_handle.await.unwrap());
   }
@@ -367,19 +361,9 @@ mod tests {
       .await
       .is_ok()
     );
-    timeout(Duration::from_secs(1), socks5_client_task)
-      .await
-      .unwrap()
-      .unwrap()
-      .unwrap();
-    timeout(Duration::from_secs(1), guest_task)
-      .await
-      .unwrap()
-      .unwrap();
-    timeout(Duration::from_secs(1), listener_socks5_task)
-      .await
-      .unwrap()
-      .unwrap();
+    timeout(Duration::from_secs(1), socks5_client_task).await.unwrap().unwrap().unwrap();
+    timeout(Duration::from_secs(1), guest_task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), listener_socks5_task).await.unwrap().unwrap();
   }
 
   #[tokio::test]
@@ -421,14 +405,8 @@ mod tests {
     )
     .await;
 
-    timeout(Duration::from_secs(3), guest_task)
-      .await
-      .unwrap()
-      .unwrap();
-    timeout(Duration::from_secs(3), client_task)
-      .await
-      .unwrap()
-      .unwrap();
+    timeout(Duration::from_secs(3), guest_task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(3), client_task).await.unwrap().unwrap();
   }
 
   #[tokio::test]
@@ -453,10 +431,7 @@ mod tests {
         )
         .await
         .unwrap();
-        socks5_stream
-          .write_all(&data_datagram_contents)
-          .await
-          .unwrap();
+        socks5_stream.write_all(&data_datagram_contents).await.unwrap();
       }
     });
 
@@ -480,13 +455,7 @@ mod tests {
     )
     .await;
 
-    timeout(Duration::from_secs(3), guest_task)
-      .await
-      .unwrap()
-      .unwrap();
-    timeout(Duration::from_secs(3), client_task)
-      .await
-      .unwrap()
-      .unwrap();
+    timeout(Duration::from_secs(3), guest_task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(3), client_task).await.unwrap().unwrap();
   }
 }

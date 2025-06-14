@@ -79,12 +79,10 @@ impl FromStr for AddressPair {
 
   fn from_str(s: &str) -> Result<Self, Self::Err> {
     let mut address_pairs = s.split('|');
-    let listener_address = address_pairs
-      .next()
-      .ok_or_else(|| anyhow::anyhow!("No listener address"))?;
-    let target_address = address_pairs
-      .next()
-      .ok_or_else(|| anyhow::anyhow!("No target address"))?;
+    let listener_address =
+      address_pairs.next().ok_or_else(|| anyhow::anyhow!("No listener address"))?;
+    let target_address =
+      address_pairs.next().ok_or_else(|| anyhow::anyhow!("No target address"))?;
     Ok(Self {
       listener_address: listener_address.to_string(),
       target_address: target_address.to_string(),
