@@ -261,6 +261,7 @@ mod tests {
   use super::*;
   use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::{receive_initial_ack_data, run_echo, setup_tracing};
+  use crate::utils::create_upstream_listener;
   use fast_socks5::client::{Config, Socks5Stream};
   use tokio::net::TcpStream;
 
@@ -364,6 +365,47 @@ mod tests {
     timeout(Duration::from_secs(1), socks5_client_task).await.unwrap().unwrap().unwrap();
     timeout(Duration::from_secs(1), guest_task).await.unwrap().unwrap();
     timeout(Duration::from_secs(1), listener_socks5_task).await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_connection_initiator() {
+    setup_tracing().await;
+    let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(256);
+    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (connection_sender, connection_receiver) =
+      mpsc::channel::<(ConnectionState, ConnectionType)>(128);
+    let cancel = CancellationToken::new();
+    let target_addr = "test:1234";
+
+    let initiator_task = tokio::spawn(connection_initiator(
+      client_to_pipe_push.clone(),
+      pipe_to_client_pull.resubscribe(),
+      connection_receiver,
+      cancel.clone(),
+    ));
+    let connection_listener = create_upstream_listener("127.0.0.1:0").await.unwrap();
+    let listener_address = connection_listener.local_addr().unwrap();
+    let client_task = tokio::spawn({
+      let cancel = cancel.clone();
+      async move {
+        let _server = TcpStream::connect(listener_address).await.unwrap();
+        cancel.cancelled().await;
+      }
+    });
+    let client = connection_listener.accept().await.unwrap().0;
+    let connection_state = ConnectionState::new(0, client);
+    let connection_type = ConnectionType::new_direct(target_addr.to_string());
+    connection_sender.send((connection_state, connection_type)).await.unwrap();
+    let datagram_bytes = client_to_pipe_pull.recv().await.unwrap();
+    let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
+    assert_eq!(initial_datagram.identifier(), 0);
+    assert_eq!(initial_datagram.code(), ControlCode::Initial);
+    assert_eq!(initial_datagram.data().unwrap().bytes(), target_addr.as_bytes());
+    let ack = create_ack_datagram(initial_datagram.identifier(), 0);
+    pipe_to_client_push.send(ack).unwrap();
+    cancel.cancel();
+    timeout(Duration::from_secs(1), initiator_task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), client_task).await.unwrap().unwrap();
   }
 
   #[tokio::test]

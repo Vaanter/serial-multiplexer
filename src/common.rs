@@ -712,6 +712,7 @@ mod tests {
   use crate::protocol_utils::{create_ack_datagram, create_data_datagram, create_initial_datagram};
   use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
   use crate::test_utils::{run_echo, setup_tracing};
+  use crate::utils::create_upstream_listener;
   use std::net::SocketAddr;
   use std::time::Duration;
   use tokio::net::{TcpListener, TcpStream};
@@ -940,76 +941,130 @@ mod tests {
     sink_b.write_all(&data).await.unwrap();
     sink_b.flush().await.unwrap();
 
-    // Send a bunch of big ones
-    info!("Sending large datagram 1");
-    let mut data = BytesMut::new();
-    data.resize(1000, 100u8);
-    let data_datagram = create_data_datagram(3, 1, &data);
-    handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-    assert_eq!(data_datagram.identifier(), 3);
-    assert_eq!(data_datagram.code(), ControlCode::Data);
-    assert_eq!(data_datagram.data().unwrap().bytes(), data);
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
+    for (i, data_size) in sizes.into_iter().enumerate() {
+      let mut data = BytesMut::new();
+      data.resize(data_size, 100u8);
+      let data_datagram = create_data_datagram(i as u64, 1, &data);
+      handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf).await.unwrap();
+      let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+      let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
+      assert_eq!(data_datagram.identifier(), i as u64);
+      assert_eq!(data_datagram.code(), ControlCode::Data);
+      assert_eq!(data_datagram.data().unwrap().bytes(), data);
+      assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    }
+  }
 
-    info!("Sending large datagram 2");
-    let mut data = BytesMut::new();
-    data.resize(5000, 100u8);
-    let data_datagram = create_data_datagram(3, 2, &data);
-    handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-    assert_eq!(data_datagram.identifier(), 3);
-    assert_eq!(data_datagram.code(), ControlCode::Data);
-    assert_eq!(data_datagram.data().unwrap().bytes(), data);
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+  #[tokio::test]
+  async fn test_sink_loop_write() {
+    setup_tracing().await;
+    let (sink_a, sink_b) = tokio::io::duplex(4096);
+    let (pipe_to_client_push_write, _pipe_to_client_pull_write) = broadcast::channel(256);
+    let (pipe_to_client_push_read, mut pipe_to_client_pull_read) = broadcast::channel(256);
+    let (client_to_pipe_push_write, client_to_pipe_pull_write) = async_channel::bounded(256);
+    let (_client_to_pipe_push_read, client_to_pipe_pull_read) = async_channel::bounded(256);
+    let cancel = CancellationToken::new();
+    let _pipe_loop_write_handle = tokio::spawn(sink_loop(
+      sink_a,
+      pipe_to_client_push_write.clone(),
+      client_to_pipe_pull_write.clone(),
+      cancel.clone(),
+    ));
+    let _pipe_loop_read_handle = tokio::spawn(sink_loop(
+      sink_b,
+      pipe_to_client_push_read.clone(),
+      client_to_pipe_pull_read.clone(),
+      cancel.clone(),
+    ));
 
-    info!("Sending large datagram 3");
-    let mut data = BytesMut::new();
-    data.resize(10000, 100u8);
-    let data_datagram = create_data_datagram(3, 4, &data);
-    handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-    assert_eq!(data_datagram.identifier(), 3);
-    assert_eq!(data_datagram.code(), ControlCode::Data);
-    assert_eq!(data_datagram.data().unwrap().bytes(), data);
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
+    for (i, data_size) in sizes.into_iter().enumerate() {
+      let mut data = BytesMut::new();
+      data.resize(data_size, 100u8);
+      let data_copy = Bytes::copy_from_slice(&data);
+      data.resize(CONNECTION_BUFFER_SIZE, 50u8);
+      handle_client_read(3, i as u64, client_to_pipe_push_write.clone(), Ok(data_size), &mut data)
+        .await;
+      let datagram_bytes =
+        timeout(Duration::from_secs(1), pipe_to_client_pull_read.recv()).await.unwrap().unwrap();
+      let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
+      assert_eq!(initial_datagram.identifier(), 3);
+      assert_eq!(initial_datagram.code(), ControlCode::Data);
+      assert_eq!(initial_datagram.sequence(), i as u64);
+      assert_eq!(initial_datagram.data().unwrap().bytes(), &data_copy);
+    }
+  }
 
-    info!("Sending large datagram 4");
-    let mut data = BytesMut::new();
-    data.resize(15000, 100u8);
-    let data_datagram = create_data_datagram(3, 3, &data);
-    handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-    assert_eq!(data_datagram.identifier(), 3);
-    assert_eq!(data_datagram.code(), ControlCode::Data);
-    assert_eq!(data_datagram.data().unwrap().bytes(), data);
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+  #[tokio::test]
+  async fn test_connection_loop_sink_read() {
+    setup_tracing().await;
+    let cancel = CancellationToken::new();
+    let (sink_to_client_push, sink_to_client_pull) = broadcast::channel(256);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
+    let data = Bytes::from_static(b"test data");
 
-    info!("Sending large datagram 5");
-    let mut data = BytesMut::new();
-    data.resize(CONNECTION_BUFFER_SIZE, 100u8);
-    let data_datagram = create_data_datagram(3, 5, &data);
-    handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf)
-      .await
-      .unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-    assert_eq!(data_datagram.identifier(), 3);
-    assert_eq!(data_datagram.code(), ControlCode::Data);
-    assert_eq!(data_datagram.data().unwrap().bytes(), data);
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let _handle = tokio::spawn(async move {
+      let listener = create_upstream_listener("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      address_sender.send(address).await.unwrap();
+      let (client, _) = listener.accept().await.unwrap();
+      let identifier = 0;
+
+      let connection = ConnectionState::new(identifier, client);
+      tokio::spawn(connection_loop(
+        connection,
+        sink_to_client_pull,
+        client_to_sink_push.clone(),
+        cancel.clone(),
+      ));
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let mut client = TcpStream::connect(server_address).await.unwrap();
+    let datagram = create_data_datagram(0, 1, &data);
+    sink_to_client_push.send(datagram).unwrap();
+    let mut client_buf = BytesMut::zeroed(2048);
+    let n = client.read(&mut client_buf).await.unwrap();
+    assert_eq!(n, data.len());
+    assert_eq!(data, client_buf[..n]);
+  }
+
+  #[tokio::test]
+  async fn test_connection_loop_cancel() {
+    setup_tracing().await;
+    let cancel = CancellationToken::new();
+    let (_sink_to_client_push, sink_to_client_pull) = broadcast::channel(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let handle = tokio::spawn({
+      let cancel = cancel.clone();
+      async move {
+        let listener = create_upstream_listener("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        address_sender.send(address).await.unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+        let identifier = 0;
+
+        let connection = ConnectionState::new(identifier, client);
+        connection_loop(connection, sink_to_client_pull, client_to_sink_push.clone(), cancel).await;
+      }
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let mut client = TcpStream::connect(server_address).await.unwrap();
+    cancel.cancel();
+    let mut client_buf = BytesMut::zeroed(2048);
+    let n = client.read(&mut client_buf).await.unwrap();
+    assert_eq!(n, 0);
+    let sink_read = client_to_sink_pull.recv().await.unwrap();
+    let close_datagram = root_as_datagram(&sink_read).unwrap();
+    assert_eq!(close_datagram.identifier(), 0);
+    assert_eq!(close_datagram.code(), ControlCode::Close);
+    assert_eq!(close_datagram.data().unwrap().bytes(), &[]);
+    assert!(timeout(Duration::from_secs(1), handle).await.is_ok());
   }
 
   #[tokio::test]
