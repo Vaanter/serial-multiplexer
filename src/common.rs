@@ -36,6 +36,7 @@ const _: () = {
 const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
 pub const HUGE_DATA_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::huge_data");
+pub const METRICS_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::metrics");
 /// Number of bytes used to store the size of a datagram
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
@@ -144,7 +145,7 @@ pub async fn sink_loop(
           Ok(data) => {
             let sink_write_duration = Instant::now();
             let result = handle_sink_write(&mut sink, data, &mut compression_buffer).instrument(current_span).await;
-            trace!(duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
+            trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
             if let Err(e) = result {
               error!("Failed to handle sink write: {}", e);
               break;
@@ -165,7 +166,7 @@ pub async fn sink_loop(
           Ok(n) => {
             let sink_read_duration = Instant::now();
             let result = handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer);
-            trace!(duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
+            trace!(target: METRICS_TARGET, duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
             match result {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
               Err(e) => {
@@ -645,7 +646,7 @@ pub async fn connection_loop(
       data = sink_to_client_pull.recv() => {
         let sink_read_start = Instant::now();
         let connection_terminating = process_sink_read(&mut connection, data).await;
-        trace!(duration = ?sink_read_start.elapsed(), "Finished processing sink read");
+        trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
         if connection_terminating {
           break;
         }
@@ -660,7 +661,7 @@ pub async fn connection_loop(
           bytes_read,
           &mut tcp_buf,
         ).instrument(current_span).await;
-        trace!(duration = ?client_read_duration.elapsed(), "Finished processing client read");
+        trace!(target: METRICS_TARGET, duration = ?client_read_duration.elapsed(), "Finished processing client read");
         if connection_terminating {
           break;
         }

@@ -1,5 +1,5 @@
 #log_file = "serial-multiplexer.log"
-tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info"
+tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info,serial_multiplexer::metrics=trace"
 
 [mode.Host]
 pipe_paths = ['\\.\pipe\myPipe1', '\\.\pipe\myPipe2', '\\.\pipe\myPipe3', '\\.\pipe\myPipe4']
