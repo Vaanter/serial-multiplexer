@@ -6,11 +6,12 @@ use memchr::memmem::Finder;
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{Instrument, Span, debug, error, info, trace};
 use tracing_attributes::instrument;
 use zeroize::Zeroize;
 
@@ -117,6 +118,7 @@ impl ConnectionState {
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
+#[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl AsyncReadExt + AsyncWriteExt + Unpin,
   sink_to_client_push: broadcast::Sender<Bytes>,
@@ -127,6 +129,7 @@ pub async fn sink_loop(
   let mut compression_buffer = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
   let mut unprocessed_data_start = 0;
   loop {
+    let current_span = Span::current();
     sink_buf.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
@@ -139,7 +142,10 @@ pub async fn sink_loop(
       data = client_to_sink_pull.recv() => {
         match data {
           Ok(data) => {
-            if let Err(e) = handle_sink_write(&mut sink, data, &mut compression_buffer).await {
+            let sink_write_duration = Instant::now();
+            let result = handle_sink_write(&mut sink, data, &mut compression_buffer).instrument(current_span).await;
+            trace!(duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
+            if let Err(e) = result {
               error!("Failed to handle sink write: {}", e);
               break;
             }
@@ -157,7 +163,10 @@ pub async fn sink_loop(
             break;
           }
           Ok(n) => {
-            match handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer) {
+            let sink_read_duration = Instant::now();
+            let result = handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer);
+            trace!(duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
+            match result {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
               Err(e) => {
                 error!("Failed to handle sink read: {}", e);
@@ -412,8 +421,13 @@ pub async fn handle_client_read(
       true
     }
     Ok(n) => {
+      assert!(
+        n <= CONNECTION_BUFFER_SIZE,
+        "Number of bytes read from client must not exceed the buffer"
+      );
       debug!("Read {} bytes from client", n);
       let datagram = create_data_datagram(identifier, sequence, &read_buf[..n]);
+      trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", &datagram);
       read_buf[..n].zeroize();
       debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
       if let Err(e) = client_to_pipe_push.send(datagram).await {
@@ -613,6 +627,7 @@ pub async fn connection_loop(
 ) {
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
+    let current_span = Span::current();
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
@@ -628,19 +643,25 @@ pub async fn connection_loop(
         break;
       }
       data = sink_to_client_pull.recv() => {
-        if process_sink_read(&mut connection, data).await {
+        let sink_read_start = Instant::now();
+        let connection_terminating = process_sink_read(&mut connection, data).await;
+        trace!(duration = ?sink_read_start.elapsed(), "Finished processing sink read");
+        if connection_terminating {
           break;
         }
       }
       bytes_read = connection.client.read(&mut tcp_buf) => {
         connection.sequence += 1;
-        if handle_client_read(
+        let client_read_duration = Instant::now();
+        let connection_terminating = handle_client_read(
           connection.identifier,
           connection.sequence,
           client_to_sink_push.clone(),
           bytes_read,
           &mut tcp_buf,
-        ).await {
+        ).instrument(current_span).await;
+        trace!(duration = ?client_read_duration.elapsed(), "Finished processing client read");
+        if connection_terminating {
           break;
         }
       }
