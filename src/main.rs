@@ -1,21 +1,11 @@
-use crate::common::ConnectionState;
 use crate::configuration::{ConfigArgs, Guest, Host, Modes};
-use crate::guest::client_initiator;
-use crate::host::{ConnectionType, connection_initiator, run_listener};
-use crate::utils::create_upstream_listener;
-use bytes::Bytes;
-use common::sink_loop;
-use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
-use futures::stream::FuturesUnordered;
-use std::collections::HashSet;
+use crate::runner::common::{create_guest_tasks, create_host_tasks};
+use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
 use std::time::Duration;
 use tokio::signal::ctrl_c;
-use tokio::sync::{broadcast, mpsc};
-use tokio::task;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
-use tokio_serial::SerialPortBuilderExt;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, error, info};
 use tracing_attributes::instrument;
@@ -29,6 +19,7 @@ mod configuration;
 mod guest;
 mod host;
 mod protocol_utils;
+mod runner;
 #[allow(unsafe_op_in_unsafe_fn, unused)]
 mod schema_generated;
 #[cfg(test)]
@@ -67,10 +58,18 @@ fn main() {
     .block_on(async {
       match config.mode {
         Some(Modes::Guest(guest)) => {
+          #[cfg(not(windows))]
+          assert!(
+            !guest.serial_paths.is_empty() || !guest.socket_path.is_empty(),
+            "No serial ports and no unix socket configured"
+          );
+          #[cfg(windows)]
           assert!(!guest.serial_paths.is_empty(), "No serial ports configured");
+
           run_guest(guest).await;
         }
         Some(Modes::Host(host)) => {
+          #[cfg(windows)]
           assert!(!host.pipe_paths.is_empty(), "No pipe paths configured");
           assert!(
             !(host.address_pairs.is_empty() && host.socks5_proxy.is_none()),
@@ -95,149 +94,19 @@ fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
   EnvFilter::new(filter_string)
 }
 
-#[cfg(unix)]
-#[instrument(skip_all)]
-async fn run_host(properties: Host) {
-  panic!("Running on linux is not supported.");
-}
-
-#[cfg(windows)]
 #[instrument(skip_all)]
 async fn run_host(properties: Host) {
   let cancel = CancellationToken::new();
-  let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(128);
-  let (pipe_to_client_push, pipe_to_client_pull) = broadcast::channel::<Bytes>(128);
-
-  let mut pipes = Vec::new();
-  let mut retry_count = 0;
-  let distinct_paths: HashSet<&String> = properties.pipe_paths.iter().collect();
-  for pipe_path in distinct_paths {
-    loop {
-      match host::prepare_pipe(pipe_path) {
-        Ok(pipe) => {
-          info!("Pipe {} is ready", &pipe_path);
-          pipes.push(pipe);
-          break;
-        }
-        Err(err) => {
-          debug!("Failed to connect to pipe: {}", err);
-          assert!(retry_count < 10, "Failed to prepare pipe {} after 10 attempts", &pipe_path);
-          sleep(Duration::from_millis(100)).await;
-          retry_count += 1;
-        }
-      }
-    }
-  }
-
-  assert!(!pipes.is_empty(), "No pipes available");
-
-  let tasks = FuturesUnordered::new();
-  for pipe in pipes {
-    let pipe_task = tokio::spawn({
-      let cancel = cancel.clone();
-      let pipe_to_client_push = pipe_to_client_push.clone();
-      let client_to_pipe_pull = client_to_pipe_pull.clone();
-      async move {
-        sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel).await;
-      }
-    });
-    tasks.push(pipe_task);
-  }
-
-  let (connection_sender, connection_receiver) = mpsc::channel(128);
-
-  let initiator_task = tokio::spawn({
-    let cancel = cancel.clone();
-    connection_initiator(client_to_pipe_push, pipe_to_client_pull, connection_receiver, cancel)
-  });
-  tasks.push(initiator_task);
-
-  let listener_tasks = FuturesUnordered::new();
-  for pair_direct in properties.address_pairs.into_iter() {
-    let cancel = cancel.clone();
-    let connection_sender = connection_sender.clone();
-    let pair_task = setup_listener(
-      &pair_direct.listener_address,
-      ConnectionType::new_direct(pair_direct.target_address),
-      connection_sender,
-      cancel,
-    )
-    .await
-    .unwrap_or_else(|e| {
-      panic!("Failed to setup listener for {}: {}", pair_direct.listener_address, e)
-    });
-    listener_tasks.push(pair_task);
-  }
-
-  if let Some(socks5_proxy) = properties.socks5_proxy {
-    let cancel = cancel.clone();
-    let connection_sender = connection_sender.clone();
-    let socks5_task =
-      setup_listener(&socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to setup socks5 listener at {}: {}", socks5_proxy, e));
-    listener_tasks.push(socks5_task);
-  }
-
-  assert!(!listener_tasks.is_empty(), "All listeners failed to start");
-
-  let joined_tasks = maybe_done(join_all(tasks.into_iter().chain(listener_tasks)));
+  let joined_tasks = create_host_tasks(properties, cancel.clone()).await;
   run_indefinitely(cancel, joined_tasks).await;
 }
 
 #[instrument(skip_all)]
-async fn setup_listener(
-  listener_address: &str,
-  connection_type: ConnectionType,
-  connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
-  cancel: CancellationToken,
-) -> anyhow::Result<JoinHandle<()>> {
-  let listener = create_upstream_listener(listener_address).await?;
-  match connection_type {
-    ConnectionType::Socks5 => {
-      info!("Created Socks5 listener at {}", listener_address);
-    }
-    ConnectionType::Direct { ref target_address } => {
-      info!("Created listener at {} for {}", listener_address, target_address);
-    }
-  }
-
-  Ok(tokio::spawn(run_listener(listener, connection_type, connection_sender, cancel)))
-}
-
-#[instrument(skip_all)]
 async fn run_guest(properties: Guest) {
-  let mut serials = Vec::new();
-  let distinct_paths: HashSet<&String> = properties.serial_paths.iter().collect();
-  for serial_path in distinct_paths {
-    let serial = tokio_serial::new(serial_path, properties.baud_rate)
-      .open_native_async()
-      .expect("Failed to open serial port");
-    info!("Serial port {} is ready", &serial_path);
-    serials.push(serial);
-  }
-
   let cancel = CancellationToken::new();
-  let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded::<Bytes>(128);
-  let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(128);
-  let tasks = FuturesUnordered::new();
 
-  for serial in serials {
-    let serial_task = task::spawn(sink_loop(
-      serial,
-      serial_to_client_push.clone(),
-      client_to_serial_pull.clone(),
-      cancel.clone(),
-    ));
-    tasks.push(serial_task);
-  }
-
-  let initiator_task =
-    task::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
-  tasks.push(initiator_task);
-
-  let join = maybe_done(join_all(tasks));
-  run_indefinitely(cancel.clone(), join).await;
+  let joined_tasks = create_guest_tasks(properties, cancel.clone()).await;
+  run_indefinitely(cancel.clone(), joined_tasks).await;
 }
 
 async fn run_indefinitely(

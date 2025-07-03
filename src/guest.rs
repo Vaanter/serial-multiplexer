@@ -9,7 +9,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -127,7 +127,7 @@ async fn initiate_client_connection(
       let Some(target_address) = datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) else {
         bail!("Initial datagram did not contain target address");
       };
-      debug!("Connecting to downstream: {}", target_address);
+      info!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;
       let ack = create_ack_datagram(identifier, 0);
       let ack_datagram = datagram_from_bytes(&ack);
