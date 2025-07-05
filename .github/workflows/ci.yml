@@ -3,6 +3,11 @@ name: Rust Build and Release
 on:
   workflow_dispatch:
     inputs:
+      build_release:
+        description: 'Build release versions'
+        required: true
+        default: false
+        type: boolean
       create_release:
         description: 'Create GitHub release'
         required: true
@@ -16,43 +21,16 @@ env:
 jobs:
   test-linux:
     name: "Tests on Linux"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-            ${{ runner.os }}-cargo-
-      - uses: actions/checkout@v4
-      - name: Run tests
-        run: cargo test --all
+    uses: ./.github/workflows/tests-linux-x86_64.yml
 
   test-windows:
     name: "Tests on Windows"
-    runs-on: windows-latest
-    steps:
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-            ${{ runner.os }}-cargo-
-      - uses: actions/checkout@v4
-      - name: Run tests
-        run: cargo test --all
+    uses: ./.github/workflows/tests-windows.yml
 
   build-linux:
     name: "Build Linux version"
     needs: [test-linux]
+    if: github.event.inputs.build_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Cache
@@ -85,6 +63,7 @@ jobs:
   build-windows:
     name: "Build Windows version"
     needs: [test-windows]
+    if: github.event.inputs.build_release == 'true'
     runs-on: windows-latest
     steps:
       - name: Cache
@@ -116,7 +95,7 @@ jobs:
   create-release:
     name: "Create Release"
     needs: [build-linux, build-windows]
-    if: github.event.inputs.create_release == 'true'
+    if: github.event.inputs.build_release == 'true' && github.event.inputs.create_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
