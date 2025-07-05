@@ -44,6 +44,8 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
             ${{ runner.os }}-cargo-
       - uses: actions/checkout@v4
+      - name: Update rust
+        run: rustup update
       - name: Extract version from Cargo.toml
         id: version
         run: |
@@ -77,6 +79,8 @@ jobs:
             ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
             ${{ runner.os }}-cargo-
       - uses: actions/checkout@v4
+      - name: Update rust
+        run: rustup update
       - name: Extract version from Cargo.toml
         id: version
         shell: bash
