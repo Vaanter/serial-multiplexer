@@ -249,6 +249,60 @@ pub mod common {
 
     Ok(tokio::spawn(run_listener(listener, connection_type, connection_sender, cancel)))
   }
+
+  #[cfg(test)]
+  mod tests {
+    use crate::configuration::{AddressPair, Host};
+    use crate::host::ConnectionType;
+    use crate::runner::common::initialize_listeners;
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn test_initialize_listeners() {
+      let cancel = CancellationToken::new();
+      let (connection_sender, mut connection_receiver) = mpsc::channel(128);
+      let address_pairs = vec![
+        AddressPair {
+          listener_address: "127.0.0.1:2000".to_string(),
+          target_address: "127.0.0.1:3000".to_string(),
+        },
+        AddressPair {
+          listener_address: "127.0.0.1:2001".to_string(),
+          target_address: "127.0.0.1:3001".to_string(),
+        },
+      ];
+      let mut host = Host {
+        socks5_proxy: Some("127.0.0.1:5000".to_string()),
+        address_pairs: address_pairs.clone(),
+        ..Default::default()
+      };
+
+      let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await;
+      assert_eq!(listener_task.len(), 3);
+
+      let mut connection_id = 1;
+      for address_pair in address_pairs.iter() {
+        let client = TcpStream::connect(&address_pair.listener_address).await.unwrap();
+        let (state, connection_type) = connection_receiver.recv().await.unwrap();
+        assert_eq!(state.identifier, connection_id);
+        assert_eq!(state.client.peer_addr().unwrap(), client.local_addr().unwrap());
+        assert_eq!(
+          connection_type,
+          ConnectionType::Direct {
+            target_address: address_pair.target_address.clone()
+          }
+        );
+        connection_id += 1;
+      }
+      let socks5_client = TcpStream::connect(&host.socks5_proxy.unwrap()).await.unwrap();
+      let (state, connection_type) = connection_receiver.recv().await.unwrap();
+      assert_eq!(state.identifier, connection_id);
+      assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
+      assert_eq!(connection_type, ConnectionType::Socks5);
+    }
+  }
 }
 
 #[cfg(windows)]
