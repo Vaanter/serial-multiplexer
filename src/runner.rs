@@ -23,33 +23,18 @@ pub mod common {
     let (socket_to_client_push, socket_to_client_pull) = broadcast::channel::<Bytes>(128);
     let (connection_sender, connection_receiver) = mpsc::channel(128);
 
-    let tasks = FuturesUnordered::new();
-
-    let initiator_task = tokio::spawn(connection_initiator(
-      client_to_socket_push,
-      socket_to_client_pull,
-      connection_receiver,
-      cancel.clone(),
-    ));
-    tasks.push(initiator_task);
-
-    let listener_tasks =
-      initialize_listeners(&mut properties, connection_sender, cancel.clone()).await;
-    assert!(!listener_tasks.is_empty(), "All listeners failed to start");
-
-    #[allow(unused_mut)]
     let mut sink_loops = FuturesUnordered::new();
     #[cfg(unix)]
     {
       use crate::runner::linux::accept_unix_connection;
       let socket_task = accept_unix_connection(
         &properties,
-        socket_to_client_push.clone(),
-        client_to_socket_pull.clone(),
+        socket_to_client_push,
+        client_to_socket_pull,
         cancel.clone(),
       )
       .await;
-      sink_loops.push(socket_task);
+      sink_loops.extend([socket_task]);
     }
 
     #[cfg(windows)]
@@ -66,6 +51,19 @@ pub mod common {
       sink_loops.extend(pipe_loop_tasks);
     }
 
+    let tasks = FuturesUnordered::new();
+
+    let initiator_task = tokio::spawn(connection_initiator(
+      client_to_socket_push,
+      socket_to_client_pull,
+      connection_receiver,
+      cancel.clone(),
+    ));
+    tasks.push(initiator_task);
+
+    let listener_tasks = initialize_listeners(&mut properties, connection_sender, cancel).await;
+    assert!(!listener_tasks.is_empty(), "All listeners failed to start");
+
     maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops)))
   }
 
@@ -77,26 +75,25 @@ pub mod common {
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(128);
     let (sink_to_client_push, sink_to_client_pull) = broadcast::channel::<Bytes>(128);
 
-    let tasks = FuturesUnordered::new();
-
-    let initiator_task =
-      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel.clone()));
-    tasks.push(initiator_task);
-
     let mut sink_loops = FuturesUnordered::new();
     match properties.guest_mode {
       GuestMode::Serial => {
         sink_loops.extend(
-          initialize_serials(&properties, sink_to_client_push, client_to_sink_pull, cancel).await,
+          initialize_serials(&properties, sink_to_client_push, client_to_sink_pull, cancel.clone())
+            .await,
         );
       }
       GuestMode::UnixSocket => {
         #[cfg(unix)]
         {
           use crate::runner::linux::connect_to_unix_socket;
-          let socket_task =
-            connect_to_unix_socket(&properties, sink_to_client_push, client_to_sink_pull, cancel)
-              .await;
+          let socket_task = connect_to_unix_socket(
+            &properties,
+            sink_to_client_push,
+            client_to_sink_pull,
+            cancel.clone(),
+          )
+          .await;
           sink_loops.push(socket_task);
         }
         #[cfg(windows)]
@@ -105,6 +102,12 @@ pub mod common {
         }
       }
     }
+
+    let tasks = FuturesUnordered::new();
+
+    let initiator_task =
+      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel));
+    tasks.push(initiator_task);
 
     maybe_done(join_all(tasks.into_iter().chain(sink_loops)))
   }
@@ -164,8 +167,6 @@ pub mod common {
     }
 
     if let Some(ref socks5_proxy) = properties.socks5_proxy {
-      let cancel = cancel.clone();
-      let connection_sender = connection_sender.clone();
       let socks5_task =
         setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
           .await
@@ -200,11 +201,12 @@ pub mod common {
 mod windows {
   use crate::common::sink_loop;
   use crate::configuration::Host;
-  use crate::host;
+  use anyhow::Error;
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
   use std::collections::HashSet;
   use std::time::Duration;
+  use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
   use tokio::sync::broadcast;
   use tokio::task::JoinHandle;
   use tokio::time::sleep;
@@ -222,7 +224,7 @@ mod windows {
     let distinct_paths: HashSet<&String> = properties.pipe_paths.iter().collect();
     for pipe_path in distinct_paths {
       loop {
-        match host::prepare_pipe(pipe_path) {
+        match prepare_pipe(pipe_path) {
           Ok(pipe) => {
             info!("Pipe {} is ready", &pipe_path);
             pipes.push(pipe);
@@ -248,6 +250,10 @@ mod windows {
       pipe_loops.push(pipe_task);
     }
     pipe_loops
+  }
+
+  fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
+    ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
   }
 }
 
@@ -282,6 +288,7 @@ mod linux {
     debug!("Attempting to connect to a unix socket at {}", &properties.socket_path);
     let unix_socket =
       UnixStream::connect(&properties.socket_path).await.expect("Failed to connect to socket");
+    debug!(peer_address = ?unix_socket.peer_addr().unwrap(), "Connected to unix socket");
     create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel)
   }
 
@@ -301,6 +308,7 @@ mod linux {
       UnixListener::bind(&properties.socket_path).expect("Failed to bind to socket");
     let (unix_socket, _) =
       socket_listener.accept().await.expect("Failed to accept socket connection");
+    debug!(peer_address = ?unix_socket.peer_addr().unwrap(), "Accepted unix socket connection");
     create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel)
   }
 }

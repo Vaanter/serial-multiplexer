@@ -113,6 +113,7 @@ async fn run_indefinitely(
   cancel: CancellationToken,
   running_tasks: MaybeDone<JoinAll<JoinHandle<()>>>,
 ) {
+  info!("Setup successful. Waiting for Ctrl+C or shutdown signal.");
   tokio::select! {
     () = cancel.cancelled() => {
       if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
