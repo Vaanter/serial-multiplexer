@@ -143,6 +143,31 @@ pub mod common {
     serial_tasks
   }
 
+  /// Initializes network listeners from the specified [`Host`] properties.
+  ///
+  /// This function creates asynchronous tasks for each network listener ([`Direct`] or [`Socks5`])
+  /// specified in the [`Host`] configuration.
+  /// These listeners are responsible for handling incoming connections.
+  ///
+  /// # Parameters
+  ///
+  /// - `properties`: A mutable reference to [`Host`] that provides the addresses for the listeners
+  /// - `connection_sender`: An [`mpsc::Sender`] channel where the connection information will be
+  ///   sent when a client connects
+  /// - `cancel`: A [`CancellationToken`] to signal the listener loops to end due to application
+  ///   shutdown
+  ///
+  /// # Returns
+  ///
+  /// A [`FuturesUnordered<JoinHandle<()>>`] containing the set of tasks created for listeners.
+  /// Each `JoinHandle` represents an asynchronous task with the listener loop.
+  ///
+  /// # Panics
+  ///
+  /// Failing to create a listener will cause a panic.
+  ///
+  /// [`Direct`]: ConnectionType::Direct
+  /// [`Socks5`]: ConnectionType::Socks5
   pub async fn initialize_listeners(
     properties: &mut Host,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
@@ -177,6 +202,35 @@ pub mod common {
     listener_tasks
   }
 
+  /// Sets up a network listener for a given connection type and address
+  /// and spawns an asynchronous task to handle incoming connections.
+  ///
+  /// # Parameters
+  ///
+  /// * `listener_address` - A string slice representing the address to bind the listener to,
+  ///   will be resolved by [`tokio::net::lookup_host`].
+  /// * `connection_type` - [`ConnectionType`] that specifies how the connection should be created.
+  /// * `connection_sender` -
+  ///   a [`mpsc::Sender`] channel whereto will the new client connection be sent.
+  /// * `cancel` - A [`CancellationToken`] used to signal cancellation of the listener operations.
+  ///
+  /// # Returns
+  ///
+  /// Returns an [`anyhow::Result`] with a [`JoinHandle`]
+  /// of the spawned listener task if the listener is successfully created.
+  ///
+  /// * On success: A [`JoinHandle`] that represents the spawned task for managing the listener.
+  /// * On failure: An [`anyhow::Error`] if the listener could not be created.
+  ///
+  /// # Behaviour
+  ///
+  /// * This function creates a TCP listener bound to the specified `listener_address`.
+  /// * Spawns a [`task`] that runs the listener loop using [`run_listener`].
+  ///
+  /// # Errors
+  ///
+  /// This function returns an error if the upstream listener fails to initialize,
+  /// such as in the case of an invalid address or lack of permissions.
   async fn setup_listener(
     listener_address: &str,
     connection_type: ConnectionType,

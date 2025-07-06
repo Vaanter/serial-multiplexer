@@ -16,7 +16,7 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// Reads datagrams from the serial port looking for an [`Initial`] datagrams.
 /// From these attempts to create a new client connection.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `serial_to_client_pull` -
 ///   A [`broadcast::Receiver<Bytes>`] to receive data from a serial port.
@@ -87,10 +87,12 @@ pub async fn client_initiator(
 /// Handles the initiation of a client connection by processing an incoming datagram
 /// and establishing a downstream connection if the datagram is an [`Initial`] datagram.
 ///
-/// # Arguments
+/// # Parameters
+///
 /// - `data`: The raw [`Bytes`] representing the incoming datagram.
 /// - `client_to_serial_push`:
 ///   An [`async_channel::Sender<Bytes>`] to send datagrams to the serial port(s).
+///
 /// # Returns
 /// An [`anyhow::Result`] that contains:
 /// - [`Ok(Some(ConnectionState))`] if the connection was successfully established.
@@ -103,7 +105,7 @@ pub async fn client_initiator(
 /// - Establishing a connection to the downstream target fails.
 /// - Sending an acknowledgement ([`ACK`]) back to the client fails.
 ///
-/// # Behavior
+/// # Behaviour
 /// - Parses the incoming datagram using [`datagram_from_bytes`].
 /// - If it's an initial connection request ([`Initial`]), extracts the target
 ///   address from the datagram, establishes a connection to the downstream,

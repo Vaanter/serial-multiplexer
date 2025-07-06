@@ -190,7 +190,7 @@ pub async fn sink_loop(
 /// to clients via a broadcast channel.
 /// Any unprocessed data is preserved for subsequent reads.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `bytes_read` - The number of bytes read into the sink buffer from the sink.
 /// * `sink_buf` -
@@ -380,7 +380,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 /// based on whether the read was successful, encountered an error, or if the client disconnected.
 /// It sends appropriate datagrams to be handled downstream via the provided channel.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `identifier` - A unique identifier for the client connection.
 /// * `sequence` - The current datagram sequence number for the connection, used for ordering data.
@@ -461,7 +461,7 @@ pub async fn handle_client_read(
 /// and performs operations such as forwarding data
 /// to the client or closing the connection if a [`Close`] datagram is received.
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `connection` - A mutable reference to a [`ConnectionState`] object, which represents
 ///   the current connection state.
@@ -693,7 +693,7 @@ pub const fn split_u16_to_u8(n: u16) -> [u8; LENGTH_BYTES] {
 
 /// Combines two 8-bit unsigned integers (`u8`) into a single 16-bit unsigned integer (`u16`).
 ///
-/// # Arguments
+/// # Parameters
 ///
 /// * `upper` - An 8-bit unsigned integer (`u8`) representing the upper byte of the 16-bit result.
 /// * `lower` - An 8-bit unsigned integer (`u8`) representing the lower byte of the 16-bit result.
