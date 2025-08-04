@@ -26,14 +26,15 @@ pub mod common {
     let mut sink_loops = FuturesUnordered::new();
     #[cfg(unix)]
     {
-      use crate::runner::linux::accept_unix_connection;
-      let socket_task = accept_unix_connection(
+      use crate::runner::linux::listen_accept_unix_connection;
+      let socket_task = listen_accept_unix_connection(
         &properties,
         socket_to_client_push,
         client_to_socket_pull,
         cancel.clone(),
       )
-      .await;
+      .await
+      .unwrap_or_else(|e| panic!("Failed to create unix socket based sink loop"));
       sink_loops.extend([socket_task]);
     }
 
@@ -369,6 +370,7 @@ mod windows {
 mod linux {
   use crate::common::sink_loop;
   use crate::configuration::{Guest, Host};
+  use anyhow::{Context, bail};
   use bytes::Bytes;
   use std::fs::remove_file;
   use std::io::ErrorKind;
@@ -378,6 +380,9 @@ mod linux {
   use tokio_util::sync::CancellationToken;
   use tracing::debug;
 
+  /// A shorthand function to create a task running a sink loop with a Unix socket as the sink.
+  ///
+  /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
     socket_to_client_push: broadcast::Sender<Bytes>,
@@ -387,6 +392,27 @@ mod linux {
     tokio::spawn(sink_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
   }
 
+  /// Attempts to connect to a Unix socket and sets up a sink loop.
+  ///
+  /// This function tries to connect to a Unix socket specified in the guest properties, panicking
+  /// if it fails to do so. After the connection is successful, a sink loop task is spawned using
+  /// [`create_unix_socket_loop`].
+  ///
+  /// # Parameters
+  /// * `properties`: A reference to [`Guest`], a struct that contains the `socket_path`
+  //     property, which specifies a path of the Unix socket to which this function will connect.
+  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  //     client loops.
+  /// - `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///    receives data sent by clients to be written to the sink.
+  /// - `cancel`: [`CancellationToken`]: A [`CancellationToken`] passed to the sink loop
+  ///    used to signal when the loop should terminate.
+  ///
+  /// # Returns:
+  /// A [`JoinHandle<()>`] with the spawned sink loop task.
+  ///
+  /// # Panics
+  /// This function panics will panic if it fails to connect to the Unix socket.
   pub async fn connect_to_unix_socket(
     properties: &Guest,
     socket_to_client_push: broadcast::Sender<Bytes>,
@@ -400,23 +426,98 @@ mod linux {
     create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel)
   }
 
-  pub async fn accept_unix_connection(
+  /// Creates and listens on a Unix socket, then creates a sink loop when a client connects.
+  ///
+  /// This function deletes a file specified in the host properties (if it exists) and then
+  /// binds a new [`UnixListener`] on the path.
+  /// After a client connects, a sink loop task is spawned using [`create_unix_socket_loop`].
+  ///
+  /// # Parameters:
+  /// - `properties`: A reference to [`Host`], a struct that contains the `socket_path`
+  ///    property, which specifies a path where the Unix socket will be created.
+  /// - `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  ///    client loops.
+  /// - `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///    receives data sent by clients to be written to the sink.
+  /// - `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the
+  ///    loop should terminate.
+  ///
+  /// # Returns:
+  /// An [`anyhow::Result<JoinHandle<()>>`] with the spawned sink loop task if successful,
+  /// Otherwise an error, if:
+  ///   - Removing an existing socket file fails
+  ///   - The socket fails to bind to the provided `socket_path`
+  ///   - The connected client does not have an address
+  pub async fn listen_accept_unix_connection(
     properties: &Host,
     socket_to_client_push: broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> JoinHandle<()> {
+  ) -> anyhow::Result<JoinHandle<()>> {
     if let Err(e) = remove_file(&properties.socket_path)
       && e.kind() != ErrorKind::NotFound
     {
-      panic!("Failed to remove socket file: {}", e);
+      bail!("Failed to remove socket file: {}", e);
     }
     debug!("Listening for a unix socket connection on {}", &properties.socket_path);
     let socket_listener =
-      UnixListener::bind(&properties.socket_path).expect("Failed to bind to socket");
+      UnixListener::bind(&properties.socket_path).context("Failed to bind to socket")?;
     let (unix_socket, _) =
-      socket_listener.accept().await.expect("Failed to accept socket connection");
-    debug!(peer_address = ?unix_socket.peer_addr().unwrap(), "Accepted unix socket connection");
-    create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel)
+      socket_listener.accept().await.context("Failed to accept socket connection")?;
+    debug!(peer_address = ?unix_socket.peer_addr()?, "Accepted unix socket connection");
+    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+  }
+
+  #[cfg(test)]
+  mod test {
+    use super::*;
+    use crate::configuration::GuestMode;
+    use crate::test_utils::setup_tracing;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    async fn listen_connect_accept_send_test() {
+      setup_tracing().await;
+      let socket_path = "test_socket.sock";
+      let host = Host {
+        socket_path: socket_path.to_string(),
+        address_pairs: vec![],
+        socks5_proxy: None,
+      };
+      let guest = Guest {
+        serial_paths: vec![],
+        socket_path: socket_path.to_string(),
+        guest_mode: GuestMode::Serial,
+        baud_rate: 0,
+      };
+
+      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+      let cancel = CancellationToken::new();
+
+      timeout(Duration::from_secs(3), async {
+        let host_loop = tokio::spawn({
+          let cancel = cancel.clone();
+          async move {
+            let sink_loop = listen_accept_unix_connection(
+              &host,
+              sink_to_client_push,
+              client_to_sink_pull,
+              cancel,
+            )
+            .await
+            .unwrap();
+            cancel.cancelled().await;
+          }
+        });
+
+        let sink_loop =
+          connect_to_unix_socket(&guest, sink_to_client_push, client_to_sink_pull, cancel.clone())
+            .await;
+        cancel.cancel();
+      })
+      .await
+      .unwrap();
+    }
   }
 }

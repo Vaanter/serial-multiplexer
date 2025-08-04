@@ -86,7 +86,7 @@ impl ConnectionState {
 /// # Parameters
 ///
 /// * `sink`: An object implementing [`AsyncReadExt`] and [`AsyncWriteExt`],
-///   currently, this will either be [`SerialStream`] or [`NamedPipeClient`].
+///   currently, this will either be [`SerialStream`], [`NamedPipeClient`] or [`UnixStream`].
 /// * `sink_to_client_push`: A [`broadcast::Sender`] used to send data from the sink to
 ///   clients.
 /// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
@@ -119,6 +119,7 @@ impl ConnectionState {
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
+/// [`UnixStream`]: tokio::net::unix::socket::UnixSocket
 #[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl AsyncReadExt + AsyncWriteExt + Unpin,
@@ -315,7 +316,7 @@ pub fn handle_sink_read(
 /// * `sink`:
 ///   A mutable reference to any type (`T`)
 ///   that is used as a sink and where the data will be written.
-///   Currently, this will either be [`SerialStream`] or [`NamedPipeClient`].
+///   Currently, this will either be [`SerialStream`], [`NamedPipeClient`] or [`UnixStream`].
 /// * `data`:
 ///   A [`Bytes`] object representing the datagram that will be written to the sink.
 /// * `compression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
@@ -345,6 +346,7 @@ pub fn handle_sink_read(
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
+/// [`UnixStream`]: tokio::net::unix::socket::UnixSocket
 pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   sink: &mut T,
   data: Bytes,
@@ -531,8 +533,8 @@ pub async fn process_sink_read(
       }
       let datagram_sequence = datagram.sequence();
       debug!(
-        "Received {:?} datagram with seq: {} and {} bytes of data",
-        datagram.code(),
+        "Received {} datagram with seq: {} and {} bytes of data",
+        format!("{:?}", datagram.code()).to_uppercase(),
         datagram_sequence,
         datagram.data().map_or(0, |d| d.len())
       );
@@ -579,6 +581,8 @@ pub async fn process_sink_read(
         if let Err(e) = connection.client.flush().await {
           error!("Failed to flush client data after writing data: {}", e);
         }
+      } else {
+        debug!("Received a datagram that was already processed before, ignoring");
       }
       false
     }
@@ -1217,6 +1221,33 @@ mod tests {
         .unwrap()
         .unwrap()
     );
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_old_datagram() {
+    setup_tracing().await;
+    let identifier = 123;
+    let data = BytesMut::from("test data");
+    let datagram = create_data_datagram(identifier, 1, &data);
+
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let handle = tokio::spawn(async move {
+      let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      address_sender.send(address).await.unwrap();
+      let (mut client, _) = listener.accept().await.unwrap();
+      let mut client_buf = BytesMut::zeroed(2048);
+      let read_result = timeout(Duration::from_secs(1), client.read(&mut client_buf)).await;
+      assert!(read_result.is_err());
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let client = TcpStream::connect(server_address).await.unwrap();
+    let mut connection = ConnectionState::new(identifier, client);
+    connection.largest_processed += 1;
+    assert!(!process_sink_read(&mut connection, Ok(datagram)).await);
+    assert!(connection.datagram_queue.is_empty());
+    handle.await.unwrap();
   }
 
   #[tokio::test]
