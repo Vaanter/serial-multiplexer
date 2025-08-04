@@ -34,7 +34,7 @@ pub mod common {
         cancel.clone(),
       )
       .await
-      .unwrap_or_else(|e| panic!("Failed to create unix socket based sink loop"));
+      .unwrap_or_else(|e| panic!("Failed to create unix socket based sink loop. {}", e));
       sink_loops.extend([socket_task]);
     }
 
@@ -498,16 +498,19 @@ mod linux {
       timeout(Duration::from_secs(3), async {
         let host_loop = tokio::spawn({
           let cancel = cancel.clone();
+          let sink_to_client_push = sink_to_client_push.clone();
+          let client_to_sink_pull = client_to_sink_pull.clone();
           async move {
             let sink_loop = listen_accept_unix_connection(
               &host,
               sink_to_client_push,
               client_to_sink_pull,
-              cancel,
+              cancel.clone(),
             )
             .await
             .unwrap();
             cancel.cancelled().await;
+            sink_loop.await.unwrap();
           }
         });
 
@@ -515,6 +518,8 @@ mod linux {
           connect_to_unix_socket(&guest, sink_to_client_push, client_to_sink_pull, cancel.clone())
             .await;
         cancel.cancel();
+        host_loop.await.unwrap();
+        sink_loop.await.unwrap();
       })
       .await
       .unwrap();
