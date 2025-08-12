@@ -7,9 +7,10 @@ use bytes::Bytes;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -73,8 +74,11 @@ pub async fn client_initiator(
               Ok(Ok(None)) => {}
             }
           }
-          Err(e) => {
-            error!("Failed to receive data from sink: {}", e);
+          Err(RecvError::Lagged(amount)) => {
+            warn!("Missed {amount} datagrams due to lag, some INITIAL datagrams might have been skipped");
+          }
+          Err(RecvError::Closed) => {
+            error!("Failed to receive data, {}", RecvError::Closed);
             cancel.cancel();
             break;
           }
