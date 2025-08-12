@@ -598,8 +598,9 @@ mod linux {
     use crate::configuration::GuestMode;
     use crate::test_utils::setup_tracing;
     use std::time::Duration;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
 
+    #[tokio::test]
     async fn listen_connect_accept_send_test() {
       setup_tracing().await;
       let socket_path = "test_socket.sock";
@@ -638,6 +639,8 @@ mod linux {
           }
         });
 
+        // HACK should wait until the socket is actually bound
+        sleep(Duration::from_secs(1)).await;
         let sink_loop =
           connect_to_unix_socket(&guest, sink_to_client_push, client_to_sink_pull, cancel.clone())
             .await;
