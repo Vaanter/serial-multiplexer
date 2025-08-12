@@ -10,8 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -30,11 +28,6 @@ impl ConnectionType {
   pub const fn new_direct(target_address: String) -> Self {
     Self::Direct { target_address }
   }
-}
-
-#[cfg(windows)]
-pub fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
-  ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
 }
 
 #[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]

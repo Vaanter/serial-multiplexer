@@ -10,5 +10,7 @@ address_pairs = [
 socks5_proxy = "127.0.0.1:2345"
 
 #[mode.Guest]
+#guest_mode = "UnixSocket"
 #serial_paths = ['COM1', 'COM2', 'COM3', 'COM4']
 #serial_paths = ['/dev/ttyS0', '/dev/ttyS1', '/dev/ttyS2', '/dev/ttyS3']
+#socket_path = '/tmp/serial_multiplexer.sock'

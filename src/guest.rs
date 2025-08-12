@@ -10,34 +10,34 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Reads datagrams from the serial port looking for an [`Initial`] datagrams.
+/// Reads datagrams from the sink looking for an [`Initial`] datagrams.
 /// From these attempts to create a new client connection.
 ///
-/// # Arguments
+/// # Parameters
 ///
-/// * `serial_to_client_pull` -
-///   A [`broadcast::Receiver<Bytes>`] to receive data from a serial port.
-/// * `client_to_serial_push` - An [`async_channel::Sender<Bytes>`] to send data from clients back
-///   to the serial port(s).
-/// * `cancel` - A [`CancellationToken`] to signal when the function should terminate.
+/// * `serial_to_client_pull`:
+///   A [`broadcast::Receiver<Bytes>`] to receive data from a sink.
+/// * `client_to_serial_push`: An [`async_channel::Sender<Bytes>`] to send data from clients back
+///   to the sink(s).
+/// * `cancel`: A [`CancellationToken`] to signal when the function should terminate.
 ///
 /// # Behaviour
 ///
-/// - Continuously waits for either incoming messages from the serial port or a cancellation signal.
-/// - When data is received from a serial port,
+/// * Continuously waits for either incoming messages from the sink or a cancellation signal.
+/// * When data is received from a sink,
 ///   it attempts to initiate a client connection within a [`CLIENT_INITIATION_TIMEOUT`] timeout
 ///   window using [`initiate_client_connection`].
-///   - If successful and a connection is established,
+///   * If successful and a connection is established,
 ///     it spawns a new task that runs [`connection_loop`],
-///     handling communication between the client connection and the serial port.
-///   - If the connection initiation fails or exceeds the timeout, appropriate errors are logged.
-/// - If no data can be received from a serial port(s) (i.e. all ports are closed),
+///     handling communication between the client connection and the sink.
+///   * If the connection initiation fails or exceeds the timeout, appropriate errors are logged.
+/// * If no data can be received from a sink(s) (i.e. all ports are closed),
 ///   `cancel` will be triggered, and the loop ends.
-/// - The loop terminates when the cancellation token (`cancel`) is triggered.
+/// * The loop terminates when the cancellation token (`cancel`) is triggered.
 ///
 /// [`Initial`]: ControlCode::Initial
 pub async fn client_initiator(
@@ -91,28 +91,30 @@ pub async fn client_initiator(
 /// Handles the initiation of a client connection by processing an incoming datagram
 /// and establishing a downstream connection if the datagram is an [`Initial`] datagram.
 ///
-/// # Arguments
-/// - `data`: The raw [`Bytes`] representing the incoming datagram.
-/// - `client_to_serial_push`:
-///   An [`async_channel::Sender<Bytes>`] to send datagrams to the serial port(s).
+/// # Parameters
+///
+/// * `data`: The raw [`Bytes`] representing the incoming datagram.
+/// * `client_to_serial_push`:
+///   An [`async_channel::Sender<Bytes>`] to send datagrams to the sink(s).
+///
 /// # Returns
 /// An [`anyhow::Result`] that contains:
-/// - [`Ok(Some(ConnectionState))`] if the connection was successfully established.
-/// - [`Err(anyhow::Error)`] if the connection could not be established
-/// - [`Ok(None)`] if the datagram was not an [`Initial`] datagram or if it was invalid.
+/// * [`Ok(Some(ConnectionState))`] if the connection was successfully established.
+/// * [`Err(anyhow::Error)`] if the connection could not be established
+/// * [`Ok(None)`] if the datagram was not an [`Initial`] datagram or if it was invalid.
 ///
 /// # Errors
 /// Returns an error if:
-/// - The datagram is an initial connection request but does not contain a valid target address.
-/// - Establishing a connection to the downstream target fails.
-/// - Sending an acknowledgement ([`ACK`]) back to the client fails.
+/// * The datagram is an initial connection request but does not contain a valid target address.
+/// * Establishing a connection to the downstream target fails.
+/// * Sending an acknowledgement ([`ACK`]) back to the client fails.
 ///
-/// # Behavior
-/// - Parses the incoming datagram using [`datagram_from_bytes`].
-/// - If it's an initial connection request ([`Initial`]), extracts the target
+/// # Behaviour
+/// * Parses the incoming datagram using [`datagram_from_bytes`].
+/// * If it's an initial connection request ([`Initial`]), extracts the target
 ///   address from the datagram, establishes a connection to the downstream,
 ///   and sends an [`ACK`] response to the client.
-/// - Performs clean-up by shutting down the downstream connection if sending the [`ACK`] fails.
+/// * Performs clean-up by shutting down the downstream connection if sending the [`ACK`] fails.
 ///
 /// [`Initial`]: ControlCode::Initial
 /// [`ACK`]: ControlCode::Ack
@@ -131,7 +133,7 @@ async fn initiate_client_connection(
       let Some(target_address) = datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) else {
         bail!("Initial datagram did not contain target address");
       };
-      debug!("Connecting to downstream: {}", target_address);
+      info!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;
       let ack = create_ack_datagram(identifier, 0);
       let ack_datagram = datagram_from_bytes(&ack);
