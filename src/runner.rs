@@ -4,7 +4,7 @@ pub mod common {
   use crate::guest::client_initiator;
   use crate::host::{ConnectionType, connection_initiator, run_listener};
   use crate::utils::create_upstream_listener;
-  use anyhow::{Context, bail, ensure};
+  use anyhow::{Context, ensure};
   use bytes::Bytes;
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
@@ -57,7 +57,7 @@ pub mod common {
 
     #[cfg(not(any(unix, windows)))]
     {
-      bail!("Host mode is only available on Linux and Windows!");
+      anyhow::bail!("Host mode is only available on Linux and Windows!");
     }
 
     let tasks = FuturesUnordered::new();
@@ -111,7 +111,7 @@ pub mod common {
         }
         #[cfg(not(unix))]
         {
-          bail!("Unix socket guest mode is only available on Linux!");
+          anyhow::bail!("Unix socket guest mode is only available on Linux!");
         }
       }
     }
@@ -643,7 +643,7 @@ mod linux {
             .await;
         cancel.cancel();
         host_loop.await.unwrap();
-        sink_loop.await.unwrap();
+        sink_loop.unwrap().await.unwrap();
       })
       .await
       .unwrap();
