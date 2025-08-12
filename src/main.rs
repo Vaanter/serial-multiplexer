@@ -218,8 +218,8 @@ async fn run_guest(properties: Guest) {
   }
 
   let cancel = CancellationToken::new();
-  let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded::<Bytes>(128);
-  let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(128);
+  let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded::<Bytes>(256);
+  let (serial_to_client_push, serial_to_client_pull) = broadcast::channel::<Bytes>(256);
   let tasks = FuturesUnordered::new();
 
   for serial in serials {
