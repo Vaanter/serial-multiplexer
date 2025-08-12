@@ -125,6 +125,26 @@ pub mod common {
     Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }
 
+  /// Attempts to connect to serial port(s) and create a sink loop for each.
+  ///
+  /// This function will go through all the serial ports in [`Guest`] properties connecting to them.
+  /// If connecting to any serial port fails, all other serial ports will be closed and this
+  /// function will return an Error. Otherwise, if all connections succeed, a sink loop is created
+  /// for each of them.
+  ///
+  /// # Parameters
+  /// * `properties`: A reference to [`Guest`], a struct that contains the `serial_paths`
+  ///   property, which specifies paths of the erial ports to which this function will connect.
+  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  ///   client loops.
+  /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///   receives data sent by clients to be written to the sink.
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
+  ///   should terminate.
+  ///
+  /// # Returns
+  /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
+  /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
     properties: &Guest,
     sink_to_client_push: broadcast::Sender<Bytes>,
@@ -177,17 +197,17 @@ pub mod common {
 
   /// Initializes network listeners from the specified [`Host`] properties.
   ///
-  /// This function creates asynchronous tasks for each network listener ([`Direct`] or [`Socks5`])
-  /// specified in the [`Host`] configuration.
+  /// This function creates tasks via [`tokio::spawn`] for each network listener
+  /// ([`Direct`] or [`Socks5`]) specified in the [`Host`] configuration.
   /// These listeners are responsible for handling incoming connections.
   ///
   /// # Parameters
   ///
-  /// - `properties`: A mutable reference to [`Host`] that provides the addresses for the listeners
-  /// - `connection_sender`: An [`mpsc::Sender`] channel where the connection information will be
-  ///   sent when a client connects
-  /// - `cancel`: A [`CancellationToken`] to signal the listener loops to end due to application
-  ///   shutdown
+  /// * `properties`: A mutable reference to [`Host`] that provides the addresses for the listeners
+  /// * `connection_sender`: An [`mpsc::Sender`] channel where the connection information will be
+  ///   sent when a client connects.
+  /// * `cancel`: A [`CancellationToken`] to signal the listener loops to end due to application
+  ///   shutdown.
   ///
   /// # Returns
   ///
@@ -233,34 +253,23 @@ pub mod common {
   }
 
   /// Sets up a network listener for a given connection type and address
-  /// and spawns an asynchronous task to handle incoming connections.
+  /// and spawns a task to run the listener loop.
   ///
   /// # Parameters
   ///
-  /// * `listener_address` - A string slice representing the address to bind the listener to,
+  /// * `listener_address`: A string slice representing the address to bind the listener to,
   ///   will be resolved by [`tokio::net::lookup_host`].
-  /// * `connection_type` - [`ConnectionType`] that specifies how the connection should be created.
-  /// * `connection_sender` -
-  ///   a [`mpsc::Sender`] channel whereto will the new client connection be sent.
-  /// * `cancel` - A [`CancellationToken`] used to signal cancellation of the listener operations.
+  /// * `connection_type`: [`ConnectionType`] that specifies how the incoming connections should
+  ///   be handled.
+  /// * `connection_sender`:
+  ///   An [`mpsc::Sender`] channel whereto will the new client connection be sent.
+  /// * `cancel`: A [`CancellationToken`] used to signal cancellation of the listener operations.
   ///
   /// # Returns
   ///
-  /// Returns an [`anyhow::Result`] with a [`JoinHandle`]
-  /// of the spawned listener task if the listener is successfully created.
-  ///
-  /// * On success: A [`JoinHandle`] that represents the spawned task for managing the listener.
-  /// * On failure: An [`anyhow::Error`] if the listener could not be created.
-  ///
-  /// # Behaviour
-  ///
-  /// * This function creates a TCP listener bound to the specified `listener_address`.
-  /// * Spawns a [`task`] that runs the listener loop using [`run_listener`].
-  ///
-  /// # Errors
-  ///
-  /// This function returns an error if the upstream listener fails to initialize,
-  /// such as in the case of an invalid address or lack of permissions.
+  /// Returns an [`anyhow::Result<JoinHandle<()>>`] with the spawned listener task
+  /// if the listener is successfully created, otherwise an error if the upstream listener fails
+  /// to initialize, such as in the case of an invalid address or lack of permissions.
   async fn setup_listener(
     listener_address: &str,
     connection_type: ConnectionType,
@@ -352,6 +361,27 @@ mod windows {
   use tokio_util::sync::CancellationToken;
   use tracing::{debug, error, info};
 
+  /// Attempts to connect to Windows named pipe(s) and set up a sink loop for each pipe.
+  ///
+  /// This function will go through all the pipes in [`Host`] properties connecting to them.
+  /// As apparently connecting to a pipe can sometimes just fail, each connection is attempted up to
+  /// 10 times. If connecting to any pipe fails, all other pipes will be closed and this
+  /// function will return an Error. Otherwise, if all connections succeed, a sink loop is created
+  /// for each of them.
+  ///
+  /// # Parameters:
+  /// * `properties`: A reference to [`Host`], a struct that contains the `pipe_paths`
+  ///   property, which specifies paths to the named pipes.
+  /// * `pipe_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  ///   client loops.
+  /// * `client_to_pipe_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///   receives data sent by clients to be written to the sink.
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the
+  ///   loop(s) should terminate.
+  ///
+  /// # Returns:
+  /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
+  /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
     properties: &Host,
     pipe_to_client_push: broadcast::Sender<Bytes>,
@@ -397,6 +427,7 @@ mod windows {
     Ok(pipe_loops)
   }
 
+  /// Attempts to open a named pipe at the specified path for reading and writing
   fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
   }
@@ -487,7 +518,7 @@ mod linux {
     tokio::spawn(sink_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
   }
 
-  /// Attempts to connect to a Unix socket and sets up a sink loop.
+  /// Attempts to connect to a Unix socket and set up a sink loop.
   ///
   /// This function tries to connect to a Unix socket specified in the guest properties, panicking
   /// if it fails to do so. After the connection is successful, a sink loop task is spawned using
@@ -495,19 +526,17 @@ mod linux {
   ///
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `socket_path`
-  //     property, which specifies a path of the Unix socket to which this function will connect.
+  ///    property, which specifies a path of the Unix socket to which this function will connect.
   /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
-  //     client loops.
-  /// - `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///    client loops.
+  /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
-  /// - `cancel`: [`CancellationToken`]: A [`CancellationToken`] passed to the sink loop
-  ///    used to signal when the loop should terminate.
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the loop
+  ///    should terminate.
   ///
   /// # Returns:
-  /// A [`JoinHandle<()>`] with the spawned sink loop task.
-  ///
-  /// # Panics
-  /// This function panics will panic if it fails to connect to the Unix socket.
+  /// An [`anyhow::Result<JoinHandle<()>>`] with the spawned sink loop task if successful,
+  /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
     properties: &Guest,
     socket_to_client_push: broadcast::Sender<Bytes>,
@@ -528,21 +557,21 @@ mod linux {
   /// After a client connects, a sink loop task is spawned using [`create_unix_socket_loop`].
   ///
   /// # Parameters:
-  /// - `properties`: A reference to [`Host`], a struct that contains the `socket_path`
+  /// * `properties`: A reference to [`Host`], a struct that contains the `socket_path`
   ///    property, which specifies a path where the Unix socket will be created.
-  /// - `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
   ///    client loops.
-  /// - `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
-  /// - `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the
   ///    loop should terminate.
   ///
   /// # Returns:
   /// An [`anyhow::Result<JoinHandle<()>>`] with the spawned sink loop task if successful,
-  /// Otherwise an error, if:
-  ///   - Removing an existing socket file fails
-  ///   - The socket fails to bind to the provided `socket_path`
-  ///   - The connected client does not have an address
+  /// otherwise an error if:
+  ///   * Removing an existing socket file fails
+  ///   * The socket fails to bind to the provided `socket_path`
+  ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
     properties: &Host,
     socket_to_client_push: broadcast::Sender<Bytes>,
