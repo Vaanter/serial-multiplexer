@@ -1,4 +1,4 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tracing::{debug, warn};
 
@@ -11,7 +11,11 @@ pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<TcpListe
       Err(e) => errors.push(e),
     }
   }
-  bail!("Failed to start listener with address {}, errors: {:?}", upstream, errors);
+  let mut result_error = anyhow!(format!("Failed to start listener with address {}", upstream));
+  for error in errors {
+    result_error = result_error.context(error);
+  }
+  Err(result_error)
 }
 
 pub async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {

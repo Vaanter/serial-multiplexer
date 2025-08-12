@@ -4,21 +4,23 @@ pub mod common {
   use crate::guest::client_initiator;
   use crate::host::{ConnectionType, connection_initiator, run_listener};
   use crate::utils::create_upstream_listener;
+  use anyhow::{Context, bail, ensure};
   use bytes::Bytes;
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
   use std::collections::HashSet;
+  use tokio::io::AsyncWriteExt;
   use tokio::sync::{broadcast, mpsc};
   use tokio::task;
   use tokio::task::JoinHandle;
   use tokio_serial::SerialPortBuilderExt;
   use tokio_util::sync::CancellationToken;
-  use tracing::{debug, info};
+  use tracing::{debug, error, info};
 
   pub async fn create_host_tasks(
     mut properties: Host,
     cancel: CancellationToken,
-  ) -> MaybeDone<JoinAll<JoinHandle<()>>> {
+  ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
     let (client_to_socket_push, client_to_socket_pull) = async_channel::bounded::<Bytes>(128);
     let (socket_to_client_push, socket_to_client_pull) = broadcast::channel::<Bytes>(128);
     let (connection_sender, connection_receiver) = mpsc::channel(128);
@@ -34,7 +36,7 @@ pub mod common {
         cancel.clone(),
       )
       .await
-      .unwrap_or_else(|e| panic!("Failed to create unix socket based sink loop. {}", e));
+      .context("Failed to create unix socket based sink loop.")?;
       sink_loops.extend([socket_task]);
     }
 
@@ -47,9 +49,15 @@ pub mod common {
         client_to_socket_pull,
         cancel.clone(),
       )
-      .await;
-      assert!(!pipe_loop_tasks.is_empty(), "All pipe loops failed to start");
+      .await
+      .context("Failed to create named pipe based sink loops.")?;
+      ensure!(!pipe_loop_tasks.is_empty(), "All pipe based sink loops failed to start");
       sink_loops.extend(pipe_loop_tasks);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+      bail!("Host mode is only available on Linux and Windows!");
     }
 
     let tasks = FuturesUnordered::new();
@@ -62,16 +70,18 @@ pub mod common {
     ));
     tasks.push(initiator_task);
 
-    let listener_tasks = initialize_listeners(&mut properties, connection_sender, cancel).await;
-    assert!(!listener_tasks.is_empty(), "All listeners failed to start");
+    let listener_tasks = initialize_listeners(&mut properties, connection_sender, cancel)
+      .await
+      .context("Failed to initialize listeners")?;
+    ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
-    maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops)))
+    Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
   }
 
   pub async fn create_guest_tasks(
     properties: Guest,
     cancel: CancellationToken,
-  ) -> MaybeDone<JoinAll<JoinHandle<()>>> {
+  ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
     debug!("Creating guest tasks");
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(128);
     let (sink_to_client_push, sink_to_client_pull) = broadcast::channel::<Bytes>(128);
@@ -79,10 +89,11 @@ pub mod common {
     let mut sink_loops = FuturesUnordered::new();
     match properties.guest_mode {
       GuestMode::Serial => {
-        sink_loops.extend(
+        let serial_port_sinks =
           initialize_serials(&properties, sink_to_client_push, client_to_sink_pull, cancel.clone())
-            .await,
-        );
+            .await
+            .context("Failed to create serial port based sink loops.")?;
+        sink_loops.extend(serial_port_sinks);
       }
       GuestMode::UnixSocket => {
         #[cfg(unix)]
@@ -94,12 +105,13 @@ pub mod common {
             client_to_sink_pull,
             cancel.clone(),
           )
-          .await;
+          .await
+          .context("Failed to create unix socket based sink loop.")?;
           sink_loops.push(socket_task);
         }
-        #[cfg(windows)]
+        #[cfg(not(unix))]
         {
-          panic!("Unix socket guest mode is not available on Windows!");
+          bail!("Unix socket guest mode is only available on Linux!");
         }
       }
     }
@@ -110,7 +122,7 @@ pub mod common {
       task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel));
     tasks.push(initiator_task);
 
-    maybe_done(join_all(tasks.into_iter().chain(sink_loops)))
+    Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }
 
   pub async fn initialize_serials(
@@ -118,21 +130,40 @@ pub mod common {
     sink_to_client_push: broadcast::Sender<Bytes>,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> FuturesUnordered<JoinHandle<()>> {
-    debug!("Initializing serials");
-    let mut serials = Vec::new();
+  ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
+    debug!("Initializing serial ports");
     let distinct_paths: HashSet<&_> = properties.serial_paths.iter().collect();
-    for serial_path in distinct_paths {
-      let serial = tokio_serial::new(serial_path, properties.baud_rate)
-        .open_native_async()
-        .expect("Failed to open serial port");
-      info!("Serial port {} is ready", &serial_path);
-      serials.push(serial);
+    let mut serials_ok = Vec::with_capacity(distinct_paths.len());
+    let mut serials_err = Vec::with_capacity(distinct_paths.len());
+    for serial_path in distinct_paths.into_iter() {
+      match tokio_serial::new(serial_path, properties.baud_rate).open_native_async() {
+        Ok(serial) => {
+          info!("Serial port {} is ready", &serial_path);
+          serials_ok.push(serial);
+        }
+        Err(e) => {
+          error!("Failed to connect to serial port '{}'. {e}", serial_path);
+          serials_err.push(e);
+        }
+      }
+    }
+
+    if !serials_err.is_empty() {
+      let mut error = anyhow::anyhow!("Failed to connect to all serial ports!");
+      for serial_error in serials_err {
+        error = error.context(serial_error);
+      }
+      for mut serial in serials_ok {
+        if let Err(e) = serial.shutdown().await {
+          error = error.context(format!("Failed to close serial port. {e:?}"));
+        }
+      }
+      return Err(error);
     }
 
     let serial_tasks = FuturesUnordered::new();
 
-    for serial in serials {
+    for serial in serials_ok {
       let serial_task = task::spawn(sink_loop(
         serial,
         sink_to_client_push.clone(),
@@ -141,7 +172,7 @@ pub mod common {
       ));
       serial_tasks.push(serial_task);
     }
-    serial_tasks
+    Ok(serial_tasks)
   }
 
   /// Initializes network listeners from the specified [`Host`] properties.
@@ -173,7 +204,7 @@ pub mod common {
     properties: &mut Host,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     cancel: CancellationToken,
-  ) -> FuturesUnordered<JoinHandle<()>> {
+  ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
     let listener_tasks = FuturesUnordered::new();
     while let Some(pair_direct) = properties.address_pairs.pop() {
@@ -186,9 +217,7 @@ pub mod common {
         cancel,
       )
       .await
-      .unwrap_or_else(|e| {
-        panic!("Failed to setup listener for {}: {}", pair_direct.listener_address, e)
-      });
+      .context(format!("Failed to setup listener at address '{}'", pair_direct.listener_address))?;
       listener_tasks.push(pair_task);
     }
 
@@ -196,11 +225,11 @@ pub mod common {
       let socks5_task =
         setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
           .await
-          .unwrap_or_else(|e| panic!("Failed to setup socks5 listener at {socks5_proxy}: {e}"));
+          .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
       listener_tasks.push(socks5_task);
     }
 
-    listener_tasks
+    Ok(listener_tasks)
   }
 
   /// Sets up a network listener for a given connection type and address
@@ -241,7 +270,7 @@ pub mod common {
     let listener = create_upstream_listener(listener_address).await?;
     match connection_type {
       ConnectionType::Socks5 => {
-        info!("Created Socks5 listener at {}", listener_address);
+        info!("Created Socks5 listener at address '{}'", listener_address);
       }
       ConnectionType::Direct { ref target_address } => {
         info!("Created listener at {} for {}", listener_address, target_address);
@@ -280,7 +309,7 @@ pub mod common {
         ..Default::default()
       };
 
-      let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await;
+      let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await.unwrap();
       assert_eq!(listener_task.len(), 3);
 
       let mut connection_id = 1;
@@ -310,29 +339,29 @@ pub mod common {
 mod windows {
   use crate::common::sink_loop;
   use crate::configuration::Host;
-  use anyhow::Error;
+  use anyhow::{Error, bail};
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
   use std::collections::HashSet;
   use std::time::Duration;
+  use tokio::io::AsyncWriteExt;
   use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
   use tokio::sync::broadcast;
   use tokio::task::JoinHandle;
   use tokio::time::sleep;
   use tokio_util::sync::CancellationToken;
-  use tracing::{debug, info};
+  use tracing::{debug, error, info};
 
   pub async fn create_windows_pipe_loops(
     properties: &Host,
     pipe_to_client_push: broadcast::Sender<Bytes>,
     client_to_pipe_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> FuturesUnordered<JoinHandle<()>> {
+  ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     let mut pipes = Vec::new();
-    let mut retry_count = 0;
     let distinct_paths: HashSet<&String> = properties.pipe_paths.iter().collect();
-    for pipe_path in distinct_paths {
-      loop {
+    for pipe_path in distinct_paths.iter() {
+      for _ in 0..10 {
         match prepare_pipe(pipe_path) {
           Ok(pipe) => {
             info!("Pipe {} is ready", &pipe_path);
@@ -341,12 +370,19 @@ mod windows {
           }
           Err(err) => {
             debug!("Failed to connect to pipe: {}", err);
-            assert!(retry_count < 10, "Failed to prepare pipe {} after 10 attempts", &pipe_path);
             sleep(Duration::from_millis(100)).await;
-            retry_count += 1;
           }
         }
       }
+    }
+
+    if pipes.len() != distinct_paths.len() {
+      for mut pipe in pipes {
+        if let Err(e) = pipe.shutdown().await {
+          error!("Failed to close a pipe! {}", e);
+        }
+      }
+      bail!("Failed to connect to all pipes!");
     }
 
     let pipe_loops = FuturesUnordered::new();
@@ -358,11 +394,70 @@ mod windows {
         tokio::spawn(sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel));
       pipe_loops.push(pipe_task);
     }
-    pipe_loops
+    Ok(pipe_loops)
   }
 
   fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+    use crate::test_utils::setup_tracing;
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn create_windows_pipe_loops_non_existent_test() {
+      setup_tracing().await;
+      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+      let cancel = CancellationToken::new();
+      let host: Host = Host {
+        pipe_paths: vec!["non_existent_pipe".to_string()],
+        ..Default::default()
+      };
+
+      let result =
+        create_windows_pipe_loops(&host, sink_to_client_push, client_to_sink_pull, cancel.clone())
+          .await;
+      assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_windows_pipe_loops_multiple_test() {
+      setup_tracing().await;
+      let pipe1_path = "\\\\.\\pipe\\test_pipe_multiplexer_1";
+      let pipe2_path = "\\\\.\\pipe\\test_pipe_multiplexer_2";
+      let pipe3_path = "\\\\.\\pipe\\test_pipe_multiplexer_3";
+      let pipe1 = ServerOptions::new().create(pipe1_path).unwrap();
+      let pipe2 = ServerOptions::new().create(pipe2_path).unwrap();
+      let pipe3 = ServerOptions::new().create(pipe3_path).unwrap();
+      let server_task = tokio::spawn(async move {
+        pipe1.connect().await.unwrap();
+        pipe2.connect().await.unwrap();
+        pipe3.connect().await.unwrap();
+        pipe1.disconnect().unwrap();
+        pipe2.disconnect().unwrap();
+        pipe3.disconnect().unwrap();
+      });
+
+      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+      let cancel = CancellationToken::new();
+      let host: Host = Host {
+        pipe_paths: vec![pipe1_path.to_string(), pipe2_path.to_string(), pipe3_path.to_string()],
+        ..Default::default()
+      };
+
+      let result =
+        create_windows_pipe_loops(&host, sink_to_client_push, client_to_sink_pull, cancel.clone())
+          .await;
+      assert!(result.is_ok());
+
+      timeout(Duration::from_secs(3), server_task).await.unwrap().unwrap();
+    }
   }
 }
 
@@ -418,12 +513,12 @@ mod linux {
     socket_to_client_push: broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> JoinHandle<()> {
+  ) -> anyhow::Result<JoinHandle<()>> {
     debug!("Attempting to connect to a unix socket at {}", &properties.socket_path);
     let unix_socket =
-      UnixStream::connect(&properties.socket_path).await.expect("Failed to connect to socket");
-    debug!(peer_address = ?unix_socket.peer_addr().unwrap(), "Connected to unix socket");
-    create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel)
+      UnixStream::connect(&properties.socket_path).await.context("Failed to connect to socket")?;
+    debug!(peer_address = ?unix_socket.peer_addr()?, "Connected to unix socket");
+    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
   }
 
   /// Creates and listens on a Unix socket, then creates a sink loop when a client connects.
@@ -469,7 +564,7 @@ mod linux {
   }
 
   #[cfg(test)]
-  mod test {
+  mod tests {
     use super::*;
     use crate::configuration::GuestMode;
     use crate::test_utils::setup_tracing;

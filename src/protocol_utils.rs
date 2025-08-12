@@ -41,6 +41,6 @@ fn create_data_datagram_with_code(
   Bytes::copy_from_slice(builder.finished_data())
 }
 
-pub fn datagram_from_bytes(data: &[u8]) -> Result<Datagram, InvalidFlatbuffer> {
+pub fn datagram_from_bytes(data: &'_ [u8]) -> Result<Datagram<'_>, InvalidFlatbuffer> {
   root_as_datagram(data)
 }

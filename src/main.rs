@@ -20,14 +20,15 @@ mod guest;
 mod host;
 mod protocol_utils;
 mod runner;
-#[allow(unsafe_op_in_unsafe_fn, unused)]
+#[allow(unsafe_op_in_unsafe_fn, unused, mismatched_lifetime_syntaxes)]
 mod schema_generated;
 #[cfg(test)]
 mod test_utils;
 mod utils;
 
 fn main() {
-  let config = ConfigArgs::build_config().unwrap_or_else(|e| panic!("Failed to parse config: {e}"));
+  let config =
+    ConfigArgs::build_config().unwrap_or_else(|e| panic!("Failed to parse config: {e:?}"));
 
   let (writer, _guard) = if let Some(ref log_file_name) = config.log_file {
     let mut log_file_options = OpenOptions::new();
@@ -97,7 +98,12 @@ fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
 #[instrument(skip_all)]
 async fn run_host(properties: Host) {
   let cancel = CancellationToken::new();
-  let joined_tasks = create_host_tasks(properties, cancel.clone()).await;
+  let joined_tasks = match create_host_tasks(properties, cancel.clone()).await {
+    Ok(joined_tasks) => joined_tasks,
+    Err(e) => {
+      panic!("Initialisation failed! {:#?}", e);
+    }
+  };
   run_indefinitely(cancel, joined_tasks).await;
 }
 
@@ -105,7 +111,12 @@ async fn run_host(properties: Host) {
 async fn run_guest(properties: Guest) {
   let cancel = CancellationToken::new();
 
-  let joined_tasks = create_guest_tasks(properties, cancel.clone()).await;
+  let joined_tasks = match create_guest_tasks(properties, cancel.clone()).await {
+    Ok(joined_tasks) => joined_tasks,
+    Err(e) => {
+      panic!("Initialisation failed! {:#?}", e);
+    }
+  };
   run_indefinitely(cancel.clone(), joined_tasks).await;
 }
 
