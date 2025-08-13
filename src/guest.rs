@@ -3,11 +3,10 @@ use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
 use crate::utils::connect_downstream;
 use anyhow::bail;
+use async_broadcast::RecvError;
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -20,7 +19,7 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// # Parameters
 ///
 /// * `serial_to_client_pull`:
-///   A [`broadcast::Receiver<Bytes>`] to receive data from a sink.
+///   A [`async_broadcast::Receiver<Bytes>`] to receive data from a sink.
 /// * `client_to_serial_push`: An [`async_channel::Sender<Bytes>`] to send data from clients back
 ///   to the sink(s).
 /// * `cancel`: A [`CancellationToken`] to signal when the function should terminate.
@@ -41,7 +40,7 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// [`Initial`]: ControlCode::Initial
 pub async fn client_initiator(
-  mut serial_to_client_pull: broadcast::Receiver<Bytes>,
+  mut serial_to_client_pull: async_broadcast::Receiver<Bytes>,
   client_to_serial_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
@@ -60,7 +59,7 @@ pub async fn client_initiator(
               Ok(Ok(Some(connection))) => {
                 tokio::spawn(connection_loop(
                   connection,
-                  serial_to_client_pull.resubscribe(),
+                  serial_to_client_pull.clone(),
                   client_to_serial_push.clone(),
                   cancel.clone()
                 ));
@@ -74,7 +73,7 @@ pub async fn client_initiator(
               Ok(Ok(None)) => {}
             }
           }
-          Err(RecvError::Lagged(amount)) => {
+          Err(RecvError::Overflowed(amount)) => {
             warn!("Missed {amount} datagrams due to lag, some INITIAL datagrams might have been skipped");
           }
           Err(RecvError::Closed) => {
@@ -194,7 +193,7 @@ mod tests {
   async fn test_client_initiator_success() {
     setup_tracing().await;
     let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
     let initial = create_initial_datagram(123, 0, &target_address);
@@ -205,7 +204,7 @@ mod tests {
       CancellationToken::new(),
     ));
 
-    serial_to_client_push.send(initial).unwrap();
+    serial_to_client_push.broadcast_direct(initial).await.unwrap();
     let ack = client_to_serial_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&ack).unwrap();
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
@@ -217,7 +216,7 @@ mod tests {
   async fn test_client_initiator_target_unreachable() {
     setup_tracing().await;
     let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
     let target_address = "127.0.0.1:0".to_string();
     let initial = create_initial_datagram(123, 0, &target_address);
 
@@ -227,7 +226,7 @@ mod tests {
       CancellationToken::new(),
     ));
 
-    serial_to_client_push.send(initial).unwrap();
+    serial_to_client_push.broadcast_direct(initial).await.unwrap();
     assert!(timeout(Duration::from_secs(1), client_to_serial_pull.recv()).await.is_err());
   }
 
@@ -235,7 +234,7 @@ mod tests {
   async fn test_client_initiator_pipe_closed() {
     setup_tracing().await;
     let (client_to_serial_push, _) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = broadcast::channel(10);
+    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
     let cancel = CancellationToken::new();
 
     tokio::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));

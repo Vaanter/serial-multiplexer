@@ -10,7 +10,7 @@ pub mod common {
   use futures::stream::FuturesUnordered;
   use std::collections::HashSet;
   use tokio::io::AsyncWriteExt;
-  use tokio::sync::{broadcast, mpsc};
+  use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
   use tokio_serial::SerialPortBuilderExt;
@@ -21,9 +21,9 @@ pub mod common {
     mut properties: Host,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
-    let (client_to_socket_push, client_to_socket_pull) = async_channel::bounded::<Bytes>(128);
-    let (socket_to_client_push, socket_to_client_pull) = broadcast::channel::<Bytes>(128);
-    let (connection_sender, connection_receiver) = mpsc::channel(128);
+    let (client_to_socket_push, client_to_socket_pull) = async_channel::bounded::<Bytes>(512);
+    let (socket_to_client_push, socket_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
+    let (connection_sender, connection_receiver) = mpsc::channel(512);
 
     let mut sink_loops = FuturesUnordered::new();
     #[cfg(unix)]
@@ -83,8 +83,8 @@ pub mod common {
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
     debug!("Creating guest tasks");
-    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(128);
-    let (sink_to_client_push, sink_to_client_pull) = broadcast::channel::<Bytes>(128);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
 
     let mut sink_loops = FuturesUnordered::new();
     match properties.guest_mode {
@@ -147,7 +147,7 @@ pub mod common {
   /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
     properties: &Guest,
-    sink_to_client_push: broadcast::Sender<Bytes>,
+    sink_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
@@ -355,7 +355,6 @@ mod windows {
   use std::time::Duration;
   use tokio::io::AsyncWriteExt;
   use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-  use tokio::sync::broadcast;
   use tokio::task::JoinHandle;
   use tokio::time::sleep;
   use tokio_util::sync::CancellationToken;
@@ -384,7 +383,7 @@ mod windows {
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
     properties: &Host,
-    pipe_to_client_push: broadcast::Sender<Bytes>,
+    pipe_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_pipe_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
@@ -442,7 +441,7 @@ mod windows {
     #[tokio::test]
     async fn create_windows_pipe_loops_non_existent_test() {
       setup_tracing().await;
-      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let host: Host = Host {
@@ -474,7 +473,7 @@ mod windows {
         pipe3.disconnect().unwrap();
       });
 
-      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let host: Host = Host {
@@ -501,7 +500,6 @@ mod linux {
   use std::fs::remove_file;
   use std::io::ErrorKind;
   use tokio::net::{UnixListener, UnixStream};
-  use tokio::sync::broadcast;
   use tokio::task::JoinHandle;
   use tokio_util::sync::CancellationToken;
   use tracing::debug;
@@ -511,7 +509,7 @@ mod linux {
   /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
-    socket_to_client_push: broadcast::Sender<Bytes>,
+    socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> JoinHandle<()> {
@@ -539,7 +537,7 @@ mod linux {
   /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
     properties: &Guest,
-    socket_to_client_push: broadcast::Sender<Bytes>,
+    socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
@@ -574,7 +572,7 @@ mod linux {
   ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
     properties: &Host,
-    socket_to_client_push: broadcast::Sender<Bytes>,
+    socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
@@ -616,7 +614,7 @@ mod linux {
         baud_rate: 0,
       };
 
-      let (sink_to_client_push, _sink_to_client_pull) = broadcast::channel(256);
+      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
 

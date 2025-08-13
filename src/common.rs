@@ -9,7 +9,6 @@ use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace};
 use tracing_attributes::instrument;
@@ -123,7 +122,7 @@ impl ConnectionState {
 #[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl AsyncReadExt + AsyncWriteExt + Unpin,
-  sink_to_client_push: broadcast::Sender<Bytes>,
+  sink_to_client_push: async_broadcast::Sender<Bytes>,
   client_to_sink_pull: async_channel::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
@@ -166,7 +165,7 @@ pub async fn sink_loop(
           }
           Ok(n) => {
             let sink_read_duration = Instant::now();
-            let result = handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer);
+            let result = handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer).await;
             trace!(target: METRICS_TARGET, duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
             match result {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
@@ -237,10 +236,10 @@ pub async fn sink_loop(
 ///   * If the entire buffer was processed, the buffer will be zeroed out.
 ///   * If some bytes remain unprocessed, they will be copied to the beginning of the buffer
 ///     and the rest of the buffer will be zeroed out.
-pub fn handle_sink_read(
+pub async fn handle_sink_read(
   bytes_read: usize,
   sink_buf: &mut BytesMut,
-  sink_to_client_push: broadcast::Sender<Bytes>,
+  sink_to_client_push: async_broadcast::Sender<Bytes>,
   decompression_buffer: &mut BytesMut,
 ) -> anyhow::Result<usize> {
   debug_assert!(decompression_buffer.len() <= SINK_COMPRESSION_BUFFER_SIZE);
@@ -275,7 +274,7 @@ pub fn handle_sink_read(
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
     trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes);
-    if let Err(e) = sink_to_client_push.send(datagram_bytes) {
+    if let Err(e) = sink_to_client_push.broadcast(datagram_bytes).await {
       bail!("Failed to send data to clients. {}", e);
     }
     unprocessed_data_start += datagram_end + 1;
@@ -516,7 +515,7 @@ pub async fn handle_client_read(
 /// [`Close`]: ControlCode::Close
 pub async fn process_sink_read(
   connection: &mut ConnectionState,
-  data: Result<Bytes, broadcast::error::RecvError>,
+  data: Result<Bytes, async_broadcast::RecvError>,
 ) -> bool {
   match data {
     Ok(data_buf) => {
@@ -586,7 +585,7 @@ pub async fn process_sink_read(
       }
       false
     }
-    Err(broadcast::error::RecvError::Closed) => {
+    Err(async_broadcast::RecvError::Closed) => {
       if let Err(e) = connection.client.shutdown().await {
         error!("Failed to shutdown client: {}", e);
       }
@@ -602,7 +601,7 @@ pub async fn process_sink_read(
 ///
 /// * `connection`: The current [`ConnectionState`] that holds the client's state and identifier.
 /// * `sink_to_client_pull`:
-///   A [`broadcast::Receiver<Bytes>`] to receive datagrams from the sink for processing.
+///   A [`async_broadcast::Receiver<Bytes>`] to receive datagrams from the sink for processing.
 /// * `client_to_sink_push`:
 ///   An [`async_channel::Sender`] for sending data received from the client to the sink(s).
 /// * `cancel`:
@@ -623,10 +622,10 @@ pub async fn process_sink_read(
 ///    The processing might signal connection termination, which breaks the loop.
 ///
 /// [`Close`]: ControlCode::Close
-#[instrument(skip_all, fields(connection_id = %connection.identifier))]
+#[instrument(skip_all, fields(connection_id = %connection.identifier, client_address = %connection.client.peer_addr().unwrap()))]
 pub async fn connection_loop(
   mut connection: ConnectionState,
-  mut sink_to_client_pull: broadcast::Receiver<Bytes>,
+  mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
@@ -647,7 +646,7 @@ pub async fn connection_loop(
         }
         break;
       }
-      data = sink_to_client_pull.recv() => {
+      data = sink_to_client_pull.recv_direct() => {
         let sink_read_start = Instant::now();
         let connection_terminating = process_sink_read(&mut connection, data).await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
@@ -729,7 +728,7 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
     sink_buf.extend_from_slice(&[1, 2]);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &[4, 5, 6], 9).unwrap();
@@ -744,6 +743,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 3);
@@ -764,6 +764,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 5);
@@ -777,7 +778,7 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
 
     let datagram1 = create_data_datagram(0, 1, b"datagram1");
     let datagram2 = create_data_datagram(1, 2, b"datagram2");
@@ -802,6 +803,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
@@ -817,7 +819,7 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
 
     let datagram_data = BytesMut::from(vec![65u8; CONNECTION_BUFFER_SIZE].as_slice());
     let datagram = create_data_datagram(0, 1, &datagram_data);
@@ -833,6 +835,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
@@ -846,7 +849,7 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let buffer_size = sink_buf.len();
@@ -857,6 +860,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
@@ -870,7 +874,7 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = broadcast::channel(20);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
 
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
@@ -884,6 +888,7 @@ mod tests {
       sink_to_client_push.clone(),
       &mut compression_buf,
     )
+    .await
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
@@ -896,7 +901,7 @@ mod tests {
     setup_tracing().await;
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, mut pipe_to_client_pull) = broadcast::channel(256);
+    let (pipe_to_client_push, mut pipe_to_client_pull) = async_broadcast::broadcast(256);
     let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     let _pipe_loop_handle = tokio::spawn(sink_loop(
@@ -965,8 +970,8 @@ mod tests {
   async fn test_sink_loop_write() {
     setup_tracing().await;
     let (sink_a, sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push_write, _pipe_to_client_pull_write) = broadcast::channel(256);
-    let (pipe_to_client_push_read, mut pipe_to_client_pull_read) = broadcast::channel(256);
+    let (pipe_to_client_push_write, _pipe_to_client_pull_write) = async_broadcast::broadcast(256);
+    let (pipe_to_client_push_read, mut pipe_to_client_pull_read) = async_broadcast::broadcast(256);
     let (client_to_pipe_push_write, client_to_pipe_pull_write) = async_channel::bounded(256);
     let (_client_to_pipe_push_read, client_to_pipe_pull_read) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
@@ -1005,7 +1010,7 @@ mod tests {
   async fn test_connection_loop_sink_read() {
     setup_tracing().await;
     let cancel = CancellationToken::new();
-    let (sink_to_client_push, sink_to_client_pull) = broadcast::channel(256);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let data = Bytes::from_static(b"test data");
 
@@ -1029,7 +1034,7 @@ mod tests {
     let server_address = address_receiver.recv().await.unwrap();
     let mut client = TcpStream::connect(server_address).await.unwrap();
     let datagram = create_data_datagram(0, 1, &data);
-    sink_to_client_push.send(datagram).unwrap();
+    sink_to_client_push.broadcast_direct(datagram).await.unwrap();
     let mut client_buf = BytesMut::zeroed(2048);
     let n = client.read(&mut client_buf).await.unwrap();
     assert_eq!(n, data.len());
@@ -1040,7 +1045,7 @@ mod tests {
   async fn test_connection_loop_cancel() {
     setup_tracing().await;
     let cancel = CancellationToken::new();
-    let (_sink_to_client_push, sink_to_client_pull) = broadcast::channel(256);
+    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
 
     let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
@@ -1254,7 +1259,7 @@ mod tests {
   async fn test_sink_loop_channel_closed() {
     setup_tracing().await;
     let (sink_a, _sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, _pipe_to_client_pull) = broadcast::channel(256);
+    let (pipe_to_client_push, _pipe_to_client_pull) = async_broadcast::broadcast(256);
     let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     client_to_pipe_pull.close();
@@ -1271,7 +1276,7 @@ mod tests {
   async fn test_sink_read_sink_closed() {
     setup_tracing().await;
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, _pipe_to_client_pull) = broadcast::channel(256);
+    let (pipe_to_client_push, _pipe_to_client_pull) = async_broadcast::broadcast(256);
     let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     sink_b.shutdown().await.unwrap();
