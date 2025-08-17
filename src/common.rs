@@ -254,10 +254,10 @@ pub async fn handle_sink_read(
       trace!("Buffer is too small to contain datagram size");
       break;
     }
-    let size = join_u8_to_u16(
+    let size = u16::from_be_bytes([
       read_data[header_idx + HEADER_BYTES],
       read_data[header_idx + HEADER_BYTES + 1],
-    );
+    ]);
     trace!("Found size - {} bytes", size);
     if header_idx + size as usize + HEADER_BYTES + LENGTH_BYTES > read_data.len() {
       trace!("Buffer is too small to contain all datagram bytes");
@@ -360,7 +360,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
   if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
     bail!("Failed to write HEADER to sink: {}", e);
   }
-  let size = split_u16_to_u8(compressed_size as u16);
+  let size: [u8; LENGTH_BYTES] = (compressed_size as u16).to_be_bytes();
   if let Err(e) = sink.write(&size).await {
     bail!("Failed to write size to sink: {}", e);
   }
@@ -674,42 +674,6 @@ pub async fn connection_loop(
   debug!("Connection {} loop ending", connection.identifier);
 }
 
-/// Splits a 16-bit unsigned integer (`u16`) into two 8-bit unsigned integers (`u8`)
-/// and returns them as an array.
-///
-/// # Parameters
-/// * `n`: A 16-bit unsigned integer (`u16`) to be split.
-///
-/// # Returns
-/// * An array of two `u8` values:
-///   * `[upper, lower]`, where:
-///     * `upper` is the most significant byte of the input `u16`.
-///     * `lower` is the least significant byte of the input `u16`.
-///
-/// # Note
-/// The actual length of the returned array is specified by [`LENGTH_BYTES`].
-pub const fn split_u16_to_u8(n: u16) -> [u8; LENGTH_BYTES] {
-  let upper = (n >> 8) as u8;
-  let lower = n as u8;
-  [upper, lower]
-}
-
-/// Combines two 8-bit unsigned integers (`u8`) into a single 16-bit unsigned integer (`u16`).
-///
-/// # Parameters
-///
-/// * `upper`: An 8-bit unsigned integer (`u8`) representing the upper byte of the 16-bit result.
-/// * `lower`: An 8-bit unsigned integer (`u8`) representing the lower byte of the 16-bit result.
-///
-/// # Returns
-///
-/// A 16-bit unsigned integer (`u16`) created by combining `upper` and `lower`.
-/// The `upper` value is shifted left by 8 bits to occupy the high byte, and
-/// the `lower` value occupies the low byte.
-pub const fn join_u8_to_u16(upper: u8, lower: u8) -> u16 {
-  ((upper as u16) << 8) | lower as u16
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -732,7 +696,7 @@ mod tests {
     sink_buf.extend_from_slice(&[1, 2]);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &[4, 5, 6], 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[7, 8, 9]);
     let mut buffer_size = sink_buf.len();
@@ -754,7 +718,7 @@ mod tests {
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &[5; 100], 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[11, 12, 13, 14, 15]);
     buffer_size = sink_buf.len();
@@ -785,15 +749,15 @@ mod tests {
     let datagram3 = create_data_datagram(2, 3, b"datagram3");
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram1, 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram2, 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram3, 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
 
     let buffer_size = sink_buf.len();
@@ -825,7 +789,7 @@ mod tests {
     let datagram = create_data_datagram(0, 1, &datagram_data);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram, 9).unwrap();
-    sink_buf.extend_from_slice(&split_u16_to_u8(n as u16));
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
 
     let buffer_size = sink_buf.len();
@@ -878,7 +842,7 @@ mod tests {
 
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
-    sink_buf.extend_from_slice(&split_u16_to_u8(5));
+    sink_buf.extend_from_slice(&5u16.to_be_bytes());
     sink_buf.extend_from_slice(&[1; 3]);
     let buffer_size = sink_buf.len();
 
