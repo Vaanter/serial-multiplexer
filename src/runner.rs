@@ -1,13 +1,13 @@
 pub mod common {
-  use crate::common::{ConnectionState, sink_loop};
   use crate::configuration::{Guest, GuestMode, Host};
-  use crate::guest::client_initiator;
-  use crate::host::{ConnectionType, connection_initiator, run_listener};
-  use crate::utils::create_upstream_listener;
   use anyhow::{Context, ensure};
   use bytes::Bytes;
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
+  use serial_multiplexer_lib::common::{ConnectionState, sink_loop};
+  use serial_multiplexer_lib::guest::client_initiator;
+  use serial_multiplexer_lib::host::{ConnectionType, connection_initiator, run_listener};
+  use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::HashSet;
   use tokio::io::AsyncWriteExt;
   use tokio::sync::mpsc;
@@ -292,8 +292,8 @@ pub mod common {
   #[cfg(test)]
   mod tests {
     use crate::configuration::{AddressPair, Host};
-    use crate::host::ConnectionType;
     use crate::runner::common::initialize_listeners;
+    use serial_multiplexer_lib::host::ConnectionType;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -321,7 +321,7 @@ pub mod common {
       let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await.unwrap();
       assert_eq!(listener_task.len(), 3);
 
-      let mut connection_id = 1;
+      let mut connection_id = 0;
       for address_pair in address_pairs.iter() {
         let client = TcpStream::connect(&address_pair.listener_address).await.unwrap();
         let (state, connection_type) = connection_receiver.recv().await.unwrap();
@@ -346,11 +346,11 @@ pub mod common {
 
 #[cfg(windows)]
 mod windows {
-  use crate::common::sink_loop;
   use crate::configuration::Host;
   use anyhow::{Error, bail};
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
+  use serial_multiplexer_lib::common::sink_loop;
   use std::collections::HashSet;
   use std::time::Duration;
   use tokio::io::AsyncWriteExt;
@@ -434,7 +434,7 @@ mod windows {
   #[cfg(test)]
   mod tests {
     use super::*;
-    use crate::test_utils::setup_tracing;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
     use tokio::net::windows::named_pipe::ServerOptions;
     use tokio::time::timeout;
 
