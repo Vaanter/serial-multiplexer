@@ -16,7 +16,7 @@ use zeroize::Zeroize;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
-const SINK_COMPRESSION_BUFFER_SIZE: usize = 2usize.pow(15);
+pub const SINK_COMPRESSION_BUFFER_SIZE: usize = 2usize.pow(15);
 pub const CONNECTION_BUFFER_SIZE: usize = SINK_COMPRESSION_BUFFER_SIZE - 256;
 const _: () = {
   // Comptime check that the size of data after compression doesn't exceed the compression buffer
@@ -277,7 +277,7 @@ pub async fn handle_sink_read(
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
     trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes);
-    if let Err(e) = sink_to_client_push.broadcast(datagram_bytes).await {
+    if let Err(e) = sink_to_client_push.broadcast_direct(datagram_bytes).await {
       bail!("Failed to send data to clients. {}", e);
     }
     unprocessed_data_start += datagram_end + 1 - header_idx;
@@ -299,7 +299,7 @@ pub async fn handle_sink_read(
     sink_buf.zeroize();
   } else {
     trace!(
-      "Copying unprocessed data (length: {}) to the start of buffer and zeroing out the rest",
+      "Copying unprocessed data (start index: {}) to the start of buffer and zeroing out the rest",
       unprocessed_data_start
     );
     let buffer_end = sink_buf.len();

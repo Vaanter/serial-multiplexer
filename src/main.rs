@@ -15,17 +15,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-mod common;
 mod configuration;
-mod guest;
-mod host;
-mod protocol_utils;
 mod runner;
-#[allow(unsafe_op_in_unsafe_fn, unused, mismatched_lifetime_syntaxes)]
-mod schema_generated;
-#[cfg(test)]
-mod test_utils;
-mod utils;
 
 fn main() -> anyhow::Result<()> {
   let config = ConfigArgs::build_config().context("Failed to parse config")?;
