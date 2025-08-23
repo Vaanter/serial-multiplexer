@@ -493,10 +493,10 @@ mod windows {
 
 #[cfg(unix)]
 mod linux {
-  use crate::common::sink_loop;
   use crate::configuration::{Guest, Host};
   use anyhow::{Context, bail};
   use bytes::Bytes;
+  use serial_multiplexer_lib::common::sink_loop;
   use std::fs::remove_file;
   use std::io::ErrorKind;
   use tokio::net::{UnixListener, UnixStream};
@@ -594,7 +594,7 @@ mod linux {
   mod tests {
     use super::*;
     use crate::configuration::GuestMode;
-    use crate::test_utils::setup_tracing;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
