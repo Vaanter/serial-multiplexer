@@ -1,4 +1,5 @@
 pub mod common {
+  use crate::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
   use anyhow::{Context, ensure};
   use bytes::Bytes;
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
@@ -516,10 +517,10 @@ mod windows {
 
 #[cfg(unix)]
 mod linux {
-  use crate::common::sink_loop;
   use crate::configuration::{UnixSocketGuest, UnixSocketHost};
   use anyhow::{Context, bail};
   use bytes::Bytes;
+  use serial_multiplexer_lib::common::sink_loop;
   use std::fs::remove_file;
   use std::io::ErrorKind;
   use tokio::net::{UnixListener, UnixStream};
@@ -616,7 +617,7 @@ mod linux {
   #[cfg(test)]
   mod tests {
     use super::*;
-    use crate::test_utils::setup_tracing;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
