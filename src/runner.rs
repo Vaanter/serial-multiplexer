@@ -348,7 +348,7 @@ pub mod common {
 mod windows {
   use crate::common::sink_loop;
   use crate::configuration::Host;
-  use anyhow::{Error, bail};
+  use anyhow::Error;
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
   use std::collections::HashSet;
@@ -387,35 +387,44 @@ mod windows {
     client_to_pipe_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
-    let mut pipes = Vec::new();
+    let mut pipes_ok = Vec::new();
+    let mut pipes_err = Vec::new();
     let distinct_paths: HashSet<&String> = properties.pipe_paths.iter().collect();
     for pipe_path in distinct_paths.iter() {
-      for _ in 0..10 {
+      for i in 0..10 {
         match prepare_pipe(pipe_path) {
           Ok(pipe) => {
             info!("Pipe {} is ready", &pipe_path);
-            pipes.push(pipe);
+            pipes_ok.push(pipe);
             break;
           }
           Err(err) => {
             debug!("Failed to connect to pipe: {}", err);
-            sleep(Duration::from_millis(100)).await;
+            if i < 9 {
+              sleep(Duration::from_millis(100)).await;
+            } else {
+              pipes_err.push(anyhow::anyhow!("Failed to connect to pipe '{pipe_path}': {err}"));
+            }
           }
         }
       }
     }
 
-    if pipes.len() != distinct_paths.len() {
-      for mut pipe in pipes {
+    if !pipes_err.is_empty() {
+      let mut error = anyhow::anyhow!("Failed to connect to all pipes!");
+      for pipe_err in pipes_err {
+        error = error.context(pipe_err);
+      }
+      for mut pipe in pipes_ok {
         if let Err(e) = pipe.shutdown().await {
           error!("Failed to close a pipe! {}", e);
         }
       }
-      bail!("Failed to connect to all pipes!");
+      return Err(error);
     }
 
     let pipe_loops = FuturesUnordered::new();
-    for pipe in pipes {
+    for pipe in pipes_ok {
       let cancel = cancel.clone();
       let pipe_to_client_push = pipe_to_client_push.clone();
       let client_to_pipe_pull = client_to_pipe_pull.clone();

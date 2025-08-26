@@ -101,7 +101,7 @@ async fn run_host(properties: Host) {
   let joined_tasks = match create_host_tasks(properties, cancel.clone()).await {
     Ok(joined_tasks) => joined_tasks,
     Err(e) => {
-      panic!("Initialisation failed! {:#?}", e);
+      panic!("Initialisation failed! {:?}", e);
     }
   };
   run_indefinitely(cancel, joined_tasks).await;
@@ -114,7 +114,7 @@ async fn run_guest(properties: Guest) {
   let joined_tasks = match create_guest_tasks(properties, cancel.clone()).await {
     Ok(joined_tasks) => joined_tasks,
     Err(e) => {
-      panic!("Initialisation failed! {:#?}", e);
+      panic!("Initialisation failed! {:?}", e);
     }
   };
   run_indefinitely(cancel.clone(), joined_tasks).await;
