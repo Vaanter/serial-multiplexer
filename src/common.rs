@@ -195,7 +195,7 @@ pub async fn sink_loop(
 /// * `bytes_read`: The number of bytes read into the sink buffer from the sink.
 /// * `sink_buf`:
 ///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
-/// * `sink_to_client_push`: A [`broadcast::Sender<Bytes>`]
+/// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`]
 ///   used to send processed datagrams to clients.
 /// * `decompression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
 ///   the datagram after decompression

@@ -135,7 +135,7 @@ pub mod common {
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `serial_paths`
   ///   property, which specifies paths of the erial ports to which this function will connect.
-  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///   client loops.
   /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
@@ -371,7 +371,7 @@ mod windows {
   /// # Parameters:
   /// * `properties`: A reference to [`Host`], a struct that contains the `pipe_paths`
   ///   property, which specifies paths to the named pipes.
-  /// * `pipe_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `pipe_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///   client loops.
   /// * `client_to_pipe_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
@@ -534,7 +534,7 @@ mod linux {
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `socket_path`
   ///    property, which specifies a path of the Unix socket to which this function will connect.
-  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///    client loops.
   /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
@@ -566,7 +566,7 @@ mod linux {
   /// # Parameters:
   /// * `properties`: A reference to [`Host`], a struct that contains the `socket_path`
   ///    property, which specifies a path where the Unix socket will be created.
-  /// * `socket_to_client_push`: A [`broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///    client loops.
   /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
