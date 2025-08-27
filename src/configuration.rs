@@ -35,21 +35,15 @@ pub enum Modes {
   Host(Host),
   /// Initializes the application in guest mode awaiting data from serial port.
   /// Requires a serial port.
+  #[command(subcommand)]
   Guest(Guest),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
 pub struct Host {
-  /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
-  #[cfg(windows)]
-  #[arg(short, long)]
-  #[serde(default)]
-  pub(crate) pipe_paths: Vec<String>,
+  #[command(subcommand)]
+  pub sink_type: SinkType,
 
-  #[cfg(not(windows))]
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub(crate) socket_path: String,
   /// Listener and target address pairs. When parsed from the command line, a pipe must separate the listener and client address.
   #[arg(long)]
   #[serde(default)]
@@ -57,26 +51,6 @@ pub struct Host {
   /// Address at which the proxy will listen for incoming connections.
   #[arg(long)]
   pub(crate) socks5_proxy: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
-pub struct Guest {
-  /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
-  #[arg(short, long)]
-  #[serde(default)]
-  pub(crate) serial_paths: Vec<String>,
-
-  #[cfg(not(windows))]
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub(crate) socket_path: String,
-
-  #[arg(short, long)]
-  pub(crate) guest_mode: GuestMode,
-
-  #[arg(long, hide = true, default_value_t = default_baud_rate())]
-  #[serde(default = "default_baud_rate")]
-  pub(crate) baud_rate: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
@@ -106,22 +80,56 @@ impl FromStr for AddressPair {
   }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
-pub enum GuestMode {
-  Serial,
-  UnixSocket,
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+pub enum SinkType {
+  #[cfg(windows)]
+  WindowsPipe(WindowsPipeSink),
+  #[cfg(not(windows))]
+  UnixSocket(UnixSocketSink),
 }
 
-impl FromStr for GuestMode {
-  type Err = anyhow::Error;
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+pub struct WindowsPipeSink {
+  /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
+  #[arg(short, long)]
+  #[serde(default)]
+  pub(crate) pipe_paths: Vec<String>,
+}
 
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s.to_lowercase().as_str() {
-      "serial" => Ok(Self::Serial),
-      "unix" | "unixsocket" => Ok(Self::UnixSocket),
-      _ => Err(anyhow::anyhow!("Invalid guest mode")),
-    }
-  }
+#[cfg(not(windows))]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+pub struct UnixSocketSink {
+  #[arg(short, long, default_value_t = default_socket_path())]
+  #[serde(default = "default_socket_path")]
+  pub(crate) socket_path: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+pub enum Guest {
+  Serial(Serial),
+  #[cfg(not(windows))]
+  UnixSocket(UnixSocket),
+}
+
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+pub struct Serial {
+  /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
+  #[arg(short, long)]
+  #[serde(default)]
+  pub serial_paths: Vec<String>,
+
+  #[arg(long, hide = true, default_value_t = default_baud_rate())]
+  #[serde(default = "default_baud_rate")]
+  pub baud_rate: u32,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+pub struct UnixSocket {
+  #[arg(short, long, default_value_t = default_socket_path())]
+  #[serde(default = "default_socket_path")]
+  pub socket_path: String,
 }
 
 const fn default_baud_rate() -> u32 {

@@ -1,4 +1,4 @@
-use crate::configuration::{ConfigArgs, Guest, Host, Modes};
+use crate::configuration::{ConfigArgs, Guest, Host, Modes, SinkType};
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
@@ -52,35 +52,42 @@ fn main() {
   Registry::default().with(fmt_layer).init();
   debug!("config: {:?}", config);
 
-  tokio::runtime::Builder::new_multi_thread()
+  let runtime = tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .build()
-    .expect("Setting up runtime should succeed")
-    .block_on(async {
-      match config.mode {
-        Some(Modes::Guest(guest)) => {
+    .expect("Setting up runtime should succeed");
+  runtime.block_on(async {
+    match config.mode {
+      Some(Modes::Guest(guest)) => {
+        match guest {
+          Guest::Serial(ref serial) => {
+            assert!(!serial.serial_paths.is_empty(), "No serial ports configured");
+          }
           #[cfg(not(windows))]
-          assert!(
-            !guest.serial_paths.is_empty() || !guest.socket_path.is_empty(),
-            "No serial ports and no unix socket configured"
-          );
-          #[cfg(windows)]
-          assert!(!guest.serial_paths.is_empty(), "No serial ports configured");
+          Guest::UnixSocket(ref unix_socket) => {
+            use std::path::PathBuf;
+            assert!(unix_socket.socket_path.parse::<PathBuf>().is_ok(), "No unix socket configured")
+          }
+        }
 
-          run_guest(guest).await;
-        }
-        Some(Modes::Host(host)) => {
-          #[cfg(windows)]
-          assert!(!host.pipe_paths.is_empty(), "No pipe paths configured");
-          assert!(
-            !(host.address_pairs.is_empty() && host.socks5_proxy.is_none()),
-            "No address pairs or socks5 proxy configured"
-          );
-          run_host(host).await;
-        }
-        None => {}
+        run_guest(guest).await;
       }
-    });
+      Some(Modes::Host(host)) => {
+        #[cfg(windows)]
+        {
+          let SinkType::WindowsPipe(ref windows_pipe_properties) = host.sink_type;
+          assert!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
+        }
+        assert!(
+          !(host.address_pairs.is_empty() && host.socks5_proxy.is_none()),
+          "No address pairs or socks5 proxy configured"
+        );
+        run_host(host).await;
+      }
+      None => {}
+    }
+  });
+  debug!("Exiting...");
 }
 
 fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
@@ -117,7 +124,7 @@ async fn run_guest(properties: Guest) {
       panic!("Initialisation failed! {:?}", e);
     }
   };
-  run_indefinitely(cancel.clone(), joined_tasks).await;
+  run_indefinitely(cancel, joined_tasks).await;
 }
 
 async fn run_indefinitely(
