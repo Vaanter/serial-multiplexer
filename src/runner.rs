@@ -1,6 +1,6 @@
 pub mod common {
   use crate::common::{ConnectionState, sink_loop};
-  use crate::configuration::{Guest, Host, Serial, SinkType};
+  use crate::configuration::{AddressPair, Guest, Host, Serial, SinkType};
   use crate::guest::client_initiator;
   use crate::host::{ConnectionType, connection_initiator, run_listener};
   use crate::utils::create_upstream_listener;
@@ -72,9 +72,14 @@ pub mod common {
     ));
     tasks.push(initiator_task);
 
-    let listener_tasks = initialize_listeners(&mut properties, connection_sender, cancel)
-      .await
-      .context("Failed to initialize listeners")?;
+    let listener_tasks = initialize_listeners(
+      &mut properties.address_pairs,
+      &properties.socks5_proxy,
+      connection_sender,
+      cancel,
+    )
+    .await
+    .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
@@ -223,13 +228,14 @@ pub mod common {
   /// [`Direct`]: ConnectionType::Direct
   /// [`Socks5`]: ConnectionType::Socks5
   pub async fn initialize_listeners(
-    properties: &mut Host,
+    address_pairs: &mut Vec<AddressPair>,
+    socks5_proxy: &Option<String>,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
     let listener_tasks = FuturesUnordered::new();
-    while let Some(pair_direct) = properties.address_pairs.pop() {
+    while let Some(pair_direct) = address_pairs.pop() {
       let cancel = cancel.clone();
       let connection_sender = connection_sender.clone();
       let pair_task = setup_listener(
@@ -243,7 +249,7 @@ pub mod common {
       listener_tasks.push(pair_task);
     }
 
-    if let Some(ref socks5_proxy) = properties.socks5_proxy {
+    if let Some(socks5_proxy) = socks5_proxy {
       let socks5_task =
         setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
           .await
@@ -293,7 +299,7 @@ pub mod common {
 
   #[cfg(test)]
   mod tests {
-    use crate::configuration::{AddressPair, Host, SinkType, WindowsPipeSink};
+    use crate::configuration::AddressPair;
     use crate::host::ConnectionType;
     use crate::runner::common::initialize_listeners;
     use tokio::net::TcpStream;
@@ -304,7 +310,7 @@ pub mod common {
     async fn test_initialize_listeners() {
       let cancel = CancellationToken::new();
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
-      let address_pairs = vec![
+      let mut address_pairs = vec![
         AddressPair {
           listener_address: "127.0.0.1:2000".to_string(),
           target_address: "127.0.0.1:3000".to_string(),
@@ -314,15 +320,16 @@ pub mod common {
           target_address: "127.0.0.1:3001".to_string(),
         },
       ];
-      let mut host = Host {
-        socks5_proxy: Some("127.0.0.1:5000".to_string()),
-        address_pairs: address_pairs.clone(),
-        sink_type: SinkType::WindowsPipe(WindowsPipeSink {
-          ..Default::default()
-        }),
-      };
+      let socks5_proxy = "127.0.0.1:5000".to_string();
 
-      let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await.unwrap();
+      let listener_task = initialize_listeners(
+        &mut address_pairs,
+        &Some(socks5_proxy.clone()),
+        connection_sender,
+        cancel,
+      )
+      .await
+      .unwrap();
       assert_eq!(listener_task.len(), 3);
 
       let mut connection_id = 1;
@@ -339,7 +346,7 @@ pub mod common {
         );
         connection_id += 1;
       }
-      let socks5_client = TcpStream::connect(&host.socks5_proxy.unwrap()).await.unwrap();
+      let socks5_client = TcpStream::connect(socks5_proxy).await.unwrap();
       let (state, connection_type) = connection_receiver.recv().await.unwrap();
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
@@ -513,7 +520,7 @@ mod windows {
 #[cfg(unix)]
 mod linux {
   use crate::common::sink_loop;
-  use crate::configuration::{Guest, Host, UnixSocket, UnixSocketSink};
+  use crate::configuration::{UnixSocket, UnixSocketSink};
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use std::fs::remove_file;

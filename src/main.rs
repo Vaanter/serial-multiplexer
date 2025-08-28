@@ -1,4 +1,4 @@
-use crate::configuration::{ConfigArgs, Guest, Host, Modes, SinkType};
+use crate::configuration::{ConfigArgs, Guest, Host, Modes};
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
@@ -75,6 +75,7 @@ fn main() {
       Some(Modes::Host(host)) => {
         #[cfg(windows)]
         {
+          use crate::configuration::SinkType;
           let SinkType::WindowsPipe(ref windows_pipe_properties) = host.sink_type;
           assert!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
         }
