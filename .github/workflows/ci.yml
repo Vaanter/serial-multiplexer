@@ -140,22 +140,22 @@ jobs:
       - name: Download Linux standard artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-linux-x86-64-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64
           path: ./linux-standard/
       - name: Download Linux optimized artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-linux-x86-64-v3-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64-v3
           path: ./linux-optimized/
       - name: Download Windows standard artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-windows-x86-64-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64
           path: ./windows-standard/
       - name: Download Windows optimized artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-windows-x86-64-v3-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64-v3
           path: ./windows-optimized/
       - name: Rename artifacts with version
         run: |
