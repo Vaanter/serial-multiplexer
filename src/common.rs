@@ -3,7 +3,7 @@ use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram}
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -248,8 +248,11 @@ pub async fn handle_sink_read(
   let mut read_data = &sink_buf[..bytes_read];
   trace!(target: HUGE_DATA_TARGET, "Data in working buffer: {:?}", &read_data);
   let mut unprocessed_data_start = 0;
+  let mut last_header_idx = 0;
   while let Some(header_idx) = HEADER_FINDER.find(read_data) {
     trace!("Found HEADER at index {}", header_idx);
+    unprocessed_data_start += header_idx;
+    last_header_idx = unprocessed_data_start;
     if header_idx + HEADER_BYTES + LENGTH_BYTES > read_data.len() {
       trace!("Buffer is too small to contain datagram size");
       break;
@@ -277,7 +280,7 @@ pub async fn handle_sink_read(
     if let Err(e) = sink_to_client_push.broadcast(datagram_bytes).await {
       bail!("Failed to send data to clients. {}", e);
     }
-    unprocessed_data_start += datagram_end + 1;
+    unprocessed_data_start += datagram_end + 1 - header_idx;
     trace!(
       "Removing processed data in the working buffer at index {}",
       min(bytes_read, unprocessed_data_start)
@@ -286,23 +289,23 @@ pub async fn handle_sink_read(
     trace!(target: HUGE_DATA_TARGET, "Data in buffer after reading datagram: {:?}", &read_data);
   }
 
-  let mut unprocessed_bytes = bytes_read;
-  if unprocessed_data_start > 0 {
-    unprocessed_bytes = bytes_read - unprocessed_data_start;
-    if unprocessed_data_start >= bytes_read {
-      trace!("Whole buffer was read, zeroing out processed data");
-      sink_buf.zeroize();
-    } else {
-      trace!(
-        "Copying unprocessed data (length: {}) to the start of buffer and zeroing out the rest",
-        unprocessed_data_start
-      );
-      let buffer_end = sink_buf.len();
-      trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", &sink_buf);
-      sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
-      sink_buf[unprocessed_bytes..buffer_end].zeroize();
-      trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", &sink_buf);
-    }
+  if unprocessed_data_start > last_header_idx || last_header_idx == 0 {
+    unprocessed_data_start = max(unprocessed_data_start, bytes_read - HEADER_BYTES - 1);
+  }
+  let unprocessed_bytes = bytes_read - unprocessed_data_start;
+  if unprocessed_data_start >= bytes_read {
+    trace!("Whole buffer was read, zeroing out processed data");
+    sink_buf.zeroize();
+  } else {
+    trace!(
+      "Copying unprocessed data (length: {}) to the start of buffer and zeroing out the rest",
+      unprocessed_data_start
+    );
+    let buffer_end = sink_buf.len();
+    trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", &sink_buf);
+    sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
+    sink_buf[unprocessed_bytes..buffer_end].zeroize();
+    trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", &sink_buf);
   }
   Ok(unprocessed_bytes)
 }
@@ -325,23 +328,19 @@ pub async fn handle_sink_read(
 /// The function follows these steps:
 /// 1. Compresses the datagram using [`zstd_safe`] into `compression_buffer`
 /// 2. Writes a constant [`DATAGRAM_HEADER`] (the header) to the sink.
-/// 3. Writes the size of the `data` as a 2-byte value to the sink.
+/// 3. Writes the size of the `data` as [`LENGTH_BYTES`] bytes to the sink.
 /// 4. Writes the `datagram` itself to the sink.
 /// 5. Flushes the sink to ensure everything is written out.
 ///
 /// # Errors
 /// This function returns an `anyhow::Result<()>`, which will contain an error
-/// if any of the following operations fail:
+/// if any of the following operations fails:
 /// * Writing the [`DATAGRAM_HEADER`] to the sink.
 /// * Writing the length of the datagram to the sink.
 /// * Writing the `datagram` itself to the sink.
 /// * Flushing the sink after all writes.
 ///
 /// The error message will include details about which operation failed.
-///
-/// # Notes
-/// The size of the data is written as a 2-byte value using the [`split_u16_to_u8`]
-/// function.
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
@@ -828,7 +827,7 @@ mod tests {
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size);
+    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
     assert_ne!(sink_buf, BytesMut::zeroed(sink_buf.len()));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
@@ -856,8 +855,64 @@ mod tests {
     .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size);
+    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+  }
+
+  #[tokio::test]
+  async fn test_handle_sink_read_data_garbage_cleanup() {
+    setup_tracing().await;
+    let mut sink_buf = BytesMut::new();
+    let mut compression_buf = BytesMut::zeroed(200);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+
+    sink_buf.extend_from_slice(&[70; 5]); // garbage
+    let datagram1 = create_data_datagram(0, 1, b"datagram1");
+    sink_buf.extend_from_slice(&DATAGRAM_HEADER);
+    let n = zstd_safe::compress(compression_buf.as_mut(), &datagram1, 9).unwrap();
+    sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
+    sink_buf.extend_from_slice(&compression_buf[..n]);
+    sink_buf.extend_from_slice(&[65; 5]); // more garbage
+    sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+
+    let buffer_size = sink_buf.len();
+    let unprocessed_bytes = handle_sink_read(
+      buffer_size,
+      &mut sink_buf,
+      sink_to_client_push.clone(),
+      &mut compression_buf,
+    )
+    .await
+    .unwrap();
+    assert_eq!(buffer_size, sink_buf.len());
+    assert!(sink_to_client_pull.try_recv().is_ok());
+    assert_eq!(unprocessed_bytes, 7);
+    assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
+    assert_eq!(sink_buf[7..], BytesMut::zeroed(buffer_size - 7));
+  }
+
+  #[tokio::test]
+  async fn test_handle_sink_read_data_garbage_filled() {
+    setup_tracing().await;
+    let mut sink_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
+    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+
+    sink_buf.fill(80);
+    let buffer_size = sink_buf.len();
+    let unprocessed_bytes = handle_sink_read(
+      buffer_size,
+      &mut sink_buf,
+      sink_to_client_push.clone(),
+      &mut compression_buf,
+    )
+    .await
+    .unwrap();
+    assert_eq!(buffer_size, sink_buf.len());
+    assert!(sink_to_client_pull.try_recv().is_err());
+    assert_eq!(unprocessed_bytes, 7);
+    assert_eq!(sink_buf[..7], Bytes::from_static(&[80; 7]));
+    assert_eq!(sink_buf[8..], BytesMut::zeroed(buffer_size - 8)[..]);
   }
 
   #[tokio::test]
