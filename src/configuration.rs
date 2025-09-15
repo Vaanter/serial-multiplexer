@@ -30,17 +30,18 @@ pub struct ConfigArgs {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
 pub enum Modes {
   /// Initializes the application in host mode to listen on configured network addresses.
-  /// Requires a functional pipe connection from VirtualBox.
-  /// Note: This mode is Windows-exclusive.
+  /// On Windows this requires a functional Windows pipe from VirtualBox,
+  /// and on Linux this will create a Unix socket.
   Host(Host),
-  /// Initializes the application in guest mode awaiting data from serial port.
-  /// Requires a serial port.
+  /// Initializes the application in guest mode awaiting data from serial port or Unix socket.
+  /// Requires a serial port or a Unix socket depending on the specified sink type.
   #[command(subcommand)]
   Guest(Guest),
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
 pub struct Host {
+  /// Specifies how the 2 multiplexer instances communicate
   #[command(subcommand)]
   pub sink_type: SinkType,
 
@@ -82,8 +83,10 @@ impl FromStr for AddressPair {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
 pub enum SinkType {
+  /// Communicate with multiplexer in guest mode via Windows pipe(s) (VirtualBox)
   #[cfg(windows)]
   WindowsPipe(WindowsPipeSink),
+  /// Communicate with multiplexer in guest mode via a Unix socket
   #[cfg(not(windows))]
   UnixSocket(UnixSocketSink),
 }
@@ -100,6 +103,7 @@ pub struct WindowsPipeSink {
 #[cfg(not(windows))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 pub struct UnixSocketSink {
+  /// Path to a Unix socket for communication with a multiplexer in host mode
   #[arg(short, long, default_value_t = default_socket_path())]
   #[serde(default = "default_socket_path")]
   pub(crate) socket_path: String,
@@ -107,7 +111,9 @@ pub struct UnixSocketSink {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
 pub enum Guest {
+  /// Communicate with multiplexer in host mode via serial port(s)
   Serial(Serial),
+  /// Communicate with multiplexer in host mode via a Unix socket
   #[cfg(not(windows))]
   UnixSocket(UnixSocket),
 }
@@ -146,7 +152,7 @@ fn default_socket_path() -> String {
 }
 
 impl ConfigArgs {
-  pub fn build_config() -> Result<Self, figment::Error> {
+  pub fn build_config() -> Result<Self, Box<figment::Error>> {
     let args = ConfigArgs::parse();
 
     let config_file_path = args.config.clone();
@@ -162,5 +168,6 @@ impl ConfigArgs {
         }
         c
       })
+      .map_err(Box::new)
   }
 }
