@@ -290,7 +290,7 @@ pub async fn handle_sink_read(
   }
 
   if unprocessed_data_start > last_header_idx || last_header_idx == 0 {
-    unprocessed_data_start = max(unprocessed_data_start, bytes_read - HEADER_BYTES - 1);
+    unprocessed_data_start = max(unprocessed_data_start, bytes_read - HEADER_BYTES + 1);
   }
   let unprocessed_bytes = bytes_read - unprocessed_data_start;
   if unprocessed_data_start >= bytes_read {
