@@ -4,9 +4,14 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+pub static ALLOWED_CONFIG_VERSION: [&str; 1] = ["1"];
+
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigArgs {
+  #[clap(skip)]
+  pub version: String,
   /// Mode in which the program will run. Either host or guest
   #[command(subcommand)]
   pub mode: Option<Modes>,
@@ -28,28 +33,25 @@ pub struct ConfigArgs {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Modes {
   /// Initializes the application in host mode to listen on configured network addresses.
-  /// Requires a functional pipe connection from VirtualBox.
-  /// Note: This mode is Windows-exclusive.
+  /// On Windows this requires a functional Windows pipe from VirtualBox,
+  /// and on Linux this will create a Unix socket.
   Host(Host),
-  /// Initializes the application in guest mode awaiting data from serial port.
-  /// Requires a serial port.
+  /// Initializes the application in guest mode awaiting data from serial port or Unix socket.
+  /// Requires a serial port or a Unix socket depending on the specified sink type.
+  #[command(subcommand)]
   Guest(Guest),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct Host {
-  /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
-  #[cfg(windows)]
-  #[arg(short, long)]
-  #[serde(default)]
-  pub(crate) pipe_paths: Vec<String>,
+  /// Specifies how the 2 multiplexer instances communicate
+  #[command(subcommand)]
+  pub sink_type: SinkType,
 
-  #[cfg(not(windows))]
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub(crate) socket_path: String,
   /// Listener and target address pairs. When parsed from the command line, a pipe must separate the listener and client address.
   #[arg(long)]
   #[serde(default)]
@@ -60,27 +62,8 @@ pub struct Host {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
-pub struct Guest {
-  /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
-  #[arg(short, long)]
-  #[serde(default)]
-  pub(crate) serial_paths: Vec<String>,
-
-  #[cfg(not(windows))]
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub(crate) socket_path: String,
-
-  #[arg(short, long)]
-  pub(crate) guest_mode: GuestMode,
-
-  #[arg(long, hide = true, default_value_t = default_baud_rate())]
-  #[serde(default = "default_baud_rate")]
-  pub(crate) baud_rate: u32,
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
 #[group(required = true, multiple = true)]
+#[serde(rename_all = "snake_case")]
 pub struct AddressPair {
   /// The address at which the multiplexer will listen for incoming connections.
   #[arg(long, requires = "target_address")]
@@ -106,22 +89,65 @@ impl FromStr for AddressPair {
   }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
-pub enum GuestMode {
-  Serial,
-  UnixSocket,
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkType {
+  /// Communicate with multiplexer in guest mode via Windows pipe(s) (VirtualBox)
+  #[cfg(windows)]
+  WindowsPipe(WindowsPipeSink),
+  /// Communicate with multiplexer in guest mode via a Unix socket
+  #[cfg(not(windows))]
+  UnixSocket(UnixSocketSink),
 }
 
-impl FromStr for GuestMode {
-  type Err = anyhow::Error;
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WindowsPipeSink {
+  /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
+  #[arg(short, long)]
+  #[serde(default)]
+  pub(crate) pipe_paths: Vec<String>,
+}
 
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s.to_lowercase().as_str() {
-      "serial" => Ok(Self::Serial),
-      "unix" | "unixsocket" => Ok(Self::UnixSocket),
-      _ => Err(anyhow::anyhow!("Invalid guest mode")),
-    }
-  }
+#[cfg(not(windows))]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+pub struct UnixSocketSink {
+  /// Path to a Unix socket for communication with a multiplexer in host mode
+  #[arg(short, long, default_value_t = default_socket_path())]
+  #[serde(default = "default_socket_path")]
+  pub(crate) socket_path: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Guest {
+  /// Communicate with multiplexer in host mode via serial port(s)
+  Serial(Serial),
+  /// Communicate with multiplexer in host mode via a Unix socket
+  #[cfg(not(windows))]
+  UnixSocket(UnixSocket),
+}
+
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Serial {
+  /// Path to a serial port file. On Linux this will likely be a /dev/ttyS0 - 3, and COM1 - 4 on Windows.
+  #[arg(short, long)]
+  #[serde(default)]
+  pub serial_paths: Vec<String>,
+
+  #[arg(long, hide = true, default_value_t = default_baud_rate())]
+  #[serde(default = "default_baud_rate")]
+  pub baud_rate: u32,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+pub struct UnixSocket {
+  #[arg(short, long, default_value_t = default_socket_path())]
+  #[serde(default = "default_socket_path")]
+  pub socket_path: String,
 }
 
 const fn default_baud_rate() -> u32 {
@@ -138,7 +164,7 @@ fn default_socket_path() -> String {
 }
 
 impl ConfigArgs {
-  pub fn build_config() -> Result<Self, figment::Error> {
+  pub fn build_config() -> Result<Self, Box<figment::Error>> {
     let args = ConfigArgs::parse();
 
     let config_file_path = args.config.clone();
@@ -154,5 +180,6 @@ impl ConfigArgs {
         }
         c
       })
+      .map_err(Box::new)
   }
 }

@@ -1,6 +1,6 @@
 pub mod common {
   use crate::common::{ConnectionState, sink_loop};
-  use crate::configuration::{Guest, GuestMode, Host};
+  use crate::configuration::{AddressPair, Guest, Host, Serial, SinkType};
   use crate::guest::client_initiator;
   use crate::host::{ConnectionType, connection_initiator, run_listener};
   use crate::utils::create_upstream_listener;
@@ -29,8 +29,9 @@ pub mod common {
     #[cfg(unix)]
     {
       use crate::runner::linux::listen_accept_unix_connection;
+      let SinkType::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
-        &properties,
+        &unix_socket_properties,
         socket_to_client_push,
         client_to_socket_pull,
         cancel.clone(),
@@ -43,8 +44,9 @@ pub mod common {
     #[cfg(windows)]
     {
       use crate::runner::windows::create_windows_pipe_loops;
+      let SinkType::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
-        &properties,
+        windows_pipe_properties,
         socket_to_client_push,
         client_to_socket_pull,
         cancel.clone(),
@@ -70,9 +72,14 @@ pub mod common {
     ));
     tasks.push(initiator_task);
 
-    let listener_tasks = initialize_listeners(&mut properties, connection_sender, cancel)
-      .await
-      .context("Failed to initialize listeners")?;
+    let listener_tasks = initialize_listeners(
+      &mut properties.address_pairs,
+      &properties.socks5_proxy,
+      connection_sender,
+      cancel,
+    )
+    .await
+    .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
@@ -87,20 +94,20 @@ pub mod common {
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
 
     let mut sink_loops = FuturesUnordered::new();
-    match properties.guest_mode {
-      GuestMode::Serial => {
+    match properties {
+      Guest::Serial(serial) => {
         let serial_port_sinks =
-          initialize_serials(&properties, sink_to_client_push, client_to_sink_pull, cancel.clone())
+          initialize_serials(&serial, sink_to_client_push, client_to_sink_pull, cancel.clone())
             .await
             .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
       }
-      GuestMode::UnixSocket => {
-        #[cfg(unix)]
+      #[cfg(unix)]
+      Guest::UnixSocket(unix_socket) => {
         {
           use crate::runner::linux::connect_to_unix_socket;
           let socket_task = connect_to_unix_socket(
-            &properties,
+            &unix_socket,
             sink_to_client_push,
             client_to_sink_pull,
             cancel.clone(),
@@ -146,7 +153,7 @@ pub mod common {
   /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
   /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
-    properties: &Guest,
+    properties: &Serial,
     sink_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -221,13 +228,14 @@ pub mod common {
   /// [`Direct`]: ConnectionType::Direct
   /// [`Socks5`]: ConnectionType::Socks5
   pub async fn initialize_listeners(
-    properties: &mut Host,
+    address_pairs: &mut Vec<AddressPair>,
+    socks5_proxy: &Option<String>,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
     let listener_tasks = FuturesUnordered::new();
-    while let Some(pair_direct) = properties.address_pairs.pop() {
+    while let Some(pair_direct) = address_pairs.pop() {
       let cancel = cancel.clone();
       let connection_sender = connection_sender.clone();
       let pair_task = setup_listener(
@@ -241,7 +249,7 @@ pub mod common {
       listener_tasks.push(pair_task);
     }
 
-    if let Some(ref socks5_proxy) = properties.socks5_proxy {
+    if let Some(socks5_proxy) = socks5_proxy {
       let socks5_task =
         setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
           .await
@@ -291,7 +299,7 @@ pub mod common {
 
   #[cfg(test)]
   mod tests {
-    use crate::configuration::{AddressPair, Host};
+    use crate::configuration::AddressPair;
     use crate::host::ConnectionType;
     use crate::runner::common::initialize_listeners;
     use tokio::net::TcpStream;
@@ -302,7 +310,7 @@ pub mod common {
     async fn test_initialize_listeners() {
       let cancel = CancellationToken::new();
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
-      let address_pairs = vec![
+      let mut address_pairs = vec![
         AddressPair {
           listener_address: "127.0.0.1:2000".to_string(),
           target_address: "127.0.0.1:3000".to_string(),
@@ -312,13 +320,16 @@ pub mod common {
           target_address: "127.0.0.1:3001".to_string(),
         },
       ];
-      let mut host = Host {
-        socks5_proxy: Some("127.0.0.1:5000".to_string()),
-        address_pairs: address_pairs.clone(),
-        ..Default::default()
-      };
+      let socks5_proxy = "127.0.0.1:5000".to_string();
 
-      let listener_task = initialize_listeners(&mut host, connection_sender, cancel).await.unwrap();
+      let listener_task = initialize_listeners(
+        &mut address_pairs,
+        &Some(socks5_proxy.clone()),
+        connection_sender,
+        cancel,
+      )
+      .await
+      .unwrap();
       assert_eq!(listener_task.len(), 3);
 
       let mut connection_id = 1;
@@ -335,7 +346,7 @@ pub mod common {
         );
         connection_id += 1;
       }
-      let socks5_client = TcpStream::connect(&host.socks5_proxy.unwrap()).await.unwrap();
+      let socks5_client = TcpStream::connect(socks5_proxy).await.unwrap();
       let (state, connection_type) = connection_receiver.recv().await.unwrap();
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
@@ -347,7 +358,7 @@ pub mod common {
 #[cfg(windows)]
 mod windows {
   use crate::common::sink_loop;
-  use crate::configuration::Host;
+  use crate::configuration::WindowsPipeSink;
   use anyhow::Error;
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
@@ -382,7 +393,7 @@ mod windows {
   /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
-    properties: &Host,
+    properties: &WindowsPipeSink,
     pipe_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_pipe_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -453,14 +464,17 @@ mod windows {
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
-      let host: Host = Host {
+      let sink_properties = WindowsPipeSink {
         pipe_paths: vec!["non_existent_pipe".to_string()],
-        ..Default::default()
       };
 
-      let result =
-        create_windows_pipe_loops(&host, sink_to_client_push, client_to_sink_pull, cancel.clone())
-          .await;
+      let result = create_windows_pipe_loops(
+        &sink_properties,
+        sink_to_client_push,
+        client_to_sink_pull,
+        cancel.clone(),
+      )
+      .await;
       assert!(result.is_err());
     }
 
@@ -485,14 +499,17 @@ mod windows {
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
-      let host: Host = Host {
+      let sink_properties = WindowsPipeSink {
         pipe_paths: vec![pipe1_path.to_string(), pipe2_path.to_string(), pipe3_path.to_string()],
-        ..Default::default()
       };
 
-      let result =
-        create_windows_pipe_loops(&host, sink_to_client_push, client_to_sink_pull, cancel.clone())
-          .await;
+      let result = create_windows_pipe_loops(
+        &sink_properties,
+        sink_to_client_push,
+        client_to_sink_pull,
+        cancel.clone(),
+      )
+      .await;
       assert!(result.is_ok());
 
       timeout(Duration::from_secs(3), server_task).await.unwrap().unwrap();
@@ -503,7 +520,7 @@ mod windows {
 #[cfg(unix)]
 mod linux {
   use crate::common::sink_loop;
-  use crate::configuration::{Guest, Host};
+  use crate::configuration::{UnixSocket, UnixSocketSink};
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use std::fs::remove_file;
@@ -545,7 +562,7 @@ mod linux {
   /// An [`anyhow::Result<JoinHandle<()>>`] with the spawned sink loop task if successful,
   /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
-    properties: &Guest,
+    properties: &UnixSocket,
     socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -580,7 +597,7 @@ mod linux {
   ///   * The socket fails to bind to the provided `socket_path`
   ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
-    properties: &Host,
+    properties: &UnixSocketSink,
     socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -602,7 +619,6 @@ mod linux {
   #[cfg(test)]
   mod tests {
     use super::*;
-    use crate::configuration::GuestMode;
     use crate::test_utils::setup_tracing;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
@@ -611,16 +627,11 @@ mod linux {
     async fn listen_connect_accept_send_test() {
       setup_tracing().await;
       let socket_path = "test_socket.sock";
-      let host = Host {
+      let sink_properties = UnixSocketSink {
         socket_path: socket_path.to_string(),
-        address_pairs: vec![],
-        socks5_proxy: None,
       };
-      let guest = Guest {
-        serial_paths: vec![],
+      let unix_socket_properties = UnixSocket {
         socket_path: socket_path.to_string(),
-        guest_mode: GuestMode::Serial,
-        baud_rate: 0,
       };
 
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
@@ -634,7 +645,7 @@ mod linux {
           let client_to_sink_pull = client_to_sink_pull.clone();
           async move {
             let sink_loop = listen_accept_unix_connection(
-              &host,
+              &sink_properties,
               sink_to_client_push,
               client_to_sink_pull,
               cancel.clone(),
@@ -648,9 +659,13 @@ mod linux {
 
         // HACK should wait until the socket is actually bound
         sleep(Duration::from_secs(1)).await;
-        let sink_loop =
-          connect_to_unix_socket(&guest, sink_to_client_push, client_to_sink_pull, cancel.clone())
-            .await;
+        let sink_loop = connect_to_unix_socket(
+          &unix_socket_properties,
+          sink_to_client_push,
+          client_to_sink_pull,
+          cancel.clone(),
+        )
+        .await;
         cancel.cancel();
         host_loop.await.unwrap();
         sink_loop.unwrap().await.unwrap();

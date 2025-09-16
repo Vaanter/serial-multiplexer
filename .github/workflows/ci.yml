@@ -35,6 +35,15 @@ jobs:
     needs: [test-linux]
     if: github.event.inputs.build_release == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - variant: "standard"
+            rustflags: "-Ctarget-cpu=x86-64"
+            suffix: "-x86-64"
+          - variant: "optimized"
+            rustflags: "-Ctarget-cpu=x86-64-v3"
+            suffix: "-x86-64-v3"
     steps:
       - name: Cache
         uses: actions/cache@v4
@@ -42,9 +51,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-cargo-${{ matrix.variant }}-
             ${{ runner.os }}-cargo-
       - uses: actions/checkout@v4
       - name: Update rust
@@ -55,13 +65,15 @@ jobs:
           VERSION=$(grep -m1 'version = ' Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Build in release mode
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release
       - name: Strip binary
         run: strip target/release/${{ env.BINARY_NAME }}
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}${{ matrix.suffix }}
           path: target/release/${{ env.BINARY_NAME }}
           if-no-files-found: error
 
@@ -70,6 +82,15 @@ jobs:
     needs: [test-windows]
     if: github.event.inputs.build_release == 'true'
     runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - variant: "standard"
+            rustflags: "-Ctarget-cpu=x86-64"
+            suffix: "-x86-64"
+          - variant: "optimized"
+            rustflags: "-Ctarget-cpu=x86-64-v3"
+            suffix: "-x86-64-v3"
     steps:
       - name: Cache
         uses: actions/cache@v4
@@ -77,9 +98,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+            ${{ runner.os }}-cargo-${{ matrix.variant }}-
             ${{ runner.os }}-cargo-
       - uses: actions/checkout@v4
       - name: Update rust
@@ -91,11 +113,13 @@ jobs:
           VERSION=$(grep -m1 'version = ' Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Build in release mode
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}
+          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}${{ matrix.suffix }}
           path: target/release/${{ env.BINARY_NAME }}.exe
           if-no-files-found: error
 
@@ -113,26 +137,40 @@ jobs:
         run: |
           VERSION=$(grep -m1 'version = ' Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-      - name: Download Linux artifact
+      - name: Download Linux standard artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}
-          path: ./
-      - name: Download Windows artifact
+          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64
+          path: ./linux-standard/
+      - name: Download Linux optimized artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}
-          path: ./
+          name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64-v3
+          path: ./linux-optimized/
+      - name: Download Windows standard artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64
+          path: ./windows-standard/
+      - name: Download Windows optimized artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64-v3
+          path: ./windows-optimized/
       - name: Rename artifacts with version
         run: |
-          mv ${{ env.BINARY_NAME }} ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux
-          mv ${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows.exe
+          mv linux-standard/${{ env.BINARY_NAME }} ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64
+          mv linux-optimized/${{ env.BINARY_NAME }} ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64-v3
+          mv windows-standard/${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64.exe
+          mv windows-optimized/${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64-v3.exe
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux
-            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows.exe
+            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64
+            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64-v3
+            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64.exe
+            ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64-v3.exe
           name: Release v${{ env.VERSION }}
           tag_name: v${{ env.VERSION }}
           draft: false
