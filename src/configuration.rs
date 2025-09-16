@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigArgs {
   /// Mode in which the program will run. Either host or guest
   #[command(subcommand)]
@@ -28,6 +29,7 @@ pub struct ConfigArgs {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Modes {
   /// Initializes the application in host mode to listen on configured network addresses.
   /// On Windows this requires a functional Windows pipe from VirtualBox,
@@ -40,6 +42,7 @@ pub enum Modes {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct Host {
   /// Specifies how the 2 multiplexer instances communicate
   #[command(subcommand)]
@@ -56,6 +59,7 @@ pub struct Host {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
 #[group(required = true, multiple = true)]
+#[serde(rename_all = "snake_case")]
 pub struct AddressPair {
   /// The address at which the multiplexer will listen for incoming connections.
   #[arg(long, requires = "target_address")]
@@ -82,6 +86,7 @@ impl FromStr for AddressPair {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SinkType {
   /// Communicate with multiplexer in guest mode via Windows pipe(s) (VirtualBox)
   #[cfg(windows)]
@@ -93,6 +98,7 @@ pub enum SinkType {
 
 #[cfg(windows)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct WindowsPipeSink {
   /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
   #[arg(short, long)]
@@ -110,6 +116,7 @@ pub struct UnixSocketSink {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Guest {
   /// Communicate with multiplexer in host mode via serial port(s)
   Serial(Serial),
@@ -119,8 +126,9 @@ pub enum Guest {
 }
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct Serial {
-  /// Path to a serial port file. On linux this will likely be a /dev/ttyS0 - 3
+  /// Path to a serial port file. On Linux this will likely be a /dev/ttyS0 - 3, and COM1 - 4 on Windows.
   #[arg(short, long)]
   #[serde(default)]
   pub serial_paths: Vec<String>,
