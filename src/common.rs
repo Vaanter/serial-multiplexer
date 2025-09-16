@@ -248,11 +248,11 @@ pub async fn handle_sink_read(
   let mut read_data = &sink_buf[..bytes_read];
   trace!(target: HUGE_DATA_TARGET, "Data in working buffer: {:?}", &read_data);
   let mut unprocessed_data_start = 0;
-  let mut last_header_idx = 0;
+  let mut last_header_idx = None;
   while let Some(header_idx) = HEADER_FINDER.find(read_data) {
     trace!("Found HEADER at index {}", header_idx);
     unprocessed_data_start += header_idx;
-    last_header_idx = unprocessed_data_start;
+    last_header_idx = Some(unprocessed_data_start);
     if header_idx + HEADER_BYTES + LENGTH_BYTES > read_data.len() {
       trace!("Buffer is too small to contain datagram size");
       break;
@@ -289,8 +289,9 @@ pub async fn handle_sink_read(
     trace!(target: HUGE_DATA_TARGET, "Data in buffer after reading datagram: {:?}", &read_data);
   }
 
-  if unprocessed_data_start > last_header_idx || last_header_idx == 0 {
-    unprocessed_data_start = max(unprocessed_data_start, bytes_read - HEADER_BYTES - 1);
+  if unprocessed_data_start > last_header_idx.unwrap_or(0) || last_header_idx.is_none() {
+    unprocessed_data_start =
+      max(unprocessed_data_start, bytes_read.saturating_sub(HEADER_BYTES - 1));
   }
   let unprocessed_bytes = bytes_read - unprocessed_data_start;
   if unprocessed_data_start >= bytes_read {
@@ -889,6 +890,30 @@ mod tests {
     assert_eq!(unprocessed_bytes, 7);
     assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
     assert_eq!(sink_buf[7..], BytesMut::zeroed(buffer_size - 7));
+  }
+
+  #[tokio::test]
+  async fn test_handle_sink_read_data_partial_header() {
+    setup_tracing().await;
+    let mut sink_buf = BytesMut::new();
+    let mut compression_buf = BytesMut::zeroed(200);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+
+    sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+
+    let buffer_size = sink_buf.len();
+    let unprocessed_bytes = handle_sink_read(
+      buffer_size,
+      &mut sink_buf,
+      sink_to_client_push.clone(),
+      &mut compression_buf,
+    )
+    .await
+    .unwrap();
+    assert_eq!(buffer_size, sink_buf.len());
+    assert!(sink_to_client_pull.try_recv().is_err());
+    assert_eq!(unprocessed_bytes, 7);
+    assert_eq!(&sink_buf[..], &DATAGRAM_HEADER[..7]);
   }
 
   #[tokio::test]
