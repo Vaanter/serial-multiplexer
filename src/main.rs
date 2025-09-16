@@ -1,5 +1,6 @@
-use crate::configuration::{ConfigArgs, Guest, Host, Modes};
+use crate::configuration::{ALLOWED_CONFIG_VERSION, ConfigArgs, Guest, Host, Modes};
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
+use anyhow::bail;
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
 use std::time::Duration;
@@ -29,6 +30,9 @@ mod utils;
 fn main() {
   let config =
     ConfigArgs::build_config().unwrap_or_else(|e| panic!("Failed to parse config: {e:?}"));
+  if !ALLOWED_CONFIG_VERSION.iter().any(|v| *v == config.version) {
+    panic!("Unsupported config version");
+  }
 
   let (writer, _guard) = if let Some(ref log_file_name) = config.log_file {
     let mut log_file_options = OpenOptions::new();

@@ -1,3 +1,4 @@
+version = "1"
 #log_file = "serial-multiplexer.log"
 tracing_filter = "serial_multiplexer=trace,serial_multiplexer::huge_data=info,serial_multiplexer::metrics=trace"
 

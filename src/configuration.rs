@@ -4,10 +4,14 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+pub static ALLOWED_CONFIG_VERSION: [&str; 1] = ["1"];
+
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigArgs {
+  #[clap(skip)]
+  pub version: String,
   /// Mode in which the program will run. Either host or guest
   #[command(subcommand)]
   pub mode: Option<Modes>,
