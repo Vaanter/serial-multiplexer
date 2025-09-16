@@ -169,8 +169,9 @@ pub mod common {
           serials_ok.push(serial);
         }
         Err(e) => {
-          error!("Failed to connect to serial port '{}'. {e}", serial_path);
-          serials_err.push(e);
+          debug!("Failed to connect to serial port '{}'. {e}", serial_path);
+          serials_err
+            .push(anyhow::anyhow!("Failed to connect to serial port '{serial_path}': {e}"));
         }
       }
     }
@@ -182,7 +183,7 @@ pub mod common {
       }
       for mut serial in serials_ok {
         if let Err(e) = serial.shutdown().await {
-          error = error.context(format!("Failed to close serial port. {e:?}"));
+          error!("Failed to close serial port! {}", e);
         }
       }
       return Err(error);
