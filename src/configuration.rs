@@ -4,7 +4,7 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-pub static ALLOWED_CONFIG_VERSION: [&str; 1] = ["1"];
+pub static ALLOWED_CONFIG_VERSIONS: [&str; 1] = ["1"];
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]

@@ -218,12 +218,9 @@ pub mod common {
   ///
   /// # Returns
   ///
-  /// A [`FuturesUnordered<JoinHandle<()>>`] containing the set of tasks created for listeners.
+  /// A [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] containing the set of tasks
+  /// created for listeners if successful, otherwise an error if setting up a listener fails.
   /// Each `JoinHandle` represents an asynchronous task with the listener loop.
-  ///
-  /// # Panics
-  ///
-  /// Failing to create a listener will cause a panic.
   ///
   /// [`Direct`]: ConnectionType::Direct
   /// [`Socks5`]: ConnectionType::Socks5
@@ -544,8 +541,8 @@ mod linux {
 
   /// Attempts to connect to a Unix socket and set up a sink loop.
   ///
-  /// This function tries to connect to a Unix socket specified in the guest properties, panicking
-  /// if it fails to do so. After the connection is successful, a sink loop task is spawned using
+  /// This function tries to connect to a Unix socket specified in the guest properties.
+  /// After the connection is successful, a sink loop task is spawned using
   /// [`create_unix_socket_loop`].
   ///
   /// # Parameters
