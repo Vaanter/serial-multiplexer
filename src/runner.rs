@@ -1,6 +1,6 @@
 pub mod common {
   use crate::common::{ConnectionState, sink_loop};
-  use crate::configuration::{AddressPair, Guest, Host, Serial, SinkType};
+  use crate::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
   use crate::guest::client_initiator;
   use crate::host::{ConnectionType, connection_initiator, run_listener};
   use crate::utils::create_upstream_listener;
@@ -29,7 +29,7 @@ pub mod common {
     #[cfg(unix)]
     {
       use crate::runner::linux::listen_accept_unix_connection;
-      let SinkType::UnixSocket(ref unix_socket_properties) = properties.sink_type;
+      let HostSink::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
         &unix_socket_properties,
         socket_to_client_push,
@@ -44,7 +44,7 @@ pub mod common {
     #[cfg(windows)]
     {
       use crate::runner::windows::create_windows_pipe_loops;
-      let SinkType::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
+      let HostSink::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
         windows_pipe_properties,
         socket_to_client_push,
@@ -94,8 +94,8 @@ pub mod common {
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
 
     let mut sink_loops = FuturesUnordered::new();
-    match properties {
-      Guest::Serial(serial) => {
+    match properties.sink_type {
+      GuestSink::Serial(serial) => {
         let serial_port_sinks =
           initialize_serials(&serial, sink_to_client_push, client_to_sink_pull, cancel.clone())
             .await
@@ -103,7 +103,7 @@ pub mod common {
         sink_loops.extend(serial_port_sinks);
       }
       #[cfg(unix)]
-      Guest::UnixSocket(unix_socket) => {
+      GuestSink::UnixSocket(unix_socket) => {
         {
           use crate::runner::linux::connect_to_unix_socket;
           let socket_task = connect_to_unix_socket(
@@ -153,7 +153,7 @@ pub mod common {
   /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
   /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
-    properties: &Serial,
+    properties: &SerialGuest,
     sink_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -356,7 +356,7 @@ pub mod common {
 #[cfg(windows)]
 mod windows {
   use crate::common::sink_loop;
-  use crate::configuration::WindowsPipeSink;
+  use crate::configuration::WindowsPipeHost;
   use anyhow::Error;
   use bytes::Bytes;
   use futures::stream::FuturesUnordered;
@@ -391,7 +391,7 @@ mod windows {
   /// An [`anyhow::Result<FuturesUnordered<JoinHandle<()>>>`] with the spawned sink loop task(s)
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
-    properties: &WindowsPipeSink,
+    properties: &WindowsPipeHost,
     pipe_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_pipe_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -462,7 +462,7 @@ mod windows {
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
-      let sink_properties = WindowsPipeSink {
+      let sink_properties = WindowsPipeHost {
         pipe_paths: vec!["non_existent_pipe".to_string()],
       };
 
@@ -497,7 +497,7 @@ mod windows {
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
-      let sink_properties = WindowsPipeSink {
+      let sink_properties = WindowsPipeHost {
         pipe_paths: vec![pipe1_path.to_string(), pipe2_path.to_string(), pipe3_path.to_string()],
       };
 
@@ -518,7 +518,7 @@ mod windows {
 #[cfg(unix)]
 mod linux {
   use crate::common::sink_loop;
-  use crate::configuration::{UnixSocket, UnixSocketSink};
+  use crate::configuration::{UnixSocketGuest, UnixSocketHost};
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use std::fs::remove_file;
@@ -547,7 +547,7 @@ mod linux {
   /// [`create_unix_socket_loop`].
   ///
   /// # Parameters
-  /// * `properties`: A reference to [`Guest`], a struct that contains the `socket_path`
+  /// * `properties`: A reference to [`UnixSocketGuest`], a struct that contains the `socket_path`
   ///    property, which specifies a path of the Unix socket to which this function will connect.
   /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///    client loops.
@@ -560,7 +560,7 @@ mod linux {
   /// An [`anyhow::Result<JoinHandle<()>>`] with the spawned sink loop task if successful,
   /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
-    properties: &UnixSocket,
+    properties: &UnixSocketGuest,
     socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -579,7 +579,7 @@ mod linux {
   /// After a client connects, a sink loop task is spawned using [`create_unix_socket_loop`].
   ///
   /// # Parameters:
-  /// * `properties`: A reference to [`Host`], a struct that contains the `socket_path`
+  /// * `properties`: A reference to [`UnixSocketHost`], a struct that contains the `socket_path`
   ///    property, which specifies a path where the Unix socket will be created.
   /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///    client loops.
@@ -595,7 +595,7 @@ mod linux {
   ///   * The socket fails to bind to the provided `socket_path`
   ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
-    properties: &UnixSocketSink,
+    properties: &UnixSocketHost,
     socket_to_client_push: async_broadcast::Sender<Bytes>,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
@@ -625,10 +625,10 @@ mod linux {
     async fn listen_connect_accept_send_test() {
       setup_tracing().await;
       let socket_path = "test_socket.sock";
-      let sink_properties = UnixSocketSink {
+      let sink_properties = UnixSocketHost {
         socket_path: socket_path.to_string(),
       };
-      let unix_socket_properties = UnixSocket {
+      let unix_socket_properties = UnixSocketGuest {
         socket_path: socket_path.to_string(),
       };
 

@@ -4,7 +4,7 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
-pub static ALLOWED_CONFIG_VERSIONS: [&str; 1] = ["1"];
+pub const ALLOWED_CONFIG_VERSIONS: [&str; 1] = ["1"];
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]
@@ -41,17 +41,15 @@ pub enum Modes {
   Host(Host),
   /// Initializes the application in guest mode awaiting data from serial port or Unix socket.
   /// Requires a serial port or a Unix socket depending on the specified sink type.
-  #[command(subcommand)]
   Guest(Guest),
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Host {
-  /// Specifies how the 2 multiplexer instances communicate
+  /// Specifies how the 2 multiplexer instances communicate.
   #[command(subcommand)]
-  pub sink_type: SinkType,
-
+  pub sink_type: HostSink,
   /// Listener and target address pairs. When parsed from the command line, a pipe must separate the listener and client address.
   #[arg(long)]
   #[serde(default)]
@@ -91,28 +89,36 @@ impl FromStr for AddressPair {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SinkType {
+pub enum HostSink {
   /// Communicate with multiplexer in guest mode via Windows pipe(s) (VirtualBox)
   #[cfg(windows)]
-  WindowsPipe(WindowsPipeSink),
+  WindowsPipe(WindowsPipeHost),
   /// Communicate with multiplexer in guest mode via a Unix socket
   #[cfg(not(windows))]
-  UnixSocket(UnixSocketSink),
+  UnixSocket(UnixSocketHost),
 }
 
 #[cfg(windows)]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct WindowsPipeSink {
+pub struct WindowsPipeHost {
   /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
   #[arg(short, long)]
   #[serde(default)]
   pub(crate) pipe_paths: Vec<String>,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Guest {
+  /// Specifies how the 2 multiplexer instances communicate
+  #[command(subcommand)]
+  pub sink_type: GuestSink,
+}
+
 #[cfg(not(windows))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
-pub struct UnixSocketSink {
+pub struct UnixSocketGuest {
   /// Path to a Unix socket for communication with a multiplexer in host mode
   #[arg(short, long, default_value_t = default_socket_path())]
   #[serde(default = "default_socket_path")]
@@ -121,17 +127,17 @@ pub struct UnixSocketSink {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Guest {
+pub enum GuestSink {
   /// Communicate with multiplexer in host mode via serial port(s)
-  Serial(Serial),
+  Serial(SerialGuest),
   /// Communicate with multiplexer in host mode via a Unix socket
   #[cfg(not(windows))]
-  UnixSocket(UnixSocket),
+  UnixSocket(UnixSocketGuest),
 }
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct Serial {
+pub struct SerialGuest {
   /// Path to a serial port file. On Linux this will likely be a /dev/ttyS0 - 3, and COM1 - 4 on Windows.
   #[arg(short, long)]
   #[serde(default)]
@@ -144,7 +150,8 @@ pub struct Serial {
 
 #[cfg(not(windows))]
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
-pub struct UnixSocket {
+pub struct UnixSocketHost {
+  /// Path to a Unix socket for communication with a multiplexer in guest mode
   #[arg(short, long, default_value_t = default_socket_path())]
   #[serde(default = "default_socket_path")]
   pub socket_path: String,

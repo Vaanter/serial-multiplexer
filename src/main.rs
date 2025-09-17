@@ -1,4 +1,4 @@
-use crate::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, Host, Modes};
+use crate::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, GuestSink, Host, Modes};
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
 use anyhow::{Context, bail, ensure};
 use futures::future::{JoinAll, MaybeDone};
@@ -63,12 +63,12 @@ fn main() -> anyhow::Result<()> {
   runtime.block_on(async {
     match config.mode {
       Some(Modes::Guest(guest)) => {
-        match guest {
-          Guest::Serial(ref serial) => {
+        match guest.sink_type {
+          GuestSink::Serial(ref serial) => {
             ensure!(!serial.serial_paths.is_empty(), "No serial ports configured");
           }
           #[cfg(not(windows))]
-          Guest::UnixSocket(ref unix_socket) => {
+          GuestSink::UnixSocket(ref unix_socket) => {
             use std::path::PathBuf;
             ensure!(unix_socket.socket_path.parse::<PathBuf>().is_ok(), "No unix socket configured")
           }
@@ -79,8 +79,8 @@ fn main() -> anyhow::Result<()> {
       Some(Modes::Host(host)) => {
         #[cfg(windows)]
         {
-          use crate::configuration::SinkType;
-          let SinkType::WindowsPipe(ref windows_pipe_properties) = host.sink_type;
+          use crate::configuration::HostSink;
+          let HostSink::WindowsPipe(ref windows_pipe_properties) = host.sink_type;
           ensure!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
         }
         ensure!(
