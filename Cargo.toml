@@ -1,8 +1,14 @@
-[package]
-name = "serial-multiplexer"
+[workspace.package]
 authors = ["Valentín Bolfík <valentin.bolfik@gmail.com>"]
 version = "0.7.0"
 edition = "2024"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/cli",
+    "crates/shared"
+]
 
 [profile.release]
 lto = "fat"
@@ -12,8 +18,7 @@ strip = "debuginfo"
 opt-level = 3
 incremental = true
 
-[dependencies]
-serial-multiplexer-lib = { path = "serial-multiplexer-lib" }
+[workspace.dependencies]
 anyhow = "1.0.99"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
@@ -29,3 +34,9 @@ tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-attributes = "0.1.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+fast-socks5 = "1.0.0-rc.0"
+flatbuffers = "25.2.10"
+memchr = "2.7.5"
+zeroize = "1.8.1"
+zstd-safe = { version = "7.2.4", features = ["std"] }

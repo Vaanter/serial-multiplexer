@@ -1,0 +1,23 @@
+[package]
+name = "serial-multiplexer-lib"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-broadcast = { workspace = true }
+async-channel = { workspace = true }
+bytes = { workspace = true }
+fast-socks5 = { workspace = true }
+flatbuffers = { workspace = true }
+futures = { workspace = true }
+memchr = { workspace = true }
+tokio = { workspace = true }
+tokio-serial = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-attributes = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+zstd-safe = { workspace = true }
