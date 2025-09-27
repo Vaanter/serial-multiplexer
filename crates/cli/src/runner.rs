@@ -1,6 +1,7 @@
 pub mod common {
   use anyhow::{Context, ensure};
   use bytes::Bytes;
+  use config::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
   use serial_multiplexer_lib::common::{ConnectionState, sink_loop};
@@ -9,6 +10,7 @@ pub mod common {
   use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::HashSet;
   use tokio::io::AsyncWriteExt;
+  use tokio::net::TcpStream;
   use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
@@ -296,8 +298,8 @@ pub mod common {
 
   #[cfg(test)]
   mod tests {
-    use crate::configuration::AddressPair;
     use crate::runner::common::initialize_listeners;
+    use config::configuration::AddressPair;
     use serial_multiplexer_lib::host::ConnectionType;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -354,9 +356,9 @@ pub mod common {
 
 #[cfg(windows)]
 mod windows {
-  use crate::configuration::WindowsPipeHost;
   use anyhow::Error;
   use bytes::Bytes;
+  use config::configuration::WindowsPipeHost;
   use futures::stream::FuturesUnordered;
   use serial_multiplexer_lib::common::sink_loop;
   use std::collections::HashSet;
@@ -516,10 +518,10 @@ mod windows {
 
 #[cfg(unix)]
 mod linux {
-  use crate::common::sink_loop;
-  use crate::configuration::{UnixSocketGuest, UnixSocketHost};
   use anyhow::{Context, bail};
   use bytes::Bytes;
+  use config::configuration::{UnixSocketGuest, UnixSocketHost};
+  use serial_multiplexer_lib::common::sink_loop;
   use std::fs::remove_file;
   use std::io::ErrorKind;
   use tokio::net::{UnixListener, UnixStream};
@@ -616,7 +618,7 @@ mod linux {
   #[cfg(test)]
   mod tests {
     use super::*;
-    use crate::test_utils::setup_tracing;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 

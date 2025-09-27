@@ -1,6 +1,6 @@
-use crate::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, GuestSink, Host, Modes};
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
 use anyhow::{Context, bail, ensure};
+use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, GuestSink, Host, Modes};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
 use std::time::Duration;
@@ -15,7 +15,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
 
-mod configuration;
 mod runner;
 
 fn main() -> anyhow::Result<()> {
@@ -70,7 +69,7 @@ fn main() -> anyhow::Result<()> {
       Some(Modes::Host(host)) => {
         #[cfg(windows)]
         {
-          use crate::configuration::HostSink;
+          use config::configuration::HostSink;
           let HostSink::WindowsPipe(ref windows_pipe_properties) = host.sink_type;
           ensure!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
         }

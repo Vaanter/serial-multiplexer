@@ -53,10 +53,10 @@ pub struct Host {
   /// Listener and target address pairs. When parsed from the command line, a pipe must separate the listener and client address.
   #[arg(long)]
   #[serde(default)]
-  pub(crate) address_pairs: Vec<AddressPair>,
+  pub address_pairs: Vec<AddressPair>,
   /// Address at which the proxy will listen for incoming connections.
   #[arg(long)]
-  pub(crate) socks5_proxy: Option<String>,
+  pub socks5_proxy: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
@@ -65,10 +65,10 @@ pub struct Host {
 pub struct AddressPair {
   /// The address at which the multiplexer will listen for incoming connections.
   #[arg(long, requires = "target_address")]
-  pub(crate) listener_address: String,
+  pub listener_address: String,
   /// The address at which the multiplexer will attempt to connect to.
   #[arg(long, requires = "listener_address")]
-  pub(crate) target_address: String,
+  pub target_address: String,
 }
 
 impl FromStr for AddressPair {
@@ -105,7 +105,7 @@ pub struct WindowsPipeHost {
   /// Path(s) to the pipe(s) that will be used to communicate with VirtualBox VM.
   #[arg(short, long)]
   #[serde(default)]
-  pub(crate) pipe_paths: Vec<String>,
+  pub pipe_paths: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
@@ -122,7 +122,7 @@ pub struct UnixSocketGuest {
   /// Path to a Unix socket for communication with a multiplexer in host mode
   #[arg(short, long, default_value_t = default_socket_path())]
   #[serde(default = "default_socket_path")]
-  pub(crate) socket_path: String,
+  pub socket_path: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]

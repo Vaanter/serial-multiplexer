@@ -6,14 +6,12 @@ edition.workspace = true
 
 [dependencies]
 serial-multiplexer-lib = { path = "../shared" }
+config = { path = "../config" }
 anyhow = { workspace = true }
 async-broadcast = { workspace = true }
 async-channel = { workspace = true }
 bytes = { workspace = true }
-clap = { workspace = true }
-figment = { workspace = true }
 futures = { workspace = true }
-serde = { workspace = true }
 tokio = { workspace = true }
 tokio-serial = { workspace = true }
 tokio-util = { workspace = true }
