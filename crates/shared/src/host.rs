@@ -9,7 +9,7 @@ use futures::TryFutureExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +34,7 @@ impl ConnectionType {
 pub async fn run_listener(
   listener: TcpListener,
   connection_type: ConnectionType,
-  connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+  connection_sender: mpsc::Sender<(ConnectionState<TcpStream>, ConnectionType)>,
   cancel: CancellationToken,
 ) {
   let listener_address = listener.local_addr().unwrap();
@@ -71,7 +71,7 @@ pub async fn run_listener(
 pub async fn connection_initiator(
   client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: async_broadcast::Receiver<Bytes>,
-  mut connection_receiver: mpsc::Receiver<(ConnectionState, ConnectionType)>,
+  mut connection_receiver: mpsc::Receiver<(ConnectionState<TcpStream>, ConnectionType)>,
   cancel: CancellationToken,
 ) {
   debug!("Starting connection initiator");
@@ -102,7 +102,7 @@ pub async fn connection_initiator(
 }
 
 async fn handle_new_connection(
-  mut connection_state: ConnectionState,
+  mut connection_state: ConnectionState<TcpStream>,
   connection_type: ConnectionType,
   client_to_pipe_push: async_channel::Sender<Bytes>,
   mut pipe_to_client_pull: async_broadcast::Receiver<Bytes>,
@@ -143,7 +143,7 @@ async fn handle_new_connection(
 }
 
 async fn initiate_direct_connection(
-  connection_state: &ConnectionState,
+  connection_state: &ConnectionState<TcpStream>,
   target_address: String,
   client_to_pipe_push: &async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
@@ -164,7 +164,7 @@ async fn initiate_direct_connection(
 }
 
 async fn initiate_socks5_connection(
-  connection_state: &mut ConnectionState,
+  connection_state: &mut ConnectionState<TcpStream>,
   client_to_pipe_push: &async_channel::Sender<Bytes>,
   pipe_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
 ) -> anyhow::Result<()> {
@@ -369,7 +369,7 @@ mod tests {
     let (pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
     let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, connection_receiver) =
-      mpsc::channel::<(ConnectionState, ConnectionType)>(128);
+      mpsc::channel::<(ConnectionState<TcpStream>, ConnectionType)>(128);
     let cancel = CancellationToken::new();
     let target_addr = "test:1234";
 

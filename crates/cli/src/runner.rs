@@ -229,7 +229,7 @@ pub mod common {
   pub async fn initialize_listeners(
     address_pairs: &mut Vec<AddressPair>,
     socks5_proxy: &Option<String>,
-    connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    connection_sender: mpsc::Sender<(ConnectionState<TcpStream>, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
@@ -280,7 +280,7 @@ pub mod common {
   async fn setup_listener(
     listener_address: &str,
     connection_type: ConnectionType,
-    connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    connection_sender: mpsc::Sender<(ConnectionState<TcpStream>, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
     let listener = create_upstream_listener(listener_address).await?;

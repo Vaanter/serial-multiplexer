@@ -7,6 +7,7 @@ use async_broadcast::RecvError;
 use bytes::Bytes;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -120,7 +121,7 @@ pub async fn client_initiator(
 async fn initiate_client_connection(
   data: Bytes,
   client_to_serial_push: async_channel::Sender<Bytes>,
-) -> anyhow::Result<Option<ConnectionState>> {
+) -> anyhow::Result<Option<ConnectionState<TcpStream>>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
       // Not the first datagram for connection, ignore

@@ -20,3 +20,10 @@ path = "fuzzing_targets/handle_sink_read_afl.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "process_sink_read_afl"
+path = "fuzzing_targets/process_sink_read_afl.rs"
+test = false
+doc = false
+bench = false

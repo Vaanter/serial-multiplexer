@@ -48,21 +48,21 @@ static HEADER_FINDER: LazyLock<Finder<'static>> =
 /// # Fields
 ///
 /// * `identifier` (`u64`) - A unique identifier assigned to the connection.
-/// * `client` (`TcpStream`) - The TCP communication stream associated with the client.
+/// * `client` (`T`) - The communication stream associated with the client.
 /// * `sequence` (`u64`) - A counter tracking the sequence of the last sent datagram for the connection.
 /// * `largest_processed` (`u64`) - The largest sequence number that has been processed.
 /// * `datagram_queue` (`BTreeMap<u64, Bytes>`) - A map (ordered by sequence number) storing datagrams
 ///   that are awaiting processing because they arrived out-of-order.
-pub struct ConnectionState {
+pub struct ConnectionState<T: AsyncReadExt + AsyncWriteExt + Unpin> {
   pub identifier: u64,
-  pub client: TcpStream,
+  pub client: T,
   pub sequence: u64,
   pub largest_processed: u64,
   pub datagram_queue: BTreeMap<u64, Bytes>,
 }
 
-impl ConnectionState {
-  pub const fn new(identifier: u64, client: TcpStream) -> Self {
+impl<T: AsyncReadExt + AsyncWriteExt + Unpin> ConnectionState<T> {
+  pub const fn new(identifier: u64, client: T) -> Self {
     Self {
       identifier,
       client,
@@ -513,8 +513,8 @@ pub async fn handle_client_read(
 ///   delivery of datagrams.
 ///
 /// [`Close`]: ControlCode::Close
-pub async fn process_sink_read(
-  connection: &mut ConnectionState,
+pub async fn process_sink_read<T: AsyncReadExt + AsyncWriteExt + Unpin>(
+  connection: &mut ConnectionState<T>,
   data: Result<Bytes, async_broadcast::RecvError>,
 ) -> bool {
   match data {
@@ -624,7 +624,7 @@ pub async fn process_sink_read(
 /// [`Close`]: ControlCode::Close
 #[instrument(skip_all, fields(connection_id = %connection.identifier, client_address = %connection.client.peer_addr().unwrap()))]
 pub async fn connection_loop(
-  mut connection: ConnectionState,
+  mut connection: ConnectionState<TcpStream>,
   mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
