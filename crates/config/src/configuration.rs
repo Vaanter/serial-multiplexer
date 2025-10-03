@@ -30,6 +30,10 @@ pub struct ConfigArgs {
   /// A filter for the traces (logs). To set a global filter at a specific level, use "serial_multiplexer=<LEVEL>"
   #[arg(long)]
   pub tracing_filter: Option<String>,
+
+  /// Specifies how many worker threads will be used. Must be a positive integer.
+  #[arg(short, long)]
+  pub threads: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]

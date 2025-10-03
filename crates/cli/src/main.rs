@@ -3,6 +3,7 @@ use anyhow::{Context, bail, ensure};
 use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, GuestSink, Host, Modes};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::signal::ctrl_c;
 use tokio::task::JoinHandle;
@@ -46,10 +47,24 @@ fn main() -> anyhow::Result<()> {
   Registry::default().with(fmt_layer).init();
   debug!("config: {:?}", config);
 
-  let runtime = tokio::runtime::Builder::new_multi_thread()
-    .enable_all()
-    .build()
-    .context("Failed to setup tokio runtime")?;
+  let runtime = match config.threads {
+    Some(0) => {
+      bail!("At least one worker thread is required!");
+    }
+    Some(1) => {
+      debug!("Using current thread tokio runtime");
+      tokio::runtime::Builder::new_current_thread().enable_all().build()
+    }
+    _ => {
+      let threads = config
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+      debug!("Using multithreaded tokio runtime with {} worker threads", threads);
+      tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(threads).build()
+    }
+  }
+  .context("Failed to setup tokio runtime")?;
+
   runtime.block_on(async {
     match config.mode {
       Some(Modes::Guest(guest)) => {
