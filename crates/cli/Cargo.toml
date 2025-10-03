@@ -22,4 +22,4 @@ tracing-subscriber = { workspace = true }
 
 [[bin]]
 path = "src/main.rs"
-name = "serial_multiplexer"
+name = "serial-multiplexer"
