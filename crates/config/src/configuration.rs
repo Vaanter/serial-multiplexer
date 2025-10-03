@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
+use std::fs::exists;
 use std::str::FromStr;
 
 pub const ALLOWED_CONFIG_VERSIONS: [&str; 1] = ["1"];
@@ -188,6 +189,9 @@ impl ConfigArgs {
         // TODO mode should be replaced automatically, but for now we need to do this
         if let Some(args_mode) = args.mode {
           c.mode = Some(args_mode);
+        }
+        if !exists(&config_file_path).unwrap_or(false) {
+          c.version = "1".to_string()
         }
         c
       })
