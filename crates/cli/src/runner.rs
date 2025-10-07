@@ -19,7 +19,7 @@ pub mod common {
   use tracing::{debug, error, info};
 
   pub async fn create_host_tasks(
-    mut properties: Host,
+    properties: Host,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
     let (client_to_socket_push, client_to_socket_pull) = async_channel::bounded::<Bytes>(512);
@@ -74,7 +74,7 @@ pub mod common {
     tasks.push(initiator_task);
 
     let listener_tasks = initialize_listeners(
-      &mut properties.address_pairs,
+      &properties.address_pairs,
       &properties.socks5_proxy,
       connection_sender,
       cancel,
@@ -227,19 +227,19 @@ pub mod common {
   /// [`Direct`]: ConnectionType::Direct
   /// [`Socks5`]: ConnectionType::Socks5
   pub async fn initialize_listeners(
-    address_pairs: &mut Vec<AddressPair>,
+    address_pairs: &[AddressPair],
     socks5_proxy: &Option<String>,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
     let listener_tasks = FuturesUnordered::new();
-    while let Some(pair_direct) = address_pairs.pop() {
+    for pair_direct in address_pairs {
       let cancel = cancel.clone();
       let connection_sender = connection_sender.clone();
       let pair_task = setup_listener(
         &pair_direct.listener_address,
-        ConnectionType::new_direct(pair_direct.target_address),
+        ConnectionType::new_direct(pair_direct.target_address.to_string()),
         connection_sender,
         cancel,
       )
@@ -309,7 +309,7 @@ pub mod common {
     async fn test_initialize_listeners() {
       let cancel = CancellationToken::new();
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
-      let mut address_pairs = vec![
+      let address_pairs = vec![
         AddressPair {
           listener_address: "127.0.0.1:2000".to_string(),
           target_address: "127.0.0.1:3000".to_string(),
@@ -322,7 +322,7 @@ pub mod common {
       let socks5_proxy = "127.0.0.1:5000".to_string();
 
       let listener_task = initialize_listeners(
-        &mut address_pairs,
+        &address_pairs,
         &Some(socks5_proxy.clone()),
         connection_sender,
         cancel,
