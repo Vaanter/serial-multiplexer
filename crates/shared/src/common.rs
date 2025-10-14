@@ -34,8 +34,8 @@ const _: () = {
 /// An array representing a header used to identify the start of a datagram in a byte stream
 const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
-pub const HUGE_DATA_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::huge_data");
-pub const METRICS_TARGET: &str = concat!(env!("CARGO_CRATE_NAME"), "::metrics");
+pub const HUGE_DATA_TARGET: &str = "serial_multiplexer::huge_data";
+pub const METRICS_TARGET: &str = "serial_multiplexer::metrics";
 /// Number of bytes used to store the size of a datagram
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
@@ -276,7 +276,7 @@ pub async fn handle_sink_read(
     .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
-    trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes);
+    trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes.as_ref());
     if let Err(e) = sink_to_client_push.broadcast_direct(datagram_bytes).await {
       bail!("Failed to send data to clients. {}", e);
     }
@@ -303,10 +303,10 @@ pub async fn handle_sink_read(
       unprocessed_data_start
     );
     let buffer_end = sink_buf.len();
-    trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", &sink_buf);
+    trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", sink_buf.as_ref());
     sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
     sink_buf[unprocessed_bytes..buffer_end].zeroize();
-    trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", &sink_buf);
+    trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", sink_buf.as_ref());
   }
   Ok(unprocessed_bytes)
 }
@@ -429,7 +429,7 @@ pub async fn handle_client_read(
       );
       debug!("Read {} bytes from client", n);
       let datagram = create_data_datagram(identifier, sequence, &read_buf[..n]);
-      trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", &datagram);
+      trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", datagram.as_ref());
       read_buf[..n].zeroize();
       debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
       if let Err(e) = client_to_pipe_push.send(datagram).await {
