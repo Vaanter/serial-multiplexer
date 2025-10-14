@@ -10,7 +10,6 @@ pub mod common {
   use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::HashSet;
   use tokio::io::AsyncWriteExt;
-  use tokio::net::TcpStream;
   use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
@@ -22,8 +21,8 @@ pub mod common {
     properties: Host,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
-    let (client_to_socket_push, client_to_socket_pull) = async_channel::bounded::<Bytes>(512);
-    let (socket_to_client_push, socket_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
     let (connection_sender, connection_receiver) = mpsc::channel(512);
 
     let mut sink_loops = FuturesUnordered::new();
@@ -33,8 +32,8 @@ pub mod common {
       let HostSink::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
         &unix_socket_properties,
-        socket_to_client_push,
-        client_to_socket_pull,
+        sink_to_client_push,
+        client_to_sink_pull,
         cancel.clone(),
       )
       .await
@@ -48,8 +47,8 @@ pub mod common {
       let HostSink::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
         windows_pipe_properties,
-        socket_to_client_push,
-        client_to_socket_pull,
+        sink_to_client_push,
+        client_to_sink_pull,
         cancel.clone(),
       )
       .await
@@ -66,8 +65,8 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task = tokio::spawn(connection_initiator(
-      client_to_socket_push,
-      socket_to_client_pull,
+      client_to_sink_push,
+      sink_to_client_pull,
       connection_receiver,
       cancel.clone(),
     ));
@@ -143,9 +142,9 @@ pub mod common {
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `serial_paths`
   ///   property, which specifies paths of the erial ports to which this function will connect.
-  /// * `socket_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///   client loops.
-  /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
+  /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
   ///   should terminate.

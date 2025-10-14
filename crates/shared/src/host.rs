@@ -69,12 +69,14 @@ pub async fn run_listener(
 
 #[instrument(skip_all)]
 pub async fn connection_initiator(
-  client_to_pipe_push: async_channel::Sender<Bytes>,
-  mut pipe_to_client_pull: async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
+  sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   mut connection_receiver: mpsc::Receiver<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
   debug!("Starting connection initiator");
+  // Deactivate the receiver so we don't need to drain it
+  let sink_to_client_pull_inactive = sink_to_client_pull.deactivate();
   loop {
     tokio::select! {
       biased;
@@ -83,20 +85,19 @@ pub async fn connection_initiator(
       }
       data = connection_receiver.recv() => {
         if let Some((connection_state, connection_type)) = data {
-          handle_new_connection(
+          tokio::spawn(handle_new_connection(
             connection_state,
             connection_type,
-            client_to_pipe_push.clone(),
-            pipe_to_client_pull.clone(),
+            client_to_sink_push.clone(),
+            sink_to_client_pull_inactive.activate_cloned(),
             cancel.clone()
-          ).await;
+          ));
         } else {
           warn!("Connection receiver closed");
           cancel.cancel();
           break;
         }
       }
-      _ = pipe_to_client_pull.recv() => {}
     }
   }
 }
@@ -104,8 +105,8 @@ pub async fn connection_initiator(
 async fn handle_new_connection(
   mut connection_state: ConnectionState,
   connection_type: ConnectionType,
-  client_to_pipe_push: async_channel::Sender<Bytes>,
-  mut pipe_to_client_pull: async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
+  mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
   let connect_result = match connection_type {
@@ -113,16 +114,16 @@ async fn handle_new_connection(
       initiate_direct_connection(
         &connection_state,
         target_address,
-        &client_to_pipe_push,
-        &mut pipe_to_client_pull,
+        &client_to_sink_push,
+        &mut sink_to_client_pull,
       )
       .await
     }
     ConnectionType::Socks5 => {
       initiate_socks5_connection(
         &mut connection_state,
-        &client_to_pipe_push,
-        &mut pipe_to_client_pull,
+        &client_to_sink_push,
+        &mut sink_to_client_pull,
       )
       .await
     }
@@ -135,9 +136,9 @@ async fn handle_new_connection(
   } else {
     tokio::spawn(connection_loop(
       connection_state,
-      pipe_to_client_pull.clone(),
-      client_to_pipe_push.clone(),
-      cancel.clone(),
+      sink_to_client_pull,
+      client_to_sink_push,
+      cancel,
     ));
   }
 }
@@ -145,15 +146,15 @@ async fn handle_new_connection(
 async fn initiate_direct_connection(
   connection_state: &ConnectionState,
   target_address: String,
-  client_to_pipe_push: &async_channel::Sender<Bytes>,
-  pipe_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
 ) -> anyhow::Result<()> {
   info!("Starting direct connection to {}", &target_address);
   if initiate_connection(
     connection_state.identifier,
     target_address,
-    client_to_pipe_push,
-    pipe_to_client_pull,
+    client_to_sink_push,
+    sink_to_client_pull,
   )
   .await
   {
@@ -165,8 +166,8 @@ async fn initiate_direct_connection(
 
 async fn initiate_socks5_connection(
   connection_state: &mut ConnectionState,
-  client_to_pipe_push: &async_channel::Sender<Bytes>,
-  pipe_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
 ) -> anyhow::Result<()> {
   // Use the local address as the guest does not reply with the actual address of it's connection
   let local_address = connection_state.client.local_addr()?;
@@ -180,8 +181,8 @@ async fn initiate_socks5_connection(
       if initiate_connection(
         connection_state.identifier,
         addr.to_string(),
-        client_to_pipe_push,
-        pipe_to_client_pull,
+        client_to_sink_push,
+        sink_to_client_pull,
       )
       .await
       {
@@ -206,19 +207,19 @@ async fn initiate_socks5_connection(
 async fn initiate_connection(
   connection_identifier: u64,
   target_address: String,
-  client_to_pipe_push: &async_channel::Sender<Bytes>,
-  pipe_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection_identifier, 0, &target_address);
   trace!(target: HUGE_DATA_TARGET, "Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
-  if let Err(e) = client_to_pipe_push.send(initial_datagram).await {
+  if let Err(e) = client_to_sink_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);
     return false;
   }
   // TODO rework
   if let Ok(Some(datagram)) = timeout(Duration::from_secs(5), async {
     loop {
-      match pipe_to_client_pull.recv().await {
+      match sink_to_client_pull.recv_direct().await {
         Ok(data) => match root_as_datagram(&data) {
           Ok(datagram) => {
             trace!(target: HUGE_DATA_TARGET, "Received datagram from server: {:?}", datagram);
@@ -366,16 +367,16 @@ mod tests {
   #[tokio::test]
   async fn test_connection_initiator() {
     setup_tracing().await;
-    let (pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (pipe_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_sink_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, connection_receiver) =
       mpsc::channel::<(ConnectionState, ConnectionType)>(128);
     let cancel = CancellationToken::new();
     let target_addr = "test:1234";
 
     let initiator_task = tokio::spawn(connection_initiator(
-      client_to_pipe_push.clone(),
-      pipe_to_client_pull.clone(),
+      client_to_sink_push.clone(),
+      sink_to_client_pull.clone(),
       connection_receiver,
       cancel.clone(),
     ));

@@ -54,24 +54,30 @@ pub async fn client_initiator(
       data = serial_to_client_pull.recv() => {
         match data {
           Ok(data) => {
-            match timeout(CLIENT_INITIATION_TIMEOUT,
-              initiate_client_connection(data, client_to_serial_push.clone())).await {
-              Ok(Ok(Some(connection))) => {
-                tokio::spawn(connection_loop(
-                  connection,
-                  serial_to_client_pull.clone(),
-                  client_to_serial_push.clone(),
-                  cancel.clone()
-                ));
-              },
-              Ok(Err(e)) => {
-                error!("Failed to initiate client connection: {}", e);
-              },
-              Err(_) => {
-                error!("Failed to initiate client connection in time");
-              }
-              Ok(Ok(None)) => {}
-            }
+            tokio::spawn({
+              let serial_to_client_pull = serial_to_client_pull.clone();
+              let client_to_serial_push = client_to_serial_push.clone();
+              let cancel = cancel.clone();
+              async move {
+                match timeout(CLIENT_INITIATION_TIMEOUT,
+                  initiate_client_connection(data, client_to_serial_push.clone())).await {
+                  Ok(Ok(Some(connection))) => {
+                    tokio::spawn(connection_loop(
+                      connection,
+                      serial_to_client_pull.clone(),
+                      client_to_serial_push.clone(),
+                      cancel.clone()
+                    ));
+                  },
+                  Ok(Err(e)) => {
+                    error!("Failed to initiate client connection: {}", e);
+                  },
+                  Err(_) => {
+                    error!("Failed to initiate client connection in time");
+                  }
+                  Ok(Ok(None)) => {}
+              }}
+            });
           }
           Err(RecvError::Overflowed(amount)) => {
             warn!("Missed {amount} datagrams due to lag, some INITIAL datagrams might have been skipped");
