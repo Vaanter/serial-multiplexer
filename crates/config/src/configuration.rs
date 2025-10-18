@@ -31,7 +31,6 @@ pub struct ConfigArgs {
   /// A filter for the traces (logs). To set a global filter at a specific level, use "serial_multiplexer=<LEVEL>"
   #[arg(long)]
   pub tracing_filter: Option<String>,
-
   /// Specifies how many worker threads will be used. Must be a positive integer.
   #[arg(short, long)]
   pub threads: Option<usize>,
@@ -59,9 +58,12 @@ pub struct Host {
   #[arg(long)]
   #[serde(default)]
   pub address_pairs: Vec<AddressPair>,
-  /// Address at which the proxy will listen for incoming connections.
+  /// Address at which the SOCKS5 proxy will listen for incoming connections.
   #[arg(long)]
   pub socks5_proxy: Option<String>,
+  /// Address at which the HTTP proxy will listen for incoming connections.
+  #[arg(long)]
+  pub http_proxy: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]

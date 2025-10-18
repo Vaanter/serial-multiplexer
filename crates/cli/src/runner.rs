@@ -1,5 +1,5 @@
 pub mod common {
-  use anyhow::{Context, ensure};
+  use anyhow::{Context, bail, ensure};
   use bytes::Bytes;
   use config::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
@@ -7,6 +7,7 @@ pub mod common {
   use serial_multiplexer_lib::common::{ConnectionState, sink_loop};
   use serial_multiplexer_lib::guest::client_initiator;
   use serial_multiplexer_lib::host::{ConnectionType, connection_initiator, run_listener};
+  use serial_multiplexer_lib::host_http::run_http_listener;
   use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::HashSet;
   use tokio::io::AsyncWriteExt;
@@ -65,8 +66,8 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task = tokio::spawn(connection_initiator(
-      client_to_sink_push,
-      sink_to_client_pull,
+      client_to_sink_push.clone(),
+      sink_to_client_pull.clone(),
       connection_receiver,
       cancel.clone(),
     ));
@@ -75,7 +76,10 @@ pub mod common {
     let listener_tasks = initialize_listeners(
       &properties.address_pairs,
       &properties.socks5_proxy,
+      &properties.http_proxy,
       connection_sender,
+      client_to_sink_push,
+      sink_to_client_pull,
       cancel,
     )
     .await
@@ -228,7 +232,10 @@ pub mod common {
   pub async fn initialize_listeners(
     address_pairs: &[AddressPair],
     socks5_proxy: &Option<String>,
+    http_proxy: &Option<String>,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    client_to_sink_push: async_channel::Sender<Bytes>,
+    sink_to_client_pull: async_broadcast::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
@@ -248,11 +255,28 @@ pub mod common {
     }
 
     if let Some(socks5_proxy) = socks5_proxy {
-      let socks5_task =
-        setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
-          .await
-          .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
+      let socks5_task = setup_listener(
+        socks5_proxy,
+        ConnectionType::Socks5,
+        connection_sender.clone(),
+        cancel.clone(),
+      )
+      .await
+      .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
       listener_tasks.push(socks5_task);
+    }
+
+    if let Some(http_proxy) = http_proxy {
+      let http_task = setup_http_listener(
+        http_proxy,
+        client_to_sink_push,
+        sink_to_client_pull,
+        connection_sender,
+        cancel,
+      )
+      .await
+      .context(format!("Failed to setup http proxy listener at address '{http_proxy}'"))?;
+      listener_tasks.push(http_task);
     }
 
     Ok(listener_tasks)
@@ -290,9 +314,30 @@ pub mod common {
       ConnectionType::Direct { ref target_address } => {
         info!("Created listener at {} for {}", listener_address, target_address);
       }
+      ConnectionType::Http => {
+        bail!("HTTP requires a custom listener");
+      }
     }
 
     Ok(tokio::spawn(run_listener(listener, connection_type, connection_sender, cancel)))
+  }
+
+  async fn setup_http_listener(
+    listener_address: &str,
+    client_to_sink_push: async_channel::Sender<Bytes>,
+    sink_to_client_pull: async_broadcast::Receiver<Bytes>,
+    connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    cancel: CancellationToken,
+  ) -> anyhow::Result<JoinHandle<()>> {
+    let listener = create_upstream_listener(listener_address).await?;
+    info!("Created HTTP listener at {}", listener_address);
+    Ok(tokio::spawn(run_http_listener(
+      listener,
+      client_to_sink_push,
+      sink_to_client_pull,
+      connection_sender,
+      cancel,
+    )))
   }
 
   #[cfg(test)]
@@ -300,13 +345,19 @@ pub mod common {
     use crate::runner::common::initialize_listeners;
     use config::configuration::AddressPair;
     use serial_multiplexer_lib::host::ConnectionType;
+    use serial_multiplexer_lib::protocol_utils::create_ack_datagram;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn test_initialize_listeners() {
+      setup_tracing().await;
       let cancel = CancellationToken::new();
+      let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+      let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
       let address_pairs = vec![
         AddressPair {
@@ -319,16 +370,20 @@ pub mod common {
         },
       ];
       let socks5_proxy = "127.0.0.1:5000".to_string();
+      let http_proxy = "127.0.0.1:5500".to_string();
 
       let listener_task = initialize_listeners(
         &address_pairs,
         &Some(socks5_proxy.clone()),
+        &Some(http_proxy.clone()),
         connection_sender,
+        client_to_sink_push,
+        sink_to_client_pull,
         cancel,
       )
       .await
       .unwrap();
-      assert_eq!(listener_task.len(), 3);
+      assert_eq!(listener_task.len(), 4);
 
       let mut connection_id = 0;
       for address_pair in address_pairs.iter() {
@@ -349,6 +404,17 @@ pub mod common {
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
       assert_eq!(connection_type, ConnectionType::Socks5);
+      connection_id += 1;
+      let mut http_client = TcpStream::connect(http_proxy).await.unwrap();
+      http_client
+        .write_all(b"CONNECT google.com:443 HTTP/1.1\r\nHost: google.com\r\n\r\n")
+        .await
+        .unwrap();
+      sink_to_client_push.broadcast_direct(create_ack_datagram(connection_id, 0)).await.unwrap();
+      let (state, connection_type) = connection_receiver.recv().await.unwrap();
+      assert_eq!(state.identifier, connection_id);
+      assert_eq!(state.client.peer_addr().unwrap(), http_client.local_addr().unwrap());
+      assert_eq!(connection_type, ConnectionType::Http);
     }
   }
 }

@@ -16,12 +16,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use tracing_attributes::instrument;
 
-static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ConnectionType {
   Direct { target_address: String },
   Socks5,
+  Http,
 }
 
 impl ConnectionType {
@@ -102,7 +103,7 @@ pub async fn connection_initiator(
   }
 }
 
-async fn handle_new_connection(
+pub(crate) async fn handle_new_connection(
   mut connection_state: ConnectionState,
   connection_type: ConnectionType,
   client_to_sink_push: async_channel::Sender<Bytes>,
@@ -127,6 +128,8 @@ async fn handle_new_connection(
       )
       .await
     }
+    // Http connections should have been initialized before this, so we just let them pass
+    ConnectionType::Http => Ok(()),
   };
   if let Err(e) = connect_result {
     info!("Failed to initialize connection, closing client. {}", e);
@@ -204,7 +207,7 @@ async fn initiate_socks5_connection(
   }
 }
 
-async fn initiate_connection(
+pub(crate) async fn initiate_connection(
   connection_identifier: u64,
   target_address: String,
   client_to_sink_push: &async_channel::Sender<Bytes>,
@@ -243,6 +246,7 @@ async fn initiate_connection(
       debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
       return false;
     }
+    debug!("Successfully initiated connection to {}", target_address);
     true
   } else {
     debug!("Failed to initialize connection, pipe is closed or failed to receive response");
