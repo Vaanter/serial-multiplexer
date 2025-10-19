@@ -10,10 +10,12 @@ pub mod common {
   use serial_multiplexer_lib::host_http::run_http_listener;
   use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::HashSet;
+  use std::time::Duration;
   use tokio::io::AsyncWriteExt;
   use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
+  use tokio::time::{MissedTickBehavior, interval};
   use tokio_serial::SerialPortBuilderExt;
   use tokio_util::sync::CancellationToken;
   use tracing::{debug, error, info};
@@ -33,7 +35,7 @@ pub mod common {
       let HostSink::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
         &unix_socket_properties,
-        sink_to_client_push,
+        sink_to_client_push.clone(),
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -48,7 +50,7 @@ pub mod common {
       let HostSink::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
         windows_pipe_properties,
-        sink_to_client_push,
+        sink_to_client_push.clone(),
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -77,8 +79,8 @@ pub mod common {
       &properties.address_pairs,
       &properties.socks5_proxy,
       &properties.http_proxy,
-      connection_sender,
-      client_to_sink_push,
+      connection_sender.clone(),
+      client_to_sink_push.clone(),
       sink_to_client_pull,
       cancel,
     )
@@ -86,7 +88,31 @@ pub mod common {
     .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
+    run_channel_watcher(client_to_sink_push, sink_to_client_push, Some(connection_sender));
+
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
+  }
+
+  fn run_channel_watcher(
+    client_to_sink_push: async_channel::Sender<Bytes>,
+    sink_to_client_push: async_broadcast::Sender<Bytes>,
+    connection_sender: Option<mpsc::Sender<(ConnectionState, ConnectionType)>>,
+  ) {
+    tokio::spawn(async move {
+      let mut interval = interval(Duration::from_secs(1));
+      interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+      loop {
+        interval.tick().await;
+        let cts_len =
+          client_to_sink_push.capacity().unwrap_or(0).saturating_sub(client_to_sink_push.len());
+        let stc_len = sink_to_client_push.capacity().saturating_sub(sink_to_client_push.len());
+        let cs_len = match &connection_sender {
+          Some(c) => c.capacity(),
+          None => 0,
+        };
+        debug!(target: "serial_multiplexer::CCW", "CTS: {}, STC: {}, CS: {}", cts_len, stc_len, cs_len);
+      }
+    });
   }
 
   pub async fn create_guest_tasks(
@@ -100,10 +126,14 @@ pub mod common {
     let mut sink_loops = FuturesUnordered::new();
     match properties.sink_type {
       GuestSink::Serial(serial) => {
-        let serial_port_sinks =
-          initialize_serials(&serial, sink_to_client_push, client_to_sink_pull, cancel.clone())
-            .await
-            .context("Failed to create serial port based sink loops.")?;
+        let serial_port_sinks = initialize_serials(
+          &serial,
+          sink_to_client_push.clone(),
+          client_to_sink_pull,
+          cancel.clone(),
+        )
+        .await
+        .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
       }
       #[cfg(unix)]
@@ -112,7 +142,7 @@ pub mod common {
           use crate::runner::linux::connect_to_unix_socket;
           let socket_task = connect_to_unix_socket(
             &unix_socket,
-            sink_to_client_push,
+            sink_to_client_push.clone(),
             client_to_sink_pull,
             cancel.clone(),
           )
@@ -130,8 +160,10 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task =
-      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel));
+      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push.clone(), cancel));
     tasks.push(initiator_task);
+
+    run_channel_watcher(client_to_sink_push, sink_to_client_push, None);
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }
@@ -410,7 +442,7 @@ pub mod common {
         .write_all(b"CONNECT google.com:443 HTTP/1.1\r\nHost: google.com\r\n\r\n")
         .await
         .unwrap();
-      sink_to_client_push.broadcast_direct(create_ack_datagram(connection_id, 0)).await.unwrap();
+      sink_to_client_push.broadcast_direct(create_ack_datagram(connection_id, 0, 0)).await.unwrap();
       let (state, connection_type) = connection_receiver.recv().await.unwrap();
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), http_client.local_addr().unwrap());
