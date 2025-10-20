@@ -140,7 +140,7 @@ async fn initiate_client_connection(
       };
       info!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;
-      let ack = create_ack_datagram(identifier, 0);
+      let ack = create_ack_datagram(identifier, 0, 0);
       let ack_datagram = datagram_from_bytes(&ack);
       debug!("Sending ACK: {:?}", ack_datagram);
       if let Err(e) = client_to_serial_push.send(ack).await {
@@ -183,7 +183,7 @@ mod tests {
     let ack_datagram = root_as_datagram(&ack_data).unwrap();
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.identifier(), 123);
-    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
   }
 
   #[tokio::test]
@@ -215,7 +215,7 @@ mod tests {
     let ack_datagram = root_as_datagram(&ack).unwrap();
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.identifier(), 123);
-    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
   }
 
   #[tokio::test]

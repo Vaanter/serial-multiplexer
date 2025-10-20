@@ -12,8 +12,8 @@ pub fn create_initial_datagram(identifier: u64, sequence: u64, target: &str) -> 
   create_data_datagram_with_code(identifier, sequence, ControlCode::Initial, target.as_bytes())
 }
 
-pub fn create_ack_datagram(identifier: u64, sequence: u64) -> Bytes {
-  create_data_datagram_with_code(identifier, sequence, ControlCode::Ack, &[])
+pub fn create_ack_datagram(identifier: u64, sequence: u64, acked: u64) -> Bytes {
+  create_data_datagram_with_code(identifier, sequence, ControlCode::Ack, &acked.to_be_bytes())
 }
 
 pub fn create_close_datagram(identifier: u64, sequence: u64) -> Bytes {

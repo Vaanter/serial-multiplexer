@@ -1,10 +1,11 @@
-use crate::protocol_utils::{create_close_datagram, create_data_datagram};
+use crate::protocol_utils::{create_ack_datagram, create_close_datagram, create_data_datagram};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use anyhow::{anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,6 +14,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace};
 use tracing_attributes::instrument;
 use zeroize::Zeroize;
+
+/// Specifies how many datagrams without ACK a connection can have
+/// before the TCP connection gets plugged.
+const ACK_THRESHOLD: u64 = 64;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
@@ -53,11 +58,13 @@ static HEADER_FINDER: LazyLock<Finder<'static>> =
 /// * `largest_processed` (`u64`) - The largest sequence number that has been processed.
 /// * `datagram_queue` (`BTreeMap<u64, Bytes>`) - A map (ordered by sequence number) storing datagrams
 ///   that are awaiting processing because they arrived out-of-order.
+#[derive(Debug)]
 pub struct ConnectionState {
   pub identifier: u64,
   pub client: TcpStream,
   pub sequence: u64,
   pub largest_processed: u64,
+  pub largest_acked: u64,
   pub datagram_queue: BTreeMap<u64, Bytes>,
 }
 
@@ -68,6 +75,7 @@ impl ConnectionState {
       client,
       sequence: 0,
       largest_processed: 0,
+      largest_acked: 0,
       datagram_queue: BTreeMap::new(),
     }
   }
@@ -516,19 +524,20 @@ pub async fn handle_client_read(
 pub async fn process_sink_read(
   connection: &mut ConnectionState,
   data: Result<Bytes, async_broadcast::RecvError>,
-) -> bool {
+) -> u8 {
+  let mut result = 0b00; // from right: should send ACK, should shut down client connection
   match data {
     Ok(data_buf) => {
       let datagram = match root_as_datagram(&data_buf) {
         Ok(datagram) => datagram,
         Err(e) => {
           error!("Received malformed datagram: {:?}, ignoring", e);
-          return false;
+          return result;
         }
       };
       if datagram.identifier() != connection.identifier {
         // Not our datagram, ignore it
-        return false;
+        return result;
       }
       let datagram_sequence = datagram.sequence();
       debug!(
@@ -544,7 +553,7 @@ pub async fn process_sink_read(
           datagram_sequence, connection.largest_processed
         );
         connection.datagram_queue.insert(datagram_sequence, data_buf);
-        return false;
+        return result;
       } else if datagram_sequence == (connection.largest_processed + 1) {
         trace!(
           "Received datagram in order, seq: {}, largest sent: {}",
@@ -558,23 +567,38 @@ pub async fn process_sink_read(
           let Ok(datagram) = root_as_datagram(&datagram_buf) else {
             continue;
           };
-          if let Some(data) = datagram.data() {
-            trace!("Sending data to client, size {}", data.len());
-            match connection.client.write_all(data.bytes()).await {
-              Ok(()) => {
-                trace!("Sent {} bytes to client", data.len());
-              }
-              Err(e) => {
-                error!("Failed to write data to client: {}", e);
-                return true;
+          match datagram.code() {
+            ControlCode::Close => {
+              result |= 0b10;
+              return result;
+            }
+            ControlCode::Ack => {
+              if let Some(data) = datagram.data() {
+                let Ok(sequence_to_ack) = data.bytes().try_into() else {
+                  error!("Received ACK datagram with invalid sequence number!");
+                  result |= 0b10;
+                  return result;
+                };
+                connection.largest_acked = u64::from_be_bytes(sequence_to_ack);
               }
             }
-          }
-          if datagram.code() == ControlCode::Close {
-            if let Err(e) = connection.client.shutdown().await {
-              error!("Failed to shutdown client after receiving CLOSE: {}", e);
+            ControlCode::Data => {
+              if let Some(data) = datagram.data() {
+                trace!("Sending data to client, size {}", data.len());
+                match connection.client.write_all(data.bytes()).await {
+                  Ok(()) => {
+                    trace!("Sent {} bytes to client", data.len());
+                    result |= 0b01;
+                  }
+                  Err(e) => {
+                    error!("Failed to write data to client: {}", e);
+                    result |= 0b10;
+                    return result;
+                  }
+                };
+              }
             }
-            return true;
+            _ => {} // We don't care about other types (only Initial at the time of writing)
           }
         }
         if let Err(e) = connection.client.flush().await {
@@ -583,15 +607,16 @@ pub async fn process_sink_read(
       } else {
         debug!("Received a datagram that was already processed before, ignoring");
       }
-      false
+      result
     }
     Err(async_broadcast::RecvError::Closed) => {
       if let Err(e) = connection.client.shutdown().await {
         error!("Failed to shutdown client: {}", e);
       }
-      true
+      result |= 0b10;
+      result
     }
-    Err(_) => false,
+    Err(_) => result,
   }
 }
 
@@ -633,6 +658,11 @@ pub async fn connection_loop(
   loop {
     let current_span = Span::current();
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
+    let connection_blocked =
+      connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
+    if connection_blocked {
+      debug!("Connection blocked. {:?}", connection);
+    }
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
@@ -648,13 +678,25 @@ pub async fn connection_loop(
       }
       data = sink_to_client_pull.recv_direct() => {
         let sink_read_start = Instant::now();
-        let connection_terminating = process_sink_read(&mut connection, data).await;
+        let read_result = process_sink_read(&mut connection, data).await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
-        if connection_terminating {
+        if read_result & 0b01 == 0b01 {
+          connection.sequence += 1;
+          connection.largest_acked += 1;
+          let ack = create_ack_datagram(connection.identifier, connection.sequence, connection.largest_processed);
+          debug!("Sending ACK: {:?}", root_as_datagram(&ack).unwrap());
+          if client_to_sink_push.send(ack).await.is_err() {
+            error!("Failed to send ACK datagram, ending connection");
+          }
+        }
+        if read_result & 0b10 == 0b10 {
+          if let Err(e) = connection.client.shutdown().await {
+            error!("Failed to shutdown client: {}", e);
+          }
           break;
         }
       }
-      bytes_read = connection.client.read(&mut tcp_buf) => {
+      bytes_read = connection.client.read(&mut tcp_buf), if !connection_blocked => {
         connection.sequence += 1;
         let client_read_duration = Instant::now();
         let connection_terminating = handle_client_read(
@@ -974,13 +1016,13 @@ mod tests {
     sink_b.flush().await.unwrap();
 
     info!("Sending ACK datagram");
-    let ack_datagram = create_ack_datagram(2, 0);
+    let ack_datagram = create_ack_datagram(2, 0, 0);
     handle_sink_write(&mut sink_b, ack_datagram, &mut compression_buf).await.unwrap();
     let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(ack_datagram.identifier(), 2);
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
-    assert_eq!(ack_datagram.data().unwrap().bytes(), &[]);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
 
     // write more rubbish between datagrams
@@ -1055,7 +1097,7 @@ mod tests {
     setup_tracing().await;
     let cancel = CancellationToken::new();
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
-    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let data = Bytes::from_static(b"test data");
 
     let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
@@ -1077,12 +1119,20 @@ mod tests {
 
     let server_address = address_receiver.recv().await.unwrap();
     let mut client = TcpStream::connect(server_address).await.unwrap();
-    let datagram = create_data_datagram(0, 1, &data);
-    sink_to_client_push.broadcast_direct(datagram).await.unwrap();
+    let data_datagram = create_data_datagram(0, 1, &data);
+    sink_to_client_push.broadcast_direct(data_datagram).await.unwrap();
     let mut client_buf = BytesMut::zeroed(2048);
     let n = client.read(&mut client_buf).await.unwrap();
     assert_eq!(n, data.len());
     assert_eq!(data, client_buf[..n]);
+    let ack_bytes = client_to_sink_pull.recv().await.unwrap();
+    let ack = root_as_datagram(&ack_bytes).unwrap();
+    assert_eq!(ControlCode::Ack, ack.code());
+    assert_eq!(1, u64::from_be_bytes(ack.data().unwrap().bytes().try_into().unwrap()));
+    let close_datagram = create_close_datagram(0, 2);
+    sink_to_client_push.broadcast_direct(close_datagram).await.unwrap();
+    let n = client.read(&mut client_buf).await.unwrap();
+    assert_eq!(0, n);
   }
 
   #[tokio::test]
@@ -1182,7 +1232,7 @@ mod tests {
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert!(!process_sink_read(&mut connection, Ok(datagram),).await);
+    assert_eq!(0b01, process_sink_read(&mut connection, Ok(datagram)).await);
     handle.await.unwrap();
   }
 
@@ -1214,10 +1264,10 @@ mod tests {
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert!(!process_sink_read(&mut connection, Ok(datagram2)).await);
+    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram2)).await);
     assert!(connection.datagram_queue.contains_key(&2));
     assert_eq!(1, connection.datagram_queue.len());
-    assert!(!process_sink_read(&mut connection, Ok(datagram1)).await);
+    assert_eq!(0b01, process_sink_read(&mut connection, Ok(datagram1)).await);
     assert!(connection.datagram_queue.is_empty());
     handle.await.unwrap();
   }
@@ -1231,7 +1281,7 @@ mod tests {
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
 
-    assert!(!process_sink_read(&mut connection, Ok(data)).await);
+    assert_eq!(0b00, process_sink_read(&mut connection, Ok(data)).await);
   }
 
   #[tokio::test]
@@ -1244,7 +1294,7 @@ mod tests {
 
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(500, client);
-    assert!(!process_sink_read(&mut connection, Ok(datagram)).await);
+    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram)).await);
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(
       std::io::ErrorKind::WouldBlock,
@@ -1261,15 +1311,20 @@ mod tests {
 
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert!(process_sink_read(&mut connection, Ok(datagram)).await);
-    let mut client_buf = BytesMut::zeroed(2048);
-    assert_eq!(
-      0,
-      timeout(Duration::from_secs(1), connection.client.read(&mut client_buf))
-        .await
-        .unwrap()
-        .unwrap()
-    );
+    assert_eq!(0b10, process_sink_read(&mut connection, Ok(datagram)).await);
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_ack_datagram() {
+    setup_tracing().await;
+    let (target_address, _) = run_echo().await;
+    let identifier = 123;
+    let datagram = create_ack_datagram(identifier, 1, 10);
+
+    let client = TcpStream::connect(target_address).await.unwrap();
+    let mut connection = ConnectionState::new(identifier, client);
+    assert_ne!(0b01, process_sink_read(&mut connection, Ok(datagram)).await);
+    assert_eq!(10, connection.largest_acked);
   }
 
   #[tokio::test]
@@ -1294,7 +1349,7 @@ mod tests {
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
     connection.largest_processed += 1;
-    assert!(!process_sink_read(&mut connection, Ok(datagram)).await);
+    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram)).await);
     assert!(connection.datagram_queue.is_empty());
     handle.await.unwrap();
   }

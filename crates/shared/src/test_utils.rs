@@ -63,7 +63,7 @@ pub async fn receive_initial_ack_data(
     assert_eq!(initial_datagram.identifier(), identifier);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data);
-    let ack = create_ack_datagram(initial_datagram.identifier(), 0);
+    let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
     pipe_to_client_push.broadcast_direct(ack).await.unwrap();
     let data = client_to_pipe_pull.recv().await.unwrap();
     let data_datagram = root_as_datagram(&data).unwrap();

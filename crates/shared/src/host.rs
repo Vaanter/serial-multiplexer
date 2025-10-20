@@ -314,7 +314,7 @@ mod tests {
     assert_eq!(target_address.as_bytes(), initial_data);
     assert_eq!(identifier, initial_datagram.identifier());
     pipe_to_client_push
-      .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0))
+      .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
       .await
       .unwrap();
 
@@ -350,7 +350,7 @@ mod tests {
     let guest_task = tokio::spawn(async move {
       let initial = client_to_pipe_pull.recv().await.unwrap();
       let initial_datagram = root_as_datagram(&initial).unwrap();
-      let ack = create_ack_datagram(initial_datagram.identifier(), 0);
+      let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
       pipe_to_client_push.broadcast_direct(ack).await.unwrap();
     });
 
@@ -402,7 +402,7 @@ mod tests {
     assert_eq!(initial_datagram.identifier(), 0);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), target_addr.as_bytes());
-    let ack = create_ack_datagram(initial_datagram.identifier(), 0);
+    let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
     pipe_to_client_push.broadcast_direct(ack).await.unwrap();
     cancel.cancel();
     timeout(Duration::from_secs(1), initiator_task).await.unwrap().unwrap();
