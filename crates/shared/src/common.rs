@@ -17,7 +17,7 @@ use zeroize::Zeroize;
 
 /// Specifies how many datagrams without ACK a connection can have
 /// before the TCP connection gets plugged.
-const ACK_THRESHOLD: u64 = 64;
+const ACK_THRESHOLD: u64 = 32;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
@@ -56,6 +56,7 @@ static HEADER_FINDER: LazyLock<Finder<'static>> =
 /// * `client` (`TcpStream`) - The TCP communication stream associated with the client.
 /// * `sequence` (`u64`) - A counter tracking the sequence of the last sent datagram for the connection.
 /// * `largest_processed` (`u64`) - The largest sequence number that has been processed.
+/// * `largest_acked` (`u64`) - The largest sequence number for which this connection received an ACK.
 /// * `datagram_queue` (`BTreeMap<u64, Bytes>`) - A map (ordered by sequence number) storing datagrams
 ///   that are awaiting processing because they arrived out-of-order.
 #[derive(Debug)]
@@ -524,6 +525,29 @@ pub async fn handle_client_read(
 pub async fn process_sink_read(
   connection: &mut ConnectionState,
   data: Result<Bytes, async_broadcast::RecvError>,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+) -> bool {
+  let processing_result = process_datagram(connection, data).await;
+  if processing_result & 0b01 == 0b01 {
+    send_ack(connection, client_to_sink_push).await;
+  }
+  if processing_result & 0b10 == 0b10 {
+    if let Err(e) = connection.client.shutdown().await {
+      error!("Failed to shutdown client: {}", e);
+    }
+    connection.sequence += 1;
+    let datagram = create_close_datagram(connection.identifier, connection.sequence);
+    if let Err(e) = client_to_sink_push.send(datagram).await {
+      error!("Failed to send CLOSE datagram for connection: {}", e);
+    }
+    return true;
+  }
+  false
+}
+
+async fn process_datagram(
+  connection: &mut ConnectionState,
+  data: Result<Bytes, async_broadcast::RecvError>,
 ) -> u8 {
   let mut result = 0b00; // from right: should send ACK, should shut down client connection
   match data {
@@ -560,50 +584,7 @@ pub async fn process_sink_read(
           datagram_sequence, connection.largest_processed
         );
         connection.datagram_queue.insert(datagram_sequence, data_buf);
-        while let Some(datagram_buf) =
-          connection.datagram_queue.remove(&(connection.largest_processed + 1))
-        {
-          connection.largest_processed += 1;
-          let Ok(datagram) = root_as_datagram(&datagram_buf) else {
-            continue;
-          };
-          match datagram.code() {
-            ControlCode::Close => {
-              result |= 0b10;
-              return result;
-            }
-            ControlCode::Ack => {
-              if let Some(data) = datagram.data() {
-                let Ok(sequence_to_ack) = data.bytes().try_into() else {
-                  error!("Received ACK datagram with invalid sequence number!");
-                  result |= 0b10;
-                  return result;
-                };
-                connection.largest_acked = u64::from_be_bytes(sequence_to_ack);
-              }
-            }
-            ControlCode::Data => {
-              if let Some(data) = datagram.data() {
-                trace!("Sending data to client, size {}", data.len());
-                match connection.client.write_all(data.bytes()).await {
-                  Ok(()) => {
-                    trace!("Sent {} bytes to client", data.len());
-                    result |= 0b01;
-                  }
-                  Err(e) => {
-                    error!("Failed to write data to client: {}", e);
-                    result |= 0b10;
-                    return result;
-                  }
-                };
-              }
-            }
-            _ => {} // We don't care about other types (only Initial at the time of writing)
-          }
-        }
-        if let Err(e) = connection.client.flush().await {
-          error!("Failed to flush client data after writing data: {}", e);
-        }
+        result |= evaluate_datagram_queue(connection).await;
       } else {
         debug!("Received a datagram that was already processed before, ignoring");
       }
@@ -613,10 +594,72 @@ pub async fn process_sink_read(
       if let Err(e) = connection.client.shutdown().await {
         error!("Failed to shutdown client: {}", e);
       }
-      result |= 0b10;
-      result
+      result | 0b10
     }
     Err(_) => result,
+  }
+}
+
+async fn evaluate_datagram_queue(connection: &mut ConnectionState) -> u8 {
+  let mut result = 0b00;
+  while let Some(datagram_buf) =
+    connection.datagram_queue.remove(&(connection.largest_processed + 1))
+  {
+    connection.largest_processed += 1;
+    let Ok(datagram) = root_as_datagram(&datagram_buf) else {
+      continue;
+    };
+    match datagram.code() {
+      ControlCode::Close => {
+        result |= 0b10;
+        break;
+      }
+      ControlCode::Ack => {
+        if let Some(data) = datagram.data() {
+          let Ok(sequence_to_ack) = data.bytes().try_into() else {
+            error!("Received ACK datagram with invalid sequence number!");
+            result |= 0b10;
+            break;
+          };
+          connection.largest_acked = connection.sequence.min(u64::from_be_bytes(sequence_to_ack));
+        }
+      }
+      ControlCode::Data => {
+        if let Some(data) = datagram.data() {
+          trace!("Sending data to client, size {}", data.len());
+          match connection.client.write_all(data.bytes()).await {
+            Ok(()) => {
+              trace!("Sent {} bytes to client", data.len());
+              result |= 0b01;
+            }
+            Err(e) => {
+              error!("Failed to write data to client: {}", e);
+              result |= 0b10;
+              break;
+            }
+          };
+        }
+      }
+      _ => {} // We don't care about other types (only Initial at the time of writing)
+    }
+  }
+  if let Err(e) = connection.client.flush().await {
+    error!("Failed to flush client data after writing data: {}", e);
+  }
+  result
+}
+
+async fn send_ack(
+  connection: &mut ConnectionState,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+) {
+  connection.sequence += 1;
+  connection.largest_acked += 1;
+  let ack =
+    create_ack_datagram(connection.identifier, connection.sequence, connection.largest_processed);
+  debug!("Sending ACK: {:?}", root_as_datagram(&ack).unwrap());
+  if client_to_sink_push.send(ack).await.is_err() {
+    error!("Failed to send ACK datagram, ending connection");
   }
 }
 
@@ -672,33 +715,22 @@ pub async fn connection_loop(
         connection.sequence += 1;
         let datagram = create_close_datagram(connection.identifier, connection.sequence);
         if let Err(e) = client_to_sink_push.send(datagram).await {
-          error!("Failed to send CLOSE datagram for connection {}: {}", connection.identifier, e);
+          error!("Failed to send CLOSE datagram for connection: {}", e);
         }
         break;
       }
       data = sink_to_client_pull.recv_direct() => {
         let sink_read_start = Instant::now();
-        let read_result = process_sink_read(&mut connection, data).await;
+        let connection_terminating =
+          process_sink_read(&mut connection, data, &client_to_sink_push).instrument(current_span).await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
-        if read_result & 0b01 == 0b01 {
-          connection.sequence += 1;
-          connection.largest_acked += 1;
-          let ack = create_ack_datagram(connection.identifier, connection.sequence, connection.largest_processed);
-          debug!("Sending ACK: {:?}", root_as_datagram(&ack).unwrap());
-          if client_to_sink_push.send(ack).await.is_err() {
-            error!("Failed to send ACK datagram, ending connection");
-          }
-        }
-        if read_result & 0b10 == 0b10 {
-          if let Err(e) = connection.client.shutdown().await {
-            error!("Failed to shutdown client: {}", e);
-          }
-          break;
+        if connection_terminating {
+            break;
         }
       }
       bytes_read = connection.client.read(&mut tcp_buf), if !connection_blocked => {
         connection.sequence += 1;
-        let client_read_duration = Instant::now();
+        let client_read_start = Instant::now();
         let connection_terminating = handle_client_read(
           connection.identifier,
           connection.sequence,
@@ -706,7 +738,7 @@ pub async fn connection_loop(
           bytes_read,
           &mut tcp_buf,
         ).instrument(current_span).await;
-        trace!(target: METRICS_TARGET, duration = ?client_read_duration.elapsed(), "Finished processing client read");
+        trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
         if connection_terminating {
           break;
         }
@@ -1213,6 +1245,7 @@ mod tests {
   #[tokio::test]
   async fn test_process_sink_read_smoke() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data = BytesMut::from("test data");
     let datagram = create_data_datagram(identifier, 1, &data);
@@ -1232,13 +1265,14 @@ mod tests {
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert_eq!(0b01, process_sink_read(&mut connection, Ok(datagram)).await);
+    assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
     handle.await.unwrap();
   }
 
   #[tokio::test]
   async fn test_process_sink_read_out_of_order() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data1 = BytesMut::from("test data1");
     let data2 = BytesMut::from("test data2");
@@ -1264,10 +1298,10 @@ mod tests {
     let server_address = address_receiver.recv().await.unwrap();
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram2)).await);
+    assert!(!process_sink_read(&mut connection, Ok(datagram2), &client_to_sink_push).await);
     assert!(connection.datagram_queue.contains_key(&2));
     assert_eq!(1, connection.datagram_queue.len());
-    assert_eq!(0b01, process_sink_read(&mut connection, Ok(datagram1)).await);
+    assert!(!process_sink_read(&mut connection, Ok(datagram1), &client_to_sink_push).await);
     assert!(connection.datagram_queue.is_empty());
     handle.await.unwrap();
   }
@@ -1275,18 +1309,20 @@ mod tests {
   #[tokio::test]
   async fn test_process_sink_read_invalid_datagram() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
     let data = Bytes::from("invalid test data");
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
 
-    assert_eq!(0b00, process_sink_read(&mut connection, Ok(data)).await);
+    assert!(!process_sink_read(&mut connection, Ok(data), &client_to_sink_push).await);
   }
 
   #[tokio::test]
   async fn test_process_sink_read_different_identifier() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
     let data = BytesMut::from("test data");
@@ -1294,7 +1330,7 @@ mod tests {
 
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(500, client);
-    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram)).await);
+    assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(
       std::io::ErrorKind::WouldBlock,
@@ -1305,31 +1341,71 @@ mod tests {
   #[tokio::test]
   async fn test_process_sink_read_close_datagram() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
     let datagram = create_close_datagram(identifier, 1);
 
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert_eq!(0b10, process_sink_read(&mut connection, Ok(datagram)).await);
+    assert!(process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
   }
 
   #[tokio::test]
   async fn test_process_sink_read_ack_datagram() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
     let datagram = create_ack_datagram(identifier, 1, 10);
 
     let client = TcpStream::connect(target_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
-    assert_ne!(0b01, process_sink_read(&mut connection, Ok(datagram)).await);
-    assert_eq!(10, connection.largest_acked);
+    connection.sequence = 5;
+    assert_eq!(0, connection.largest_acked);
+    assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
+    assert_eq!(5, connection.largest_acked);
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_multi_ack_datagram() {
+    setup_tracing().await;
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+    let (target_address_a, _) = run_echo().await;
+    let (target_address_b, _) = run_echo().await;
+    let identifier = 123;
+
+    let client_a = TcpStream::connect(target_address_a).await.unwrap();
+    let client_b = TcpStream::connect(target_address_b).await.unwrap();
+    let mut connection_a = ConnectionState::new(identifier, client_a);
+    let mut connection_b = ConnectionState::new(identifier, client_b);
+
+    for i in (2..21).rev() {
+      connection_a.datagram_queue.insert(i, create_data_datagram(identifier, i, b"test"));
+    }
+    let data_datagram = create_data_datagram(identifier, 1, b"test");
+    assert_eq!(0, connection_a.largest_acked);
+    assert_eq!(0, connection_a.sequence);
+    connection_b.sequence = 20;
+    assert!(!process_sink_read(&mut connection_a, Ok(data_datagram), &client_to_sink_push).await);
+    let ack_data = client_to_sink_pull.recv().await.unwrap();
+    let ack_datagram = root_as_datagram(&ack_data).unwrap();
+    assert_eq!(1, connection_a.largest_acked);
+    assert_eq!(1, connection_a.sequence);
+    assert_eq!(identifier, ack_datagram.identifier());
+    assert_eq!(ControlCode::Ack, ack_datagram.code());
+    assert_eq!(connection_a.sequence, ack_datagram.sequence());
+    assert_eq!(20, u64::from_be_bytes(ack_datagram.data().unwrap().bytes().try_into().unwrap()));
+
+    assert!(!process_sink_read(&mut connection_b, Ok(ack_data), &client_to_sink_push).await);
+    assert_eq!(20, connection_b.largest_acked);
+    assert!(client_to_sink_pull.try_recv().is_err());
   }
 
   #[tokio::test]
   async fn test_process_sink_old_datagram() {
     setup_tracing().await;
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data = BytesMut::from("test data");
     let datagram = create_data_datagram(identifier, 1, &data);
@@ -1349,7 +1425,7 @@ mod tests {
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
     connection.largest_processed += 1;
-    assert_eq!(0b00, process_sink_read(&mut connection, Ok(datagram)).await);
+    assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
     assert!(connection.datagram_queue.is_empty());
     handle.await.unwrap();
   }
