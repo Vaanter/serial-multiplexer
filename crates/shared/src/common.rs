@@ -149,23 +149,6 @@ pub async fn sink_loop(
         }
         return;
       }
-      data = client_to_sink_pull.recv() => {
-        match data {
-          Ok(data) => {
-            let sink_write_duration = Instant::now();
-            let result = handle_sink_write(&mut sink, data, &mut compression_buffer).instrument(current_span).await;
-            trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
-            if let Err(e) = result {
-              error!("Failed to handle sink write: {}", e);
-              break;
-            }
-          },
-          Err(e) => {
-            info!("Sink receiver closed, {}", e);
-            break;
-          }
-        }
-      }
       n = sink.read(&mut sink_buf[unprocessed_data_start..]) => {
         match n {
           Ok(0) => {
@@ -186,6 +169,23 @@ pub async fn sink_loop(
           }
           Err(e) => {
             error!("Failed to read from sink: {}", e);
+            break;
+          }
+        }
+      }
+      data = client_to_sink_pull.recv() => {
+        match data {
+          Ok(data) => {
+            let sink_write_duration = Instant::now();
+            let result = handle_sink_write(&mut sink, data, &mut compression_buffer).instrument(current_span).await;
+            trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
+            if let Err(e) = result {
+              error!("Failed to handle sink write: {}", e);
+              break;
+            }
+          },
+          Err(e) => {
+            info!("Sink receiver closed, {}", e);
             break;
           }
         }
