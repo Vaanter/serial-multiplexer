@@ -365,8 +365,8 @@ pub mod common {
     info!("Created HTTP listener at {}", listener_address);
     Ok(tokio::spawn(run_http_listener(
       listener,
-      client_to_sink_push,
       sink_to_client_pull,
+      client_to_sink_push,
       connection_sender,
       cancel,
     )))

@@ -15,11 +15,28 @@ use tracing_attributes::instrument;
 
 type ServerBuilder = hyper::server::conn::http1::Builder;
 
+/// Runs an HTTP proxy listener that accepts CONNECT requests and tunnels TCP connections.
+///
+/// Accepts incoming TCP connections, serves them as HTTP/1.1, and handles HTTP CONNECT
+/// method requests to establish TCP tunnels through the proxy.
+/// The listener runs until the cancellation token is triggered.
+///
+/// # Parameters
+///
+/// * `listener`: A [`TcpListener`] whose connections will be accepted.
+/// * `sink_to_client_pull`:
+///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
+/// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
+///   sink(s) when initiating a connection.
+/// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
+///   [`crate::host::connection_initiator`] after initiation succeeds.
+/// * `cancel`:
+///   A [`CancellationToken`] used to signal loop termination due to the app shutting down.
 #[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
 pub async fn run_http_listener(
   listener: TcpListener,
-  client_to_sink_push: async_channel::Sender<Bytes>,
   sink_to_client_pull: async_broadcast::Receiver<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
@@ -38,8 +55,8 @@ pub async fn run_http_listener(
             info!("Client connected: {}", client_address);
             handle_http_connection(
               client,
-              client_to_sink_push.clone(),
               sink_to_client_pull_inactive.clone(),
+              client_to_sink_push.clone(),
               connection_sender.clone(),
             );
           }
@@ -53,10 +70,21 @@ pub async fn run_http_listener(
   }
 }
 
+/// Spawns a tokio task to serve a connection with HTTP upgrade support via [`hyper`].
+///
+/// # Parameters
+///
+/// * `client`: The TCP stream for the connected client.
+/// * `sink_to_client_pull`:
+///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
+/// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
+///   sink(s) when initiating a connection.
+/// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
+///   [`crate::host::connection_initiator`] after initiation succeeds.
 fn handle_http_connection(
   client: TcpStream,
-  client_to_sink_push: async_channel::Sender<Bytes>,
   sink_to_client_pull: async_broadcast::InactiveReceiver<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
 ) {
   let io = TokioIo::new(client);
@@ -83,6 +111,24 @@ fn handle_http_connection(
   });
 }
 
+/// Handles an HTTP request and initiates a connection after receiving a CONNECT method request.
+///
+/// Processes HTTP CONNECT requests by initiating a connection to a target address,
+/// upgrading the HTTP connection to a TCP tunnel, and sending the connection state to the
+/// [`crate::host::connection_initiator`].
+/// Returns a 400 response for non-CONNECT requests, requests that do not have a valid authority
+/// in their URI, and when initiating a connection fails.
+///
+/// # Parameters
+///
+/// * `req`: The incoming HTTP request.
+/// * `identifier`: A unique identifier for this connection.
+/// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
+///   sink(s) when initiating a connection.
+/// * `sink_to_client_pull`:
+///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
+/// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
+///   [`crate::host::connection_initiator`] after initiation succeeds.
 async fn serve_http(
   req: Request<hyper::body::Incoming>,
   identifier: u64,
@@ -93,24 +139,11 @@ async fn serve_http(
   debug!("Received request: {:?}", req);
 
   if Method::CONNECT == req.method() {
-    // Received an HTTP request like:
-    // ```
-    // CONNECT www.domain.com:443 HTTP/1.1
-    // Host: www.domain.com:443
-    // Proxy-Connection: Keep-Alive
-    // ```
-    //
-    // When HTTP method is CONNECT we should return an empty body,
-    // then we can eventually upgrade the connection and talk a new protocol.
-    //
-    // Note: only after client received an empty body with STATUS_OK can the
-    // connection be upgraded, so we can't return a response inside
-    // `on_upgrade` future.
-    if let Some(addr) = host_addr(req.uri()) {
+    if let Some(target_address) = extract_authority(req.uri()) {
       let mut sink_to_client_pull = sink_to_client_pull.activate();
       let connect_result = crate::host::initiate_connection(
         identifier,
-        addr.to_string(),
+        target_address.to_string(),
         &client_to_sink_push,
         &mut sink_to_client_pull,
       )
@@ -133,36 +166,121 @@ async fn serve_http(
         });
       } else {
         info!("Failed to initialize connection, sending 400 status.");
-        let mut resp = Response::new(empty());
-        *resp.status_mut() = StatusCode::BAD_REQUEST;
-        return Ok(resp);
+        return Ok(create_400_response(None::<Bytes>));
       }
 
       Ok(Response::new(empty()))
     } else {
-      error!("CONNECT host is not socket addr: {:?}", req.uri());
-      let mut resp = Response::new(full("CONNECT must be to a socket address"));
-      *resp.status_mut() = StatusCode::BAD_REQUEST;
-
-      Ok(resp)
+      debug!("Target address invalid: {:?}", req.uri());
+      Ok(create_400_response(Some("Target address is invalid!")))
     }
   } else {
-    let response = Response::builder()
-      .status(StatusCode::BAD_REQUEST)
-      .body(empty())
-      .expect("Empty 400 response shouldn't have a reason to fail");
-    Ok(response.map(|b| b.boxed()))
+    Ok(create_400_response(Some("Only the CONNECT method is supported")))
   }
 }
 
-fn host_addr(uri: &http::Uri) -> Option<String> {
+/// Extracts the authority part of a URI
+fn extract_authority(uri: &http::Uri) -> Option<String> {
   uri.authority().map(|auth| auth.to_string())
 }
 
+/// Creates a boxed, empty body of an HTTP request
 fn empty() -> BoxBody<Bytes, hyper::Error> {
   Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
 }
 
-fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
+/// Creates a boxed body of an HTTP request with a single chunk
+fn full(chunk: impl Into<Bytes>) -> BoxBody<Bytes, hyper::Error> {
   Full::new(chunk.into()).map_err(|never| match never {}).boxed()
+}
+
+fn create_400_response(body: Option<impl Into<Bytes>>) -> Response<BoxBody<Bytes, hyper::Error>> {
+  let mut response = match body {
+    Some(body) => Response::new(full(body)),
+    None => Response::new(empty()),
+  };
+  *response.status_mut() = StatusCode::BAD_REQUEST;
+  response
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::host::ConnectionType;
+  use crate::protocol_utils::create_ack_datagram;
+  use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
+  use crate::test_utils::{run_echo, setup_tracing};
+  use bytes::Bytes;
+  use http_body_util::BodyExt;
+  use tokio::net::{TcpListener, TcpStream};
+  use tokio::sync::mpsc;
+  use tokio_util::sync::CancellationToken;
+
+  #[tokio::test]
+  async fn test_create_400_response_empty() {
+    let response = create_400_response(None::<&str>);
+    assert_eq!(400, response.status().as_u16());
+    assert_eq!(Bytes::new(), response.into_body().collect().await.unwrap().to_bytes());
+  }
+
+  #[tokio::test]
+  async fn test_create_400_response_with_str_content() {
+    let content = "test content";
+    let response = create_400_response(Some(content));
+    assert_eq!(400, response.status().as_u16());
+    assert_eq!(content.as_bytes(), response.into_body().collect().await.unwrap().to_bytes());
+  }
+
+  #[tokio::test]
+  async fn test_create_400_response_with_bytes_content() {
+    let content = Bytes::from_static("test content".as_bytes());
+    let response = create_400_response(Some(content.clone()));
+    assert_eq!(400, response.status().as_u16());
+    assert_eq!(content, response.into_body().collect().await.unwrap().to_bytes());
+  }
+
+  #[tokio::test]
+  async fn test_run_http_listener_smoke() {
+    type ClientBuilder = hyper::client::conn::http1::Builder;
+    setup_tracing().await;
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(4);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(4);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener_address = listener.local_addr().unwrap();
+    let (target_address, _) = run_echo().await;
+    info!("Echo server running at {:?}", target_address);
+    let connection_type = ConnectionType::Http;
+    let (connection_sender, mut connection_receiver) = mpsc::channel(4);
+    tokio::spawn(run_http_listener(
+      listener,
+      sink_to_client_pull,
+      client_to_sink_push,
+      connection_sender,
+      CancellationToken::new(),
+    ));
+    let test_connection = TcpStream::connect(listener_address).await.unwrap();
+    let (mut sender, conn) =
+      ClientBuilder::new().handshake(TokioIo::new(test_connection)).await.unwrap();
+    let request =
+      Request::builder().method("CONNECT").uri(target_address.to_string()).body(empty()).unwrap();
+    tokio::spawn(conn.with_upgrades());
+    tokio::spawn(async move {
+      let recv = client_to_sink_pull.recv().await.unwrap();
+      let initial_datagram = root_as_datagram(&recv).unwrap();
+      assert_eq!(0, initial_datagram.sequence());
+      assert_eq!(ControlCode::Initial, initial_datagram.code());
+      assert_eq!(target_address.to_string().as_bytes(), initial_datagram.data().unwrap().bytes());
+      sink_to_client_push
+        .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
+        .await
+        .unwrap();
+    });
+    let resp = sender.send_request(request).await.unwrap();
+    assert_eq!(200, resp.status());
+    let (connection, connection_type_received) = connection_receiver.recv().await.unwrap();
+    assert_eq!(connection_type_received, connection_type);
+    let upgraded = hyper::upgrade::on(resp).await.unwrap();
+    let client = upgraded.downcast::<TokioIo<TcpStream>>().unwrap().io;
+    assert_eq!(connection.client.peer_addr().unwrap(), client.inner().local_addr().unwrap());
+  }
 }
