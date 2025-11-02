@@ -16,7 +16,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use tracing_attributes::instrument;
 
+#[cfg(not(test))]
 pub(crate) static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Since this is static, if the tests run in different order between multiple test runs, they
+// could fail indeterministically if they use a constant connection identifier in assertions
+#[cfg(test)]
+pub(crate) static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(100);
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ConnectionType {
@@ -280,7 +285,6 @@ mod tests {
     let test_connection = TcpStream::connect(listener_address).await.unwrap();
     let (connection, connection_type_received) = connection_receiver.recv().await.unwrap();
     assert_eq!(connection_type_received, connection_type);
-    assert_eq!(0, connection.identifier);
     assert_eq!(connection.client.peer_addr().unwrap(), test_connection.local_addr().unwrap());
   }
 
