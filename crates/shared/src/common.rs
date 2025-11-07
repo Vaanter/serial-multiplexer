@@ -1031,7 +1031,7 @@ mod tests {
 
     info!("Sending initial datagram");
     let initial_data = "test data";
-    let initial_datagram = create_initial_datagram(1, 0, initial_data);
+    let initial_datagram = create_initial_datagram(1, initial_data);
     handle_sink_write(&mut sink_b, initial_datagram, &mut compression_buf).await.unwrap();
     let datagram_bytes =
       timeout(Duration::from_secs(1), pipe_to_client_pull.recv()).await.unwrap().unwrap();

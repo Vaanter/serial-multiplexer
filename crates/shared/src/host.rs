@@ -218,7 +218,7 @@ pub(crate) async fn initiate_connection(
   client_to_sink_push: &async_channel::Sender<Bytes>,
   sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
 ) -> bool {
-  let initial_datagram = create_initial_datagram(connection_identifier, 0, &target_address);
+  let initial_datagram = create_initial_datagram(connection_identifier, &target_address);
   trace!(target: HUGE_DATA_TARGET, "Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
   if let Err(e) = client_to_sink_push.send(initial_datagram).await {
     info!("Failed to initialize connection: {}", e);

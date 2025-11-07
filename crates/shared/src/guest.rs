@@ -171,7 +171,7 @@ mod tests {
     let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let datagram = create_initial_datagram(123, 0, &target_address);
+    let datagram = create_initial_datagram(123, &target_address);
 
     let connection =
       initiate_client_connection(datagram, client_to_serial_push.clone()).await.unwrap().unwrap();
@@ -202,7 +202,7 @@ mod tests {
     let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let initial = create_initial_datagram(123, 0, &target_address);
+    let initial = create_initial_datagram(123, &target_address);
 
     tokio::spawn(client_initiator(
       serial_to_client_pull,
@@ -224,7 +224,7 @@ mod tests {
     let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
     let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
     let target_address = "127.0.0.1:0".to_string();
-    let initial = create_initial_datagram(123, 0, &target_address);
+    let initial = create_initial_datagram(123, &target_address);
 
     tokio::spawn(client_initiator(
       serial_to_client_pull,
