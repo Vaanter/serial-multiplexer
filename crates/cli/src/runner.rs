@@ -18,7 +18,7 @@ pub mod common {
   use tokio::time::{MissedTickBehavior, interval};
   use tokio_serial::SerialPortBuilderExt;
   use tokio_util::sync::CancellationToken;
-  use tracing::{debug, error, info};
+  use tracing::{debug, error, info, trace};
 
   pub async fn create_host_tasks(
     properties: Host,
@@ -110,7 +110,7 @@ pub mod common {
           Some(c) => c.capacity(),
           None => 0,
         };
-        debug!(target: "serial_multiplexer::CCW", "CTS: {}, STC: {}, CS: {}", cts_len, stc_len, cs_len);
+        trace!(target: "serial_multiplexer::CCW", "CTS: {}, STC: {}, CS: {}", cts_len, stc_len, cs_len);
       }
     });
   }
