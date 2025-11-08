@@ -46,7 +46,16 @@ fn main() -> anyhow::Result<()> {
 
   Registry::default().with(fmt_layer).init();
   debug!("config: {:?}", config);
+  match execute(config) {
+    Ok(()) => Ok(()),
+    Err(e) => {
+      error!("{}", e);
+      Err(e)
+    }
+  }
+}
 
+fn execute(config: ConfigArgs) -> anyhow::Result<()> {
   let runtime = match config.threads {
     Some(0) => {
       bail!("At least one worker thread is required!");
