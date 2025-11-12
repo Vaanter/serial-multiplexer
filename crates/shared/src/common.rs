@@ -7,9 +7,10 @@ use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace};
 use tracing_attributes::instrument;
@@ -704,7 +705,21 @@ pub async fn connection_loop(
     let connection_blocked =
       connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
     if connection_blocked {
-      debug!("Connection blocked. {:?}", connection);
+      trace!("Connection blocked. {:?}", connection);
+      match connection.client.peek(&mut tcp_buf).await {
+        Ok(0) => {
+          debug!("Connection closed while blocked");
+          send_close_datagram(&mut connection, &client_to_sink_push).await;
+          break;
+        }
+        Ok(_) => {}
+        Err(e) => {
+          error!("Error peeking at blocked connection: {}", e);
+          send_close_datagram(&mut connection, &client_to_sink_push).await;
+          break;
+        }
+      }
+      tcp_buf.zeroize();
     }
     tokio::select! {
       biased;
@@ -712,11 +727,7 @@ pub async fn connection_loop(
         if let Err(e) = connection.client.shutdown().await {
           error!("Failed to shutdown client after server shutdown: {}", e);
         }
-        connection.sequence += 1;
-        let datagram = create_close_datagram(connection.identifier, connection.sequence);
-        if let Err(e) = client_to_sink_push.send(datagram).await {
-          error!("Failed to send CLOSE datagram for connection: {}", e);
-        }
+        send_close_datagram(&mut connection, &client_to_sink_push).await;
         break;
       }
       data = sink_to_client_pull.recv_direct() => {
@@ -725,7 +736,7 @@ pub async fn connection_loop(
           process_sink_read(&mut connection, data, &client_to_sink_push).instrument(current_span).await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
         if connection_terminating {
-            break;
+          break;
         }
       }
       bytes_read = connection.client.read(&mut tcp_buf), if !connection_blocked => {
@@ -743,9 +754,24 @@ pub async fn connection_loop(
           break;
         }
       }
+      () = sleep(Duration::from_secs(3)), if connection_blocked => {
+        // Loop now and then to check if the connection hasn't closed while it's blocked
+      }
     }
   }
   debug!("Connection {} loop ending", connection.identifier);
+}
+
+async fn send_close_datagram(
+  connection: &mut ConnectionState,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+) {
+  trace!("Sending CLOSE datagram");
+  connection.sequence += 1;
+  let datagram = create_close_datagram(connection.identifier, connection.sequence);
+  if let Err(e) = client_to_sink_push.send(datagram).await {
+    error!("Failed to send CLOSE datagram for connection: {}", e);
+  }
 }
 
 #[cfg(test)]
@@ -759,6 +785,7 @@ mod tests {
   use std::time::Duration;
   use tokio::net::{TcpListener, TcpStream};
   use tokio::sync::mpsc;
+  use tokio::task::JoinHandle;
   use tokio::time::timeout;
 
   #[tokio::test]
@@ -1165,6 +1192,49 @@ mod tests {
     sink_to_client_push.broadcast_direct(close_datagram).await.unwrap();
     let n = client.read(&mut client_buf).await.unwrap();
     assert_eq!(0, n);
+  }
+
+  #[tokio::test]
+  async fn test_connection_loop_blocked_timeout() {
+    setup_tracing().await;
+    let identifier = 0;
+    let cancel = CancellationToken::new();
+    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let (loop_task_sender, mut loop_task_receiver) = mpsc::channel::<JoinHandle<()>>(1);
+    let _handle = tokio::spawn(async move {
+      let listener = create_upstream_listener("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      address_sender.send(address).await.unwrap();
+      let (client, _) = listener.accept().await.unwrap();
+
+      let mut connection = ConnectionState::new(identifier, client);
+      connection.sequence += ACK_THRESHOLD + 1;
+      loop_task_sender
+        .send(tokio::spawn(connection_loop(
+          connection,
+          sink_to_client_pull,
+          client_to_sink_push.clone(),
+          cancel.clone(),
+        )))
+        .await
+        .unwrap();
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let mut client = TcpStream::connect(server_address).await.unwrap();
+    let loop_task =
+      timeout(Duration::from_secs(1), loop_task_receiver.recv()).await.unwrap().unwrap();
+    client.shutdown().await.unwrap();
+    let close_data =
+      timeout(Duration::from_secs(1), client_to_sink_pull.recv()).await.unwrap().unwrap();
+    let close_datagram = root_as_datagram(&close_data).unwrap();
+    assert_eq!(close_datagram.code(), ControlCode::Close);
+    assert_eq!(close_datagram.identifier(), identifier);
+    timeout(Duration::from_secs(1), _handle).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), loop_task).await.unwrap().unwrap();
   }
 
   #[tokio::test]
