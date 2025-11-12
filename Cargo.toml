@@ -1,6 +1,6 @@
 [workspace.package]
 authors = ["Valentín Bolfík <valentin.bolfik@gmail.com>"]
-version = "0.8.0-rc.1"
+version = "0.8.0-rc.2"
 edition = "2024"
 
 [workspace]
@@ -29,7 +29,7 @@ figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.31"
 http = "1.3.1"
 http-body-util = "0.1.3"
-hyper = { version = "1.7.0", features = ["http1", "client", "server"] }
+hyper = { version = "1.8.0", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1.17", features = ["http1", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
