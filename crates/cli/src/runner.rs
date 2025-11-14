@@ -478,9 +478,9 @@ mod windows {
   /// # Parameters:
   /// * `properties`: A reference to [`Host`], a struct that contains the `pipe_paths`
   ///   property, which specifies paths to the named pipes.
-  /// * `pipe_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///   client loops.
-  /// * `client_to_pipe_pull`: An [`async_channel::Receiver`], through which the sink loop
+  /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the
   ///   loop(s) should terminate.
@@ -490,8 +490,8 @@ mod windows {
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
     properties: &WindowsPipeHost,
-    pipe_to_client_push: async_broadcast::Sender<Bytes>,
-    client_to_pipe_pull: async_channel::Receiver<Bytes>,
+    sink_to_client_push: async_broadcast::Sender<Bytes>,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     let mut pipes_ok = Vec::new();
@@ -533,10 +533,10 @@ mod windows {
     let pipe_loops = FuturesUnordered::new();
     for pipe in pipes_ok {
       let cancel = cancel.clone();
-      let pipe_to_client_push = pipe_to_client_push.clone();
-      let client_to_pipe_pull = client_to_pipe_pull.clone();
+      let sink_to_client_push = sink_to_client_push.clone();
+      let client_to_sink_pull = client_to_sink_pull.clone();
       let pipe_task =
-        tokio::spawn(sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel));
+        tokio::spawn(sink_loop(pipe, sink_to_client_push, client_to_sink_pull, cancel));
       pipe_loops.push(pipe_task);
     }
     Ok(pipe_loops)
@@ -554,7 +554,7 @@ mod windows {
     use tokio::net::windows::named_pipe::ServerOptions;
     use tokio::time::timeout;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn create_windows_pipe_loops_non_existent_test() {
       setup_tracing().await;
       let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);

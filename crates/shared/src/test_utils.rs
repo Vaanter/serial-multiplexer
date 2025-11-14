@@ -53,19 +53,19 @@ pub async fn run_echo() -> (SocketAddr, JoinHandle<()>) {
 pub async fn receive_initial_ack_data(
   identifier: u64,
   initial_data: Bytes,
-  client_to_pipe_pull: async_channel::Receiver<Bytes>,
-  pipe_to_client_push: async_broadcast::Sender<Bytes>,
+  client_to_sink_pull: async_channel::Receiver<Bytes>,
+  sink_to_client_push: async_broadcast::Sender<Bytes>,
   data_datagram_contents: Bytes,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
-    let initial = client_to_pipe_pull.recv().await.unwrap();
+    let initial = client_to_sink_pull.recv().await.unwrap();
     let initial_datagram = root_as_datagram(&initial).unwrap();
     assert_eq!(initial_datagram.identifier(), identifier);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data);
     let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
-    pipe_to_client_push.broadcast_direct(ack).await.unwrap();
-    let data = client_to_pipe_pull.recv().await.unwrap();
+    sink_to_client_push.broadcast_direct(ack).await.unwrap();
+    let data = client_to_sink_pull.recv().await.unwrap();
     let data_datagram = root_as_datagram(&data).unwrap();
     assert_eq!(data_datagram.identifier(), identifier);
     assert_eq!(data_datagram.code(), ControlCode::Data);

@@ -395,7 +395,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 ///
 /// * `identifier`: A unique identifier for the client connection.
 /// * `sequence`: The current datagram sequence number for the connection, used for ordering data.
-/// * `client_to_pipe_push`: An async channel sender used to send datagrams to [`sink_loop`].
+/// * `client_to_sink_push`: An async channel sender used to send datagrams to [`sink_loop`].
 /// * `bytes_read`: The result of a read operation indicating the number of bytes read or an error.
 /// * `read_buf`: A mutable buffer containing the bytes read from the client connection.
 ///
@@ -423,7 +423,7 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 pub async fn handle_client_read(
   identifier: u64,
   sequence: u64,
-  client_to_pipe_push: async_channel::Sender<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
   bytes_read: std::io::Result<usize>,
   read_buf: &mut BytesMut,
 ) -> bool {
@@ -442,7 +442,7 @@ pub async fn handle_client_read(
       trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", datagram.as_ref());
       read_buf[..n].zeroize();
       debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
-      if let Err(e) = client_to_pipe_push.send(datagram).await {
+      if let Err(e) = client_to_sink_push.send(datagram).await {
         error!("Failed to send DATA datagram for connection {}: {}", identifier, e);
         true
       } else {
@@ -456,7 +456,7 @@ pub async fn handle_client_read(
   };
   if connection_ending {
     let datagram = create_close_datagram(identifier, sequence);
-    if let Err(e) = client_to_pipe_push.send(datagram).await {
+    if let Err(e) = client_to_sink_push.send(datagram).await {
       error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
     }
   }
@@ -682,7 +682,7 @@ async fn send_ack(
 /// 1. **Cancellation signal**: If `cancel.cancelled()` is triggered, the connection is closed
 ///    gracefully by shutting down the client, sending a [`Close`] datagram and exiting the loop.
 /// 2. **Incoming data from the server**:
-///    When [`pipe_to_client_pull.recv()`] receives data from sink,
+///    When [`sink_to_client_pull.recv()`] receives data from sink,
 ///    it uses [`process_sink_read()`] to handle and forward the data to the client.
 ///    The processing might signal connection termination, which breaks the loop.
 /// 3. **Incoming data from the client**:
@@ -1046,13 +1046,13 @@ mod tests {
     setup_tracing().await;
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, mut pipe_to_client_pull) = async_broadcast::broadcast(256);
-    let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    let _pipe_loop_handle = tokio::spawn(sink_loop(
+    let _sink_loop_handle = tokio::spawn(sink_loop(
       sink_a,
-      pipe_to_client_push.clone(),
-      client_to_pipe_pull,
+      sink_to_client_push.clone(),
+      client_to_sink_pull,
       cancel.clone(),
     ));
 
@@ -1061,7 +1061,7 @@ mod tests {
     let initial_datagram = create_initial_datagram(1, initial_data);
     handle_sink_write(&mut sink_b, initial_datagram, &mut compression_buf).await.unwrap();
     let datagram_bytes =
-      timeout(Duration::from_secs(1), pipe_to_client_pull.recv()).await.unwrap().unwrap();
+      timeout(Duration::from_secs(1), sink_to_client_pull.recv()).await.unwrap().unwrap();
     let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(initial_datagram.identifier(), 1);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
@@ -1077,7 +1077,7 @@ mod tests {
     info!("Sending ACK datagram");
     let ack_datagram = create_ack_datagram(2, 0, 0);
     handle_sink_write(&mut sink_b, ack_datagram, &mut compression_buf).await.unwrap();
-    let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+    let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(ack_datagram.identifier(), 2);
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
@@ -1102,7 +1102,7 @@ mod tests {
       data.resize(data_size, 100u8);
       let data_datagram = create_data_datagram(i as u64, 1, &data);
       handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf).await.unwrap();
-      let datagram_bytes = pipe_to_client_pull.recv().await.unwrap();
+      let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
       let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
       assert_eq!(data_datagram.identifier(), i as u64);
       assert_eq!(data_datagram.code(), ControlCode::Data);
@@ -1115,21 +1115,21 @@ mod tests {
   async fn test_sink_loop_write() {
     setup_tracing().await;
     let (sink_a, sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push_write, _pipe_to_client_pull_write) = async_broadcast::broadcast(256);
-    let (pipe_to_client_push_read, mut pipe_to_client_pull_read) = async_broadcast::broadcast(256);
-    let (client_to_pipe_push_write, client_to_pipe_pull_write) = async_channel::bounded(256);
-    let (_client_to_pipe_push_read, client_to_pipe_pull_read) = async_channel::bounded(256);
+    let (sink_to_client_push_write, _sink_to_client_pull_write) = async_broadcast::broadcast(256);
+    let (sink_to_client_push_read, mut sink_to_client_pull_read) = async_broadcast::broadcast(256);
+    let (client_to_sink_push_write, client_to_sink_pull_write) = async_channel::bounded(256);
+    let (_client_to_sink_push_read, client_to_sink_pull_read) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    let _pipe_loop_write_handle = tokio::spawn(sink_loop(
+    let _sink_loop_write_handle = tokio::spawn(sink_loop(
       sink_a,
-      pipe_to_client_push_write.clone(),
-      client_to_pipe_pull_write.clone(),
+      sink_to_client_push_write.clone(),
+      client_to_sink_pull_write.clone(),
       cancel.clone(),
     ));
-    let _pipe_loop_read_handle = tokio::spawn(sink_loop(
+    let _sink_loop_read_handle = tokio::spawn(sink_loop(
       sink_b,
-      pipe_to_client_push_read.clone(),
-      client_to_pipe_pull_read.clone(),
+      sink_to_client_push_read.clone(),
+      client_to_sink_pull_read.clone(),
       cancel.clone(),
     ));
 
@@ -1139,10 +1139,10 @@ mod tests {
       data.resize(data_size, 100u8);
       let data_copy = Bytes::copy_from_slice(&data);
       data.resize(CONNECTION_BUFFER_SIZE, 50u8);
-      handle_client_read(3, i as u64, client_to_pipe_push_write.clone(), Ok(data_size), &mut data)
+      handle_client_read(3, i as u64, client_to_sink_push_write.clone(), Ok(data_size), &mut data)
         .await;
       let datagram_bytes =
-        timeout(Duration::from_secs(1), pipe_to_client_pull_read.recv()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(1), sink_to_client_pull_read.recv()).await.unwrap().unwrap();
       let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
       assert_eq!(initial_datagram.identifier(), 3);
       assert_eq!(initial_datagram.code(), ControlCode::Data);
@@ -1278,14 +1278,14 @@ mod tests {
     setup_tracing().await;
     let contents = "test data";
     let mut bytes = BytesMut::from(contents);
-    let (pipe_push, pipe_pull) = async_channel::bounded(1);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(1);
 
     let identifier = 123;
     let bytes_read = Ok(bytes.len());
 
-    assert!(!handle_client_read(identifier, 1, pipe_push, bytes_read, &mut bytes).await);
-    let pipe_read = pipe_pull.recv().await.unwrap();
-    let datagram = root_as_datagram(&pipe_read).expect("Received datagram should be valid");
+    assert!(!handle_client_read(identifier, 1, client_to_sink_push, bytes_read, &mut bytes).await);
+    let sink_read = client_to_sink_pull.recv().await.unwrap();
+    let datagram = root_as_datagram(&sink_read).expect("Received datagram should be valid");
     assert_eq!(datagram.identifier(), identifier);
     assert_eq!(datagram.code(), ControlCode::Data);
     assert_eq!(datagram.data().unwrap().bytes(), contents.as_bytes());
@@ -1295,21 +1295,27 @@ mod tests {
   #[tokio::test]
   async fn test_handle_client_read_client_disconnect() {
     setup_tracing().await;
-    let (pipe_push, _pipe_pull) = async_channel::bounded(1);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Ok(0);
 
-    assert!(handle_client_read(identifier, 1, pipe_push, bytes_read, &mut BytesMut::new()).await);
+    assert!(
+      handle_client_read(identifier, 1, client_to_sink_push, bytes_read, &mut BytesMut::new())
+        .await
+    );
   }
 
   #[tokio::test]
   async fn test_handle_client_read_client_error() {
     setup_tracing().await;
-    let (pipe_push, _pipe_pull) = async_channel::bounded(1);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Err(std::io::Error::other("test error"));
 
-    assert!(handle_client_read(identifier, 2, pipe_push, bytes_read, &mut BytesMut::new()).await);
+    assert!(
+      handle_client_read(identifier, 2, client_to_sink_push, bytes_read, &mut BytesMut::new())
+        .await
+    );
   }
 
   #[tokio::test]
@@ -1504,14 +1510,14 @@ mod tests {
   async fn test_sink_loop_channel_closed() {
     setup_tracing().await;
     let (sink_a, _sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, _pipe_to_client_pull) = async_broadcast::broadcast(256);
-    let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
+    let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    client_to_pipe_pull.close();
-    let _pipe_loop_handle = tokio::spawn(sink_loop(
+    client_to_sink_pull.close();
+    let _sink_loop_handle = tokio::spawn(sink_loop(
       sink_a,
-      pipe_to_client_push.clone(),
-      client_to_pipe_pull,
+      sink_to_client_push.clone(),
+      client_to_sink_pull,
       cancel.clone(),
     ));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
@@ -1521,14 +1527,14 @@ mod tests {
   async fn test_sink_read_sink_closed() {
     setup_tracing().await;
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (pipe_to_client_push, _pipe_to_client_pull) = async_broadcast::broadcast(256);
-    let (_client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
+    let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     sink_b.shutdown().await.unwrap();
-    let _pipe_loop_handle = tokio::spawn(sink_loop(
+    let _sink_loop_handle = tokio::spawn(sink_loop(
       sink_a,
-      pipe_to_client_push.clone(),
-      client_to_pipe_pull,
+      sink_to_client_push.clone(),
+      client_to_sink_pull,
       cancel.clone(),
     ));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());

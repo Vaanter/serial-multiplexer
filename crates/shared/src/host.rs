@@ -278,7 +278,7 @@ pub(crate) async fn initiate_connection(
     debug!("Successfully initiated connection to {}", target_address);
     true
   } else {
-    debug!("Failed to initialize connection, pipe is closed or failed to receive response");
+    debug!("Failed to initialize connection, sink is closed or failed to receive response");
     false
   }
 }
@@ -317,33 +317,33 @@ mod tests {
   #[tokio::test]
   async fn test_initiate_connection_success() {
     setup_tracing().await;
-    let (pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded(256);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let (address, _) = run_echo().await;
     let target_address = "test:1234";
     let identifier = 1;
     let connection = ConnectionState::new(identifier, TcpStream::connect(address).await.unwrap());
 
     let initiate_handle = tokio::spawn({
-      let client_to_pipe_push = client_to_pipe_push.clone();
-      let mut pipe_to_client_pull = pipe_to_client_pull.clone();
+      let client_to_sink_push = client_to_sink_push.clone();
+      let mut sink_to_client_pull = sink_to_client_pull.clone();
       async move {
         initiate_connection(
           connection.identifier,
           target_address.to_string(),
-          &client_to_pipe_push,
-          &mut pipe_to_client_pull,
+          &client_to_sink_push,
+          &mut sink_to_client_pull,
         )
         .await
       }
     });
 
-    let initial_datagram_bytes = client_to_pipe_pull.recv().await.unwrap();
+    let initial_datagram_bytes = client_to_sink_pull.recv().await.unwrap();
     let initial_datagram = root_as_datagram(&initial_datagram_bytes).unwrap();
     let initial_data = initial_datagram.data().unwrap().bytes();
     assert_eq!(target_address.as_bytes(), initial_data);
     assert_eq!(identifier, initial_datagram.identifier());
-    pipe_to_client_push
+    sink_to_client_push
       .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
       .await
       .unwrap();
@@ -354,8 +354,8 @@ mod tests {
   #[tokio::test]
   async fn initiate_socks5_connection_success() {
     setup_tracing().await;
-    let (pipe_to_client_push, mut pipe_to_client_pull) = async_broadcast::broadcast(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, mut connection_receiver) = mpsc::channel(128);
 
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -378,17 +378,17 @@ mod tests {
     assert_eq!(connection_type, ConnectionType::Socks5);
 
     let guest_task = tokio::spawn(async move {
-      let initial = client_to_pipe_pull.recv().await.unwrap();
+      let initial = client_to_sink_pull.recv().await.unwrap();
       let initial_datagram = root_as_datagram(&initial).unwrap();
       let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
-      pipe_to_client_push.broadcast_direct(ack).await.unwrap();
+      sink_to_client_push.broadcast_direct(ack).await.unwrap();
     });
 
     assert!(
       initiate_socks5_connection(
         &mut connection_state,
-        &client_to_pipe_push,
-        &mut pipe_to_client_pull
+        &client_to_sink_push,
+        &mut sink_to_client_pull
       )
       .await
       .is_ok()
@@ -401,8 +401,8 @@ mod tests {
   #[tokio::test]
   async fn test_connection_initiator() {
     setup_tracing().await;
-    let (pipe_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
-    let (client_to_sink_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, connection_receiver) =
       mpsc::channel::<(ConnectionState, ConnectionType)>(128);
     let cancel = CancellationToken::new();
@@ -427,13 +427,13 @@ mod tests {
     let connection_state = ConnectionState::new(0, client);
     let connection_type = ConnectionType::new_direct(target_addr.to_string());
     connection_sender.send((connection_state, connection_type)).await.unwrap();
-    let datagram_bytes = client_to_pipe_pull.recv().await.unwrap();
+    let datagram_bytes = client_to_sink_pull.recv().await.unwrap();
     let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(initial_datagram.identifier(), 0);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), target_addr.as_bytes());
     let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
-    pipe_to_client_push.broadcast_direct(ack).await.unwrap();
+    sink_to_client_push.broadcast_direct(ack).await.unwrap();
     cancel.cancel();
     timeout(Duration::from_secs(1), initiator_task).await.unwrap().unwrap();
     timeout(Duration::from_secs(1), client_task).await.unwrap().unwrap();
@@ -442,8 +442,8 @@ mod tests {
   #[tokio::test]
   async fn test_handle_new_connection_direct_success() {
     setup_tracing().await;
-    let (pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let cancel = CancellationToken::new();
     let (target_addr, _) = run_echo().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -464,8 +464,8 @@ mod tests {
     let guest_task = receive_initial_ack_data(
       connection_state.identifier,
       Bytes::from(target_addr.to_string()),
-      client_to_pipe_pull,
-      pipe_to_client_push,
+      client_to_sink_pull,
+      sink_to_client_push,
       data_datagram_contents,
     )
     .await;
@@ -473,8 +473,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
-      client_to_pipe_push,
-      pipe_to_client_pull,
+      client_to_sink_push,
+      sink_to_client_pull,
       cancel,
     )
     .await;
@@ -486,8 +486,8 @@ mod tests {
   #[tokio::test]
   async fn test_handle_new_connection_socks5_success() {
     setup_tracing().await;
-    let (pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
-    let (client_to_pipe_push, client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let cancel = CancellationToken::new();
     let (target_addr, _) = run_echo().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -515,8 +515,8 @@ mod tests {
     let guest_task = receive_initial_ack_data(
       connection_state.identifier,
       Bytes::from(target_addr.to_string()),
-      client_to_pipe_pull,
-      pipe_to_client_push,
+      client_to_sink_pull,
+      sink_to_client_push,
       data_datagram_contents,
     )
     .await;
@@ -524,8 +524,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
-      client_to_pipe_push,
-      pipe_to_client_pull,
+      client_to_sink_push,
+      sink_to_client_pull,
       cancel,
     )
     .await;
@@ -537,8 +537,8 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn test_handle_new_connection_socks5_no_socks5_data() {
     setup_tracing().await;
-    let (_pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
-    let (client_to_pipe_push, _client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let cancel = CancellationToken::new();
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -555,8 +555,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
-      client_to_pipe_push,
-      pipe_to_client_pull,
+      client_to_sink_push,
+      sink_to_client_pull,
       cancel,
     )
     .await;
