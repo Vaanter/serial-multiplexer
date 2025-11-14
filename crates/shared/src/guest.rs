@@ -55,7 +55,7 @@ pub async fn client_initiator(
         match data {
           Ok(data) => {
             tokio::spawn({
-              let sink_to_client_pull = sink_to_client_pull.clone();
+              let sink_to_client_pull = sink_to_client_pull.clone().deactivate();
               let client_to_sink_push = client_to_sink_push.clone();
               let cancel = cancel.clone();
               async move {
@@ -64,7 +64,7 @@ pub async fn client_initiator(
                   Ok(Ok(Some(connection))) => {
                     tokio::spawn(connection_loop(
                       connection,
-                      sink_to_client_pull,
+                      sink_to_client_pull.activate(),
                       client_to_sink_push.clone(),
                       cancel.clone()
                     ));
