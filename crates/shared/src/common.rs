@@ -282,7 +282,7 @@ pub async fn handle_sink_read(
       decompression_buffer.as_mut(),
       &read_data[datagram_start..=datagram_end],
     )
-    .inspect(|n| debug!("Decompressed {} to {} bytes", size, n))
+    .inspect(|n| trace!("Decompressed {} to {} bytes", size, n))
     .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
@@ -363,9 +363,9 @@ pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
 ) -> anyhow::Result<()> {
   trace!("Maximum compressed size: {}", zstd_safe::compress_bound(data.len()));
   let compressed_size = zstd_safe::compress(compression_buffer.as_mut(), &data, 9)
-    .inspect(|n| debug!("Compressed {} to {} bytes", data.len(), n))
+    .inspect(|n| trace!("Compressed {} to {} bytes", data.len(), n))
     .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
-  debug!("Writing {} bytes to sink", compressed_size + HEADER_BYTES + LENGTH_BYTES);
+  trace!("Writing {} bytes to sink", compressed_size + HEADER_BYTES + LENGTH_BYTES);
   trace!(target: HUGE_DATA_TARGET, "Writing compressed datagram to sink: {:?}", &compression_buffer[..compressed_size]);
   if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
     bail!("Failed to write HEADER to sink: {}", e);
