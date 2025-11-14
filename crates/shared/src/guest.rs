@@ -218,7 +218,7 @@ mod tests {
     assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
   }
 
-  #[tokio::test]
+  #[tokio::test(start_paused = true)]
   async fn test_client_initiator_target_unreachable() {
     setup_tracing().await;
     let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);

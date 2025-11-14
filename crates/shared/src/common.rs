@@ -1472,7 +1472,7 @@ mod tests {
     assert!(client_to_sink_pull.try_recv().is_err());
   }
 
-  #[tokio::test]
+  #[tokio::test(start_paused = true)]
   async fn test_process_sink_old_datagram() {
     setup_tracing().await;
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
