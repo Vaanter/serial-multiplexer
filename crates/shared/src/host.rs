@@ -23,6 +23,8 @@ pub(crate) static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static IDENTIFIER_SEQUENCE: AtomicU64 = AtomicU64::new(100);
 
+pub(crate) const NEW_CONNECTION_TIMEOUT_DURATION: Duration = Duration::from_secs(8);
+
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum ConnectionType {
   Direct { target_address: String },
@@ -115,39 +117,61 @@ pub(crate) async fn handle_new_connection(
   mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
-  let connect_result = match connection_type {
+  let connect_result = timeout(
+    NEW_CONNECTION_TIMEOUT_DURATION,
+    connection_initiation_dispatch(
+      &mut connection_state,
+      connection_type,
+      &client_to_sink_push,
+      &mut sink_to_client_pull,
+    ),
+  )
+  .await;
+  match connect_result {
+    Ok(Ok(())) => {
+      tokio::spawn(connection_loop(
+        connection_state,
+        sink_to_client_pull,
+        client_to_sink_push,
+        cancel,
+      ));
+    }
+    Ok(Err(e)) => {
+      info!("Failed to initialize connection, closing client. {}", e);
+      if let Err(e) = connection_state.client.shutdown().await {
+        error!("Failed to shutdown client after initialization failed: {}", e);
+      }
+    }
+    Err(_) => {
+      info!("Failed to initialize connection in time, closing client.");
+      if let Err(e) = connection_state.client.shutdown().await {
+        error!("Failed to shutdown client after initialization failed: {}", e);
+      }
+    }
+  }
+}
+
+async fn connection_initiation_dispatch(
+  connection_state: &mut ConnectionState,
+  connection_type: ConnectionType,
+  client_to_sink_push: &async_channel::Sender<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+) -> anyhow::Result<()> {
+  match connection_type {
     ConnectionType::Direct { target_address } => {
       initiate_direct_connection(
-        &connection_state,
+        connection_state,
         target_address,
-        &client_to_sink_push,
-        &mut sink_to_client_pull,
+        client_to_sink_push,
+        sink_to_client_pull,
       )
       .await
     }
     ConnectionType::Socks5 => {
-      initiate_socks5_connection(
-        &mut connection_state,
-        &client_to_sink_push,
-        &mut sink_to_client_pull,
-      )
-      .await
+      initiate_socks5_connection(connection_state, client_to_sink_push, sink_to_client_pull).await
     }
     // Http connections should have been initialized before this, so we just let them pass
     ConnectionType::Http => Ok(()),
-  };
-  if let Err(e) = connect_result {
-    info!("Failed to initialize connection, closing client. {}", e);
-    if let Err(e) = connection_state.client.shutdown().await {
-      error!("Failed to shutdown client after initialization failed: {}", e);
-    }
-  } else {
-    tokio::spawn(connection_loop(
-      connection_state,
-      sink_to_client_pull,
-      client_to_sink_push,
-      cancel,
-    ));
   }
 }
 
@@ -265,7 +289,9 @@ mod tests {
   use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::{receive_initial_ack_data, run_echo, setup_tracing};
   use crate::utils::create_upstream_listener;
+  use bytes::BytesMut;
   use fast_socks5::client::{Config, Socks5Stream};
+  use tokio::io::AsyncReadExt;
   use tokio::net::TcpStream;
 
   #[tokio::test]
@@ -506,5 +532,35 @@ mod tests {
 
     timeout(Duration::from_secs(3), guest_task).await.unwrap().unwrap();
     timeout(Duration::from_secs(3), client_task).await.unwrap().unwrap();
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn test_handle_new_connection_socks5_no_socks5_data() {
+    setup_tracing().await;
+    let (_pipe_to_client_push, pipe_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let (client_to_pipe_push, _client_to_pipe_pull) = async_channel::bounded::<Bytes>(256);
+    let cancel = CancellationToken::new();
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_address = local_listener.local_addr().unwrap();
+
+    let client_task = tokio::spawn(async move {
+      let mut client = TcpStream::connect(local_address).await.unwrap();
+      let mut client_buffer = BytesMut::zeroed(128);
+      assert_eq!(client.read(&mut client_buffer).await.unwrap(), 0);
+    });
+
+    let connection_type = ConnectionType::Socks5;
+    let connection_state = ConnectionState::new(0, local_listener.accept().await.unwrap().0);
+
+    handle_new_connection(
+      connection_state,
+      connection_type,
+      client_to_pipe_push,
+      pipe_to_client_pull,
+      cancel,
+    )
+    .await;
+
+    client_task.await.unwrap();
   }
 }
