@@ -89,10 +89,8 @@ fn handle_http_connection(
 ) {
   let io = TokioIo::new(client);
   let serving = service_fn(move |req| {
-    let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
     serve_http(
       req,
-      identifier,
       client_to_sink_push.clone(),
       sink_to_client_pull.clone(),
       connection_sender.clone(),
@@ -122,7 +120,6 @@ fn handle_http_connection(
 /// # Parameters
 ///
 /// * `req`: The incoming HTTP request.
-/// * `identifier`: A unique identifier for this connection.
 /// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
 ///   sink(s) when initiating a connection.
 /// * `sink_to_client_pull`:
@@ -131,7 +128,6 @@ fn handle_http_connection(
 ///   [`crate::host::connection_initiator`] after initiation succeeds.
 async fn serve_http(
   req: Request<hyper::body::Incoming>,
-  identifier: u64,
   client_to_sink_push: async_channel::Sender<Bytes>,
   sink_to_client_pull: async_broadcast::InactiveReceiver<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
@@ -140,6 +136,7 @@ async fn serve_http(
 
   if Method::CONNECT == req.method() {
     if let Some(target_address) = extract_authority(req.uri()) {
+      let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
       let mut sink_to_client_pull = sink_to_client_pull.activate();
       let connect_result = crate::host::initiate_connection(
         identifier,
