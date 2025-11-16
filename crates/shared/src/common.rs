@@ -1,6 +1,7 @@
 use crate::protocol_utils::{create_ack_datagram, create_close_datagram, create_data_datagram};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
-use anyhow::{anyhow, bail};
+use crate::try_write::Sink;
+use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
 use std::cmp::{max, min};
@@ -8,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +47,7 @@ pub const METRICS_TARGET: &str = "serial_multiplexer::metrics";
 const LENGTH_BYTES: usize = 2;
 static HEADER_FINDER: LazyLock<Finder<'static>> =
   LazyLock::new(|| Finder::new(&DATAGRAM_HEADER).into_owned());
+const SINK_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Represents the state of a network connection, holding information about the
 /// connection identifier, client communication stream, sequence tracking, and
@@ -131,17 +133,20 @@ impl ConnectionState {
 /// [`UnixStream`]: tokio::net::unix::socket::UnixSocket
 #[instrument(skip_all)]
 pub async fn sink_loop(
-  mut sink: impl AsyncReadExt + AsyncWriteExt + Unpin,
+  mut sink: impl Sink,
   sink_to_client_push: async_broadcast::Sender<Bytes>,
   client_to_sink_pull: async_channel::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
-  let mut sink_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
+  let mut sink_buf_read = BytesMut::zeroed(SINK_BUFFER_SIZE);
+  let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
   let mut compression_buffer = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
   let mut unprocessed_data_start = 0;
+  let mut unwritten_data_end = 0;
   loop {
     let current_span = Span::current();
-    sink_buf.resize(SINK_BUFFER_SIZE, 0);
+    sink_buf_read.resize(SINK_BUFFER_SIZE, 0);
+    sink_buf_write.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
@@ -150,7 +155,7 @@ pub async fn sink_loop(
         }
         return;
       }
-      n = sink.read(&mut sink_buf[unprocessed_data_start..]) => {
+      n = sink.read(&mut sink_buf_read[unprocessed_data_start..]) => {
         match n {
           Ok(0) => {
             info!("Sink disconnected");
@@ -158,7 +163,12 @@ pub async fn sink_loop(
           }
           Ok(n) => {
             let sink_read_duration = Instant::now();
-            let result = handle_sink_read(n + unprocessed_data_start, &mut sink_buf, sink_to_client_push.clone(), &mut compression_buffer).await;
+            let result = handle_sink_read(
+              n + unprocessed_data_start,
+              &mut sink_buf_read,
+              sink_to_client_push.clone(),
+              &mut compression_buffer
+            ).instrument(current_span).await;
             trace!(target: METRICS_TARGET, duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
             match result {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
@@ -174,19 +184,34 @@ pub async fn sink_loop(
           }
         }
       }
-      data = client_to_sink_pull.recv() => {
+      data = client_to_sink_pull.recv(), if unwritten_data_end == 0 => {
         match data {
           Ok(data) => {
             let sink_write_duration = Instant::now();
-            let result = handle_sink_write(&mut sink, data, &mut compression_buffer).instrument(current_span).await;
+            let write_result = handle_sink_write(&mut sink, data, &mut sink_buf_write)
+              .instrument(current_span).await;
             trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
-            if let Err(e) = result {
-              error!("Failed to handle sink write: {}", e);
-              break;
+            match write_result {
+              Ok(n) => unwritten_data_end = n,
+              Err(e) => {
+                error!("Failed to handle sink write: {}", e);
+                break;
+              }
             }
           },
           Err(e) => {
             info!("Sink receiver closed, {}", e);
+            break;
+          }
+        }
+      }
+      () = sleep(SINK_WRITE_RETRY_INTERVAL), if unwritten_data_end > 0 => {
+        let write_result = write_to_sink(&mut sink, &mut sink_buf_write[0..unwritten_data_end])
+          .instrument(current_span).await;
+        match write_result {
+          Ok(n) => unwritten_data_end = n,
+          Err(e) => {
+            error!("Failed to handle sink write: {}", e);
             break;
           }
         }
@@ -356,32 +381,46 @@ pub async fn handle_sink_read(
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
 /// [`UnixStream`]: tokio::net::unix::socket::UnixSocket
-pub async fn handle_sink_write<T: AsyncReadExt + AsyncWriteExt + Unpin + Sized>(
-  sink: &mut T,
+pub async fn handle_sink_write(
+  sink: &mut impl Sink,
   data: Bytes,
-  compression_buffer: &mut BytesMut,
-) -> anyhow::Result<()> {
+  sink_buffer: &mut BytesMut,
+) -> anyhow::Result<usize> {
   trace!("Maximum compressed size: {}", zstd_safe::compress_bound(data.len()));
-  let compressed_size = zstd_safe::compress(compression_buffer.as_mut(), &data, 9)
-    .inspect(|n| trace!("Compressed {} to {} bytes", data.len(), n))
-    .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
-  trace!("Writing {} bytes to sink", compressed_size + HEADER_BYTES + LENGTH_BYTES);
-  trace!(target: HUGE_DATA_TARGET, "Writing compressed datagram to sink: {:?}", &compression_buffer[..compressed_size]);
-  if let Err(e) = sink.write_all(&DATAGRAM_HEADER).await {
-    bail!("Failed to write HEADER to sink: {}", e);
+  let compressed_size =
+    zstd_safe::compress(sink_buffer[HEADER_BYTES + LENGTH_BYTES..].as_mut(), &data, 9)
+      .inspect(|n| trace!("Compressed {} to {} bytes", data.len(), n))
+      .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
+  sink_buffer[0..HEADER_BYTES].copy_from_slice(&DATAGRAM_HEADER);
+  sink_buffer[HEADER_BYTES..HEADER_BYTES + LENGTH_BYTES]
+    .copy_from_slice(&(compressed_size as u16).to_be_bytes());
+  let data_to_send = &mut sink_buffer[..HEADER_BYTES + LENGTH_BYTES + compressed_size];
+  trace!(target: HUGE_DATA_TARGET, "Writing compressed datagram to sink: {:?}", data_to_send);
+  write_to_sink(sink, data_to_send).await
+}
+
+async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow::Result<usize> {
+  trace!("Writing {} bytes to sink", data_to_send.len());
+  let mut bytes_sent = 0;
+  while bytes_sent < data_to_send.len().saturating_sub(bytes_sent) {
+    match sink.try_write(data_to_send).await {
+      Ok(bytes_written) => {
+        trace!("Wrote {} bytes to sink", bytes_written);
+        bytes_sent = bytes_sent.saturating_add(bytes_written);
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        let leftover_bytes = data_to_send.len().saturating_sub(bytes_sent);
+        trace!("Unable to write {} bytes to sink", leftover_bytes);
+        data_to_send.copy_within(bytes_sent..data_to_send.len(), 0);
+        return Ok(leftover_bytes);
+      }
+      Err(e) => bail!(e),
+    };
   }
-  let size: [u8; LENGTH_BYTES] = (compressed_size as u16).to_be_bytes();
-  if let Err(e) = sink.write(&size).await {
-    bail!("Failed to write size to sink: {}", e);
-  }
-  if let Err(e) = sink.write_all(&compression_buffer[..compressed_size]).await {
-    bail!("Failed to write data to sink: {}", e);
-  }
-  if let Err(e) = sink.flush().await {
-    bail!("Failed to flush sink after writing: {}", e);
-  }
-  compression_buffer[..compressed_size].zeroize();
-  Ok(())
+  trace!("All bytes written to sink");
+  sink.flush().await.context("Failed to flush data to sink")?;
+  data_to_send.zeroize();
+  Ok(0)
 }
 
 ///
@@ -776,9 +815,11 @@ mod tests {
   use crate::protocol_utils::{create_ack_datagram, create_data_datagram, create_initial_datagram};
   use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
   use crate::test_utils::{run_echo, setup_tracing};
+  use crate::try_write::Sink;
   use crate::utils::create_upstream_listener;
   use std::net::SocketAddr;
   use std::time::Duration;
+  use tokio::io::AsyncReadExt;
   use tokio::net::{TcpListener, TcpStream};
   use tokio::sync::mpsc;
   use tokio::task::JoinHandle;
@@ -1040,7 +1081,7 @@ mod tests {
   #[tokio::test]
   async fn test_sink_loop_read_sink() {
     setup_tracing().await;
-    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
+    let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(256);
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
@@ -1055,14 +1096,14 @@ mod tests {
     info!("Sending initial datagram");
     let initial_data = "test data";
     let initial_datagram = create_initial_datagram(1, initial_data);
-    handle_sink_write(&mut sink_b, initial_datagram, &mut compression_buf).await.unwrap();
+    handle_sink_write(&mut sink_b, initial_datagram, &mut sink_buf_write).await.unwrap();
     let datagram_bytes =
       timeout(Duration::from_secs(1), sink_to_client_pull.recv()).await.unwrap().unwrap();
     let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(initial_datagram.identifier(), 1);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data.as_bytes());
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf_write, BytesMut::zeroed(sink_buf_write.len()));
 
     // write some rubbish between datagrams
     info!("Sending rubbish data");
@@ -1072,13 +1113,13 @@ mod tests {
 
     info!("Sending ACK datagram");
     let ack_datagram = create_ack_datagram(2, 0, 0);
-    handle_sink_write(&mut sink_b, ack_datagram, &mut compression_buf).await.unwrap();
+    handle_sink_write(&mut sink_b, ack_datagram, &mut sink_buf_write).await.unwrap();
     let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(ack_datagram.identifier(), 2);
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf_write, BytesMut::zeroed(sink_buf_write.len()));
 
     // write more rubbish between datagrams
     info!("Sending rubbish data");
@@ -1097,13 +1138,13 @@ mod tests {
       let mut data = BytesMut::new();
       data.resize(data_size, 100u8);
       let data_datagram = create_data_datagram(i as u64, 1, &data);
-      handle_sink_write(&mut sink_b, data_datagram, &mut compression_buf).await.unwrap();
+      handle_sink_write(&mut sink_b, data_datagram, &mut sink_buf_write).await.unwrap();
       let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
       let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
       assert_eq!(data_datagram.identifier(), i as u64);
       assert_eq!(data_datagram.code(), ControlCode::Data);
       assert_eq!(data_datagram.data().unwrap().bytes(), data);
-      assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+      assert_eq!(sink_buf_write, BytesMut::zeroed(sink_buf_write.len()));
     }
   }
 
@@ -1145,6 +1186,49 @@ mod tests {
       assert_eq!(initial_datagram.sequence(), i as u64);
       assert_eq!(initial_datagram.data().unwrap().bytes(), &data_copy);
     }
+  }
+
+  #[cfg(windows)]
+  #[tokio::test]
+  async fn test_write_to_sink_full_sink_named_pipe() {
+    use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    setup_tracing().await;
+    let pipe_path = "\\\\.\\pipe\\test_pipe_multiplexer_sink_loop";
+    let pipe_server = ServerOptions::new().first_pipe_instance(true).create(pipe_path).unwrap();
+    let pipe_server_handle = tokio::spawn(async move {
+      pipe_server.connect().await.unwrap();
+      pipe_server
+    });
+    let sink_a = ClientOptions::new().write(true).read(true).open(pipe_path).unwrap();
+    let _sink_b = pipe_server_handle.await.unwrap();
+
+    test_write_to_sink_full_sink(sink_a).await;
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn test_write_to_sink_full_sink_named_pipe() {
+    use tokio::net::{UnixListener, UnixStream};
+    setup_tracing().await;
+    let uds_path = "test_serial_multiplexer.sock";
+    let uds_server = UnixListener::bind(uds_path).unwrap();
+    let pipe_server_handle = tokio::spawn(async move { uds_server.accept().await.unwrap().0 });
+    let sink_a = UnixStream::connect(uds_path).await.unwrap();
+    let sink_b = pipe_server_handle.await.unwrap();
+    test_write_to_sink_full_sink(sink_a).await;
+  }
+
+  async fn test_write_to_sink_full_sink(mut sink_a: impl Sink) {
+    loop {
+      if let Err(e) = sink_a.try_write(&BytesMut::zeroed(2usize.pow(20)))
+        && e.kind() == std::io::ErrorKind::WouldBlock
+      {
+        break;
+      }
+    }
+    let mut data = BytesMut::from_iter(0..255u8);
+    let result = write_to_sink(&mut sink_a, &mut data).await.unwrap();
+    assert_eq!(result, data.len());
   }
 
   #[tokio::test]
