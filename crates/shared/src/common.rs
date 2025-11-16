@@ -706,20 +706,6 @@ pub async fn connection_loop(
       connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
     if connection_blocked {
       trace!("Connection blocked. {:?}", connection);
-      match connection.client.peek(&mut tcp_buf).await {
-        Ok(0) => {
-          debug!("Connection closed while blocked");
-          send_close_datagram(&mut connection, &client_to_sink_push).await;
-          break;
-        }
-        Ok(_) => {}
-        Err(e) => {
-          error!("Error peeking at blocked connection: {}", e);
-          send_close_datagram(&mut connection, &client_to_sink_push).await;
-          break;
-        }
-      }
-      tcp_buf.zeroize();
     }
     tokio::select! {
       biased;
@@ -739,23 +725,33 @@ pub async fn connection_loop(
           break;
         }
       }
-      bytes_read = connection.client.read(&mut tcp_buf), if !connection_blocked => {
-        connection.sequence += 1;
-        let client_read_start = Instant::now();
-        let connection_terminating = handle_client_read(
-          connection.identifier,
-          connection.sequence,
-          client_to_sink_push.clone(),
-          bytes_read,
-          &mut tcp_buf,
-        ).instrument(current_span).await;
-        trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
-        if connection_terminating {
+      bytes_read = async {
+        if connection_blocked {
+          sleep(Duration::from_secs(3)).await;
+        }
+        connection.client.peek(&mut tcp_buf).await
+      } => {
+        if matches!(bytes_read, Ok(0) | Err(_)) {
+          send_close_datagram(&mut connection, &client_to_sink_push).await;
           break;
         }
-      }
-      () = sleep(Duration::from_secs(3)), if connection_blocked => {
-        // Loop now and then to check if the connection hasn't closed while it's blocked
+        if !connection_blocked {
+          let bytes_read = connection.client.try_read(&mut tcp_buf);
+          connection.sequence += 1;
+          let client_read_start = Instant::now();
+          let connection_terminating = handle_client_read(
+            connection.identifier,
+            connection.sequence,
+            client_to_sink_push.clone(),
+            bytes_read,
+            &mut tcp_buf,
+          ).instrument(current_span).await;
+          trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
+          if connection_terminating {
+            break;
+          }
+        }
+        tcp_buf.zeroize();
       }
     }
   }
@@ -1194,7 +1190,7 @@ mod tests {
     assert_eq!(0, n);
   }
 
-  #[tokio::test]
+  #[tokio::test(start_paused = true)]
   async fn test_connection_loop_blocked_timeout() {
     setup_tracing().await;
     let identifier = 0;
@@ -1225,11 +1221,9 @@ mod tests {
 
     let server_address = address_receiver.recv().await.unwrap();
     let mut client = TcpStream::connect(server_address).await.unwrap();
-    let loop_task =
-      timeout(Duration::from_secs(1), loop_task_receiver.recv()).await.unwrap().unwrap();
+    let loop_task = loop_task_receiver.recv().await.unwrap();
     client.shutdown().await.unwrap();
-    let close_data =
-      timeout(Duration::from_secs(1), client_to_sink_pull.recv()).await.unwrap().unwrap();
+    let close_data = client_to_sink_pull.recv().await.unwrap();
     let close_datagram = root_as_datagram(&close_data).unwrap();
     assert_eq!(close_datagram.code(), ControlCode::Close);
     assert_eq!(close_datagram.identifier(), identifier);

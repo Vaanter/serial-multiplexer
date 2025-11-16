@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail};
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tracing::{debug, warn};
+use tracing_attributes::instrument;
 
 pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<TcpListener> {
   let upstream_addresses = lookup_host(upstream).await?;
@@ -18,6 +19,7 @@ pub async fn create_upstream_listener(upstream: &str) -> anyhow::Result<TcpListe
   Err(result_error)
 }
 
+#[instrument]
 pub async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {
   let downstream_addresses = lookup_host(downstream).await?.collect::<Vec<_>>();
   for downstream_address in downstream_addresses.iter() {
@@ -27,7 +29,7 @@ pub async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {
         downstream
       }
       Err(e) => {
-        warn!("Failed to connect to downstream {}: {}", downstream_address, e);
+        warn!("Failed to connect to downstream: {}", e);
         continue;
       }
     };

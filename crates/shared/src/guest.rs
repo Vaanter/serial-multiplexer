@@ -51,7 +51,7 @@ pub async fn client_initiator(
       () = cancel.cancelled() => {
         break;
       }
-      data = sink_to_client_pull.recv() => {
+      data = sink_to_client_pull.recv_direct() => {
         match data {
           Ok(data) => {
             tokio::spawn({
