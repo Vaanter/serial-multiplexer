@@ -4,12 +4,15 @@ pub mod common {
   use config::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
+  use papaya::HashMap;
+  use serial_multiplexer_lib::channels::{ChannelMap, Identifier};
   use serial_multiplexer_lib::common::{ConnectionState, sink_loop};
   use serial_multiplexer_lib::guest::client_initiator;
   use serial_multiplexer_lib::host::{ConnectionType, connection_initiator, run_listener};
   use serial_multiplexer_lib::host_http::run_http_listener;
   use serial_multiplexer_lib::utils::create_upstream_listener;
-  use std::collections::HashSet;
+  use std::collections::{BTreeMap, HashSet};
+  use std::sync::Arc;
   use std::time::Duration;
   use tokio::io::AsyncWriteExt;
   use tokio::sync::mpsc;
@@ -24,9 +27,10 @@ pub mod common {
     properties: Host,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
+    let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
-    let (connection_sender, connection_receiver) = mpsc::channel(512);
+    let (connection_sender, connection_receiver) =
+      mpsc::channel::<(ConnectionState, ConnectionType)>(512);
 
     let mut sink_loops = FuturesUnordered::new();
     #[cfg(unix)]
@@ -35,8 +39,8 @@ pub mod common {
       let HostSink::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
         &unix_socket_properties,
-        sink_to_client_push.clone(),
-        client_to_sink_pull,
+        channel_map.clone(),
+        client_to_sink_pull.clone(),
         cancel.clone(),
       )
       .await
@@ -50,8 +54,8 @@ pub mod common {
       let HostSink::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
         windows_pipe_properties,
-        sink_to_client_push.clone(),
-        client_to_sink_pull,
+        channel_map.clone(),
+        client_to_sink_pull.clone(),
         cancel.clone(),
       )
       .await
@@ -68,8 +72,8 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task = tokio::spawn(connection_initiator(
+      channel_map.clone(),
       client_to_sink_push.clone(),
-      sink_to_client_pull.clone(),
       connection_receiver,
       cancel.clone(),
     ));
@@ -79,23 +83,23 @@ pub mod common {
       &properties.address_pairs,
       &properties.socks5_proxy,
       &properties.http_proxy,
+      channel_map.clone(),
       connection_sender.clone(),
       client_to_sink_push.clone(),
-      sink_to_client_pull,
       cancel,
     )
     .await
     .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
-    run_channel_watcher(client_to_sink_push, sink_to_client_push, Some(connection_sender));
+    run_channel_watcher(channel_map, client_to_sink_push, Some(connection_sender));
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
   }
 
   fn run_channel_watcher(
+    channel_map: ChannelMap,
     client_to_sink_push: async_channel::Sender<Bytes>,
-    sink_to_client_push: async_broadcast::Sender<Bytes>,
     connection_sender: Option<mpsc::Sender<(ConnectionState, ConnectionType)>>,
   ) {
     tokio::spawn(async move {
@@ -105,12 +109,27 @@ pub mod common {
         interval.tick().await;
         let cts_len =
           client_to_sink_push.capacity().unwrap_or(0).saturating_sub(client_to_sink_push.len());
-        let stc_len = sink_to_client_push.capacity().saturating_sub(sink_to_client_push.len());
+
+        let channels: BTreeMap<Identifier, usize> = channel_map
+          .pin()
+          .iter()
+          .map(|(id, (stc, _))| (*id, stc.capacity().saturating_sub(stc.len())))
+          .collect();
+        let stc_lens = channels.into_iter().fold(
+          String::with_capacity(channel_map.len() * 20),
+          |mut a, (id, len)| {
+            if !a.is_empty() {
+              a.push_str(", ");
+            }
+            a.push_str(&format!("'{:?}': {}", id, len));
+            a
+          },
+        );
         let cs_len = match &connection_sender {
           Some(c) => c.capacity(),
           None => 0,
         };
-        trace!(target: "serial_multiplexer::CCW", "CTS: {}, STC: {}, CS: {}", cts_len, stc_len, cs_len);
+        trace!(target: "serial_multiplexer::CCW", "CTS: {}, CS: {}, STC: [{}]", cts_len, cs_len, stc_lens);
       }
     });
   }
@@ -120,20 +139,20 @@ pub mod common {
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
     debug!("Creating guest tasks");
+    let channel_map = Arc::new(HashMap::new());
+    let (initiator_push, initiator_pull) = async_broadcast::broadcast::<Bytes>(512);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
+    channel_map
+      .pin()
+      .insert(Identifier::ClientInitiator, (initiator_push, initiator_pull.deactivate()));
 
     let mut sink_loops = FuturesUnordered::new();
     match properties.sink_type {
       GuestSink::Serial(serial) => {
-        let serial_port_sinks = initialize_serials(
-          &serial,
-          sink_to_client_push.clone(),
-          client_to_sink_pull,
-          cancel.clone(),
-        )
-        .await
-        .context("Failed to create serial port based sink loops.")?;
+        let serial_port_sinks =
+          initialize_serials(&serial, channel_map.clone(), client_to_sink_pull, cancel.clone())
+            .await
+            .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
       }
       #[cfg(unix)]
@@ -142,7 +161,7 @@ pub mod common {
           use crate::runner::linux::connect_to_unix_socket;
           let socket_task = connect_to_unix_socket(
             &unix_socket,
-            sink_to_client_push.clone(),
+            channel_map.clone(),
             client_to_sink_pull,
             cancel.clone(),
           )
@@ -160,10 +179,10 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task =
-      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push.clone(), cancel));
+      task::spawn(client_initiator(channel_map.clone(), client_to_sink_push.clone(), cancel));
     tasks.push(initiator_task);
 
-    run_channel_watcher(client_to_sink_push, sink_to_client_push, None);
+    run_channel_watcher(channel_map, client_to_sink_push, None);
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }
@@ -190,7 +209,7 @@ pub mod common {
   /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
     properties: &SerialGuest,
-    sink_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
@@ -230,7 +249,7 @@ pub mod common {
     for serial in serials_ok {
       let serial_task = task::spawn(sink_loop(
         serial,
-        sink_to_client_push.clone(),
+        channel_map.clone(),
         client_to_sink_pull.clone(),
         cancel.clone(),
       ));
@@ -265,9 +284,9 @@ pub mod common {
     address_pairs: &[AddressPair],
     socks5_proxy: &Option<String>,
     http_proxy: &Option<String>,
+    channel_map: ChannelMap,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     client_to_sink_push: async_channel::Sender<Bytes>,
-    sink_to_client_pull: async_broadcast::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
@@ -301,8 +320,8 @@ pub mod common {
     if let Some(http_proxy) = http_proxy {
       let http_task = setup_http_listener(
         http_proxy,
+        channel_map,
         client_to_sink_push,
-        sink_to_client_pull,
         connection_sender,
         cancel,
       )
@@ -356,8 +375,8 @@ pub mod common {
 
   async fn setup_http_listener(
     listener_address: &str,
+    channel_map: ChannelMap,
     client_to_sink_push: async_channel::Sender<Bytes>,
-    sink_to_client_pull: async_broadcast::Receiver<Bytes>,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
@@ -365,7 +384,7 @@ pub mod common {
     info!("Created HTTP listener at {}", listener_address);
     Ok(tokio::spawn(run_http_listener(
       listener,
-      sink_to_client_pull,
+      channel_map,
       client_to_sink_push,
       connection_sender,
       cancel,
@@ -376,9 +395,12 @@ pub mod common {
   mod tests {
     use crate::runner::common::initialize_listeners;
     use config::configuration::AddressPair;
+    use papaya::HashMap;
+    use serial_multiplexer_lib::channels::Identifier;
     use serial_multiplexer_lib::host::ConnectionType;
     use serial_multiplexer_lib::protocol_utils::create_ack_datagram;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
@@ -388,9 +410,9 @@ pub mod common {
     async fn test_initialize_listeners() {
       setup_tracing().await;
       let cancel = CancellationToken::new();
-      let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
       let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
+      let channel_map = Arc::new(HashMap::new());
       let address_pairs = vec![
         AddressPair {
           listener_address: "127.0.0.1:2000".to_string(),
@@ -408,9 +430,9 @@ pub mod common {
         &address_pairs,
         &Some(socks5_proxy.clone()),
         &Some(http_proxy.clone()),
+        channel_map.clone(),
         connection_sender,
         client_to_sink_push,
-        sink_to_client_pull,
         cancel,
       )
       .await
@@ -437,6 +459,11 @@ pub mod common {
       assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
       assert_eq!(connection_type, ConnectionType::Socks5);
       connection_id += 1;
+      let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+      channel_map.pin().insert(
+        Identifier::Client(connection_id),
+        (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+      );
       let mut http_client = TcpStream::connect(http_proxy).await.unwrap();
       http_client
         .write_all(b"CONNECT google.com:443 HTTP/1.1\r\nHost: google.com\r\n\r\n")
@@ -457,6 +484,7 @@ mod windows {
   use bytes::Bytes;
   use config::configuration::WindowsPipeHost;
   use futures::stream::FuturesUnordered;
+  use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
   use std::collections::HashSet;
   use std::time::Duration;
@@ -490,7 +518,7 @@ mod windows {
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
     properties: &WindowsPipeHost,
-    sink_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
@@ -533,10 +561,9 @@ mod windows {
     let pipe_loops = FuturesUnordered::new();
     for pipe in pipes_ok {
       let cancel = cancel.clone();
-      let sink_to_client_push = sink_to_client_push.clone();
       let client_to_sink_pull = client_to_sink_pull.clone();
-      let pipe_task =
-        tokio::spawn(sink_loop(pipe, sink_to_client_push, client_to_sink_pull, cancel));
+      let channel_map = channel_map.clone();
+      let pipe_task = tokio::spawn(sink_loop(pipe, channel_map, client_to_sink_pull, cancel));
       pipe_loops.push(pipe_task);
     }
     Ok(pipe_loops)
@@ -550,14 +577,16 @@ mod windows {
   #[cfg(test)]
   mod tests {
     use super::*;
+    use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
     use tokio::net::windows::named_pipe::ServerOptions;
     use tokio::time::timeout;
 
     #[tokio::test(start_paused = true)]
     async fn create_windows_pipe_loops_non_existent_test() {
       setup_tracing().await;
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let sink_properties = WindowsPipeHost {
@@ -566,7 +595,7 @@ mod windows {
 
       let result = create_windows_pipe_loops(
         &sink_properties,
-        sink_to_client_push,
+        channel_map,
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -592,7 +621,7 @@ mod windows {
         pipe3.disconnect().unwrap();
       });
 
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let sink_properties = WindowsPipeHost {
@@ -601,7 +630,7 @@ mod windows {
 
       let result = create_windows_pipe_loops(
         &sink_properties,
-        sink_to_client_push,
+        channel_map,
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -618,6 +647,7 @@ mod linux {
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use config::configuration::{UnixSocketGuest, UnixSocketHost};
+  use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
   use std::fs::remove_file;
   use std::io::ErrorKind;
@@ -631,11 +661,11 @@ mod linux {
   /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> JoinHandle<()> {
-    tokio::spawn(sink_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+    tokio::spawn(sink_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
   }
 
   /// Attempts to connect to a Unix socket and set up a sink loop.
@@ -659,7 +689,7 @@ mod linux {
   /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
     properties: &UnixSocketGuest,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
@@ -667,7 +697,7 @@ mod linux {
     let unix_socket =
       UnixStream::connect(&properties.socket_path).await.context("Failed to connect to socket")?;
     debug!(peer_address = ?unix_socket.peer_addr()?, "Connected to unix socket");
-    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+    Ok(create_unix_socket_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
   }
 
   /// Creates and listens on a Unix socket, then creates a sink loop when a client connects.
@@ -694,7 +724,7 @@ mod linux {
   ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
     properties: &UnixSocketHost,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<JoinHandle<()>> {
@@ -709,13 +739,15 @@ mod linux {
     let (unix_socket, _) =
       socket_listener.accept().await.context("Failed to accept socket connection")?;
     debug!(peer_address = ?unix_socket.peer_addr()?, "Accepted unix socket connection");
-    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+    Ok(create_unix_socket_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
   }
 
   #[cfg(test)]
   mod tests {
     use super::*;
+    use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -730,19 +762,19 @@ mod linux {
         socket_path: socket_path.to_string(),
       };
 
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
 
       timeout(Duration::from_secs(3), async {
         let host_loop = tokio::spawn({
           let cancel = cancel.clone();
-          let sink_to_client_push = sink_to_client_push.clone();
           let client_to_sink_pull = client_to_sink_pull.clone();
+          let channel_map = channel_map.clone();
           async move {
             let sink_loop = listen_accept_unix_connection(
               &sink_properties,
-              sink_to_client_push,
+              channel_map,
               client_to_sink_pull,
               cancel.clone(),
             )
@@ -757,7 +789,7 @@ mod linux {
         sleep(Duration::from_secs(1)).await;
         let sink_loop = connect_to_unix_socket(
           &unix_socket_properties,
-          sink_to_client_push,
+          channel_map,
           client_to_sink_pull,
           cancel.clone(),
         )

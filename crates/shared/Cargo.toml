@@ -17,6 +17,7 @@ http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 memchr = { workspace = true }
+papaya = { workspace = true }
 tokio = { workspace = true }
 tokio-serial = { workspace = true }
 tokio-util = { workspace = true }

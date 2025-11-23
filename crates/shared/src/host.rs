@@ -1,3 +1,4 @@
+use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::{ConnectionState, HUGE_DATA_TARGET, connection_loop};
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
@@ -13,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Span, debug, error, info, trace, warn};
 use tracing_attributes::instrument;
 
 #[cfg(not(test))]
@@ -38,14 +39,16 @@ impl ConnectionType {
   }
 }
 
-#[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
+#[instrument(skip_all, fields(listener_address))]
 pub async fn run_listener(
   listener: TcpListener,
   connection_type: ConnectionType,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
-  let listener_address = listener.local_addr().unwrap();
+  let listener_address =
+    listener.local_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
+  Span::current().record("listener_address", &listener_address);
   loop {
     tokio::select! {
       biased;
@@ -77,14 +80,12 @@ pub async fn run_listener(
 
 #[instrument(skip_all)]
 pub async fn connection_initiator(
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
-  sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   mut connection_receiver: mpsc::Receiver<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
   debug!("Starting connection initiator");
-  // Deactivate the receiver so we don't need to drain it
-  let sink_to_client_pull_inactive = sink_to_client_pull.deactivate();
   loop {
     tokio::select! {
       biased;
@@ -96,8 +97,8 @@ pub async fn connection_initiator(
           tokio::spawn(handle_new_connection(
             connection_state,
             connection_type,
+            channel_map.clone(),
             client_to_sink_push.clone(),
-            sink_to_client_pull_inactive.activate_cloned(),
             cancel.clone()
           ));
         } else {
@@ -111,16 +112,20 @@ pub async fn connection_initiator(
 }
 
 pub(crate) async fn handle_new_connection(
-  mut connection_state: ConnectionState,
+  mut connection: ConnectionState,
   connection_type: ConnectionType,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
-  mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
+  let (mut sink_to_client_pull, guard) = channel_get_or_insert_with_guard(
+    channel_map.clone(),
+    Identifier::Client(connection.identifier),
+  );
   let connect_result = timeout(
     NEW_CONNECTION_TIMEOUT_DURATION,
     connection_initiation_dispatch(
-      &mut connection_state,
+      &mut connection,
       connection_type,
       &client_to_sink_push,
       &mut sink_to_client_pull,
@@ -129,22 +134,21 @@ pub(crate) async fn handle_new_connection(
   .await;
   match connect_result {
     Ok(Ok(())) => {
-      tokio::spawn(connection_loop(
-        connection_state,
-        sink_to_client_pull,
-        client_to_sink_push,
-        cancel,
-      ));
+      tokio::spawn(async move {
+        connection_loop(connection, channel_map, client_to_sink_push, cancel).await;
+        // Explicitly move the guard so it doesn't get dropped before the connection loop
+        drop(guard);
+      });
     }
     Ok(Err(e)) => {
-      info!("Failed to initialize connection, closing client. {}", e);
-      if let Err(e) = connection_state.client.shutdown().await {
+      info!("Failed to initialize connection {}, closing client. {}", connection.identifier, e);
+      if let Err(e) = connection.client.shutdown().await {
         error!("Failed to shutdown client after initialization failed: {}", e);
       }
     }
     Err(_) => {
-      info!("Failed to initialize connection in time, closing client.");
-      if let Err(e) = connection_state.client.shutdown().await {
+      info!("Failed to initialize connection {} in time, closing client.", connection.identifier);
+      if let Err(e) = connection.client.shutdown().await {
         error!("Failed to shutdown client after initialization failed: {}", e);
       }
     }
@@ -244,8 +248,11 @@ pub(crate) async fn initiate_connection(
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection_identifier, &target_address);
   trace!(target: HUGE_DATA_TARGET, "Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
-  if let Err(e) = client_to_sink_push.send(initial_datagram).await {
-    info!("Failed to initialize connection: {}", e);
+  if client_to_sink_push.send(initial_datagram).await.is_err() {
+    info!(
+      "Failed to send Initial datagram for connection {}, channel closed",
+      connection_identifier
+    );
     return false;
   }
   // TODO rework
@@ -275,10 +282,13 @@ pub(crate) async fn initiate_connection(
       debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
       return false;
     }
-    debug!("Successfully initiated connection to {}", target_address);
+    debug!("Successfully initiated connection {} to {}", connection_identifier, target_address);
     true
   } else {
-    debug!("Failed to initialize connection, sink is closed or failed to receive response");
+    debug!(
+      "Failed to initialize connection {}, sink is closed or failed to receive response",
+      connection_identifier
+    );
     false
   }
 }
@@ -291,6 +301,8 @@ mod tests {
   use crate::utils::create_upstream_listener;
   use bytes::BytesMut;
   use fast_socks5::client::{Config, Socks5Stream};
+  use papaya::HashMap;
+  use std::sync::Arc;
   use tokio::io::AsyncReadExt;
   use tokio::net::TcpStream;
 
@@ -401,7 +413,12 @@ mod tests {
   #[tokio::test]
   async fn test_connection_initiator() {
     setup_tracing().await;
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, connection_receiver) =
       mpsc::channel::<(ConnectionState, ConnectionType)>(128);
@@ -409,8 +426,8 @@ mod tests {
     let target_addr = "test:1234";
 
     let initiator_task = tokio::spawn(connection_initiator(
+      channel_map,
       client_to_sink_push.clone(),
-      sink_to_client_pull.clone(),
       connection_receiver,
       cancel.clone(),
     ));
@@ -442,8 +459,13 @@ mod tests {
   #[tokio::test]
   async fn test_handle_new_connection_direct_success() {
     setup_tracing().await;
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let cancel = CancellationToken::new();
     let (target_addr, _) = run_echo().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -473,8 +495,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
+      channel_map,
       client_to_sink_push,
-      sink_to_client_pull,
       cancel,
     )
     .await;
@@ -486,8 +508,13 @@ mod tests {
   #[tokio::test]
   async fn test_handle_new_connection_socks5_success() {
     setup_tracing().await;
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let cancel = CancellationToken::new();
     let (target_addr, _) = run_echo().await;
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -524,8 +551,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
+      channel_map,
       client_to_sink_push,
-      sink_to_client_pull,
       cancel,
     )
     .await;
@@ -537,8 +564,13 @@ mod tests {
   #[tokio::test(start_paused = true)]
   async fn test_handle_new_connection_socks5_no_socks5_data() {
     setup_tracing().await;
-    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(256);
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let cancel = CancellationToken::new();
     let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local_listener.local_addr().unwrap();
@@ -555,8 +587,8 @@ mod tests {
     handle_new_connection(
       connection_state,
       connection_type,
+      channel_map,
       client_to_sink_push,
-      sink_to_client_pull,
       cancel,
     )
     .await;

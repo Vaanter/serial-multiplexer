@@ -1,6 +1,6 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub trait Sink: TryWrite + AsyncWriteExt + AsyncReadExt + Unpin + Sized {}
+pub trait Sink: TryWrite + AsyncWriteExt + AsyncReadExt + Unpin + Sized + Send {}
 
 impl<T> Sink for T where T: TryWrite + AsyncReadExt + AsyncWriteExt + Unpin + Sized {}
 

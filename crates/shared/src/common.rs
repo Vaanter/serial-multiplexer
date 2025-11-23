@@ -1,3 +1,4 @@
+use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::protocol_utils::{create_ack_datagram, create_close_datagram, create_data_datagram};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use crate::try_write::Sink;
@@ -19,7 +20,7 @@ use zeroize::Zeroize;
 
 /// Specifies how many datagrams without ACK a connection can have
 /// before the TCP connection gets plugged.
-const ACK_THRESHOLD: u64 = 32;
+pub const ACK_THRESHOLD: u64 = 32;
 
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
@@ -87,8 +88,7 @@ impl ConnectionState {
 
 /// Asynchronous loop for handling communication between a `sink` and clients.
 ///
-/// This function manages bidirectional communication between a `sink` (a stream
-/// implementing both `AsyncRead` and `AsyncWrite`) and clients using channels.
+/// This function manages bidirectional communication between a `sink` and clients using channels.
 /// It reads data from the sink and pushes it to the client via a broadcast channel,
 /// while also receiving data from the client and writing it to the sink.
 /// The loop terminates on a cancellation signal, sink disconnection, or an error during
@@ -96,10 +96,8 @@ impl ConnectionState {
 ///
 /// # Parameters
 ///
-/// * `sink`: An object implementing [`AsyncReadExt`] and [`AsyncWriteExt`],
-///   currently, this will either be [`SerialStream`], [`NamedPipeClient`] or [`UnixStream`].
-/// * `sink_to_client_push`: A [`broadcast::Sender`] used to send data from the sink to
-///   clients.
+/// * `sink`: A [`Sink`] data transfer medium through which two multiplexers communicate.
+/// * `channel_map`: A [`ChannelMap`] for sending received datagrams to clients/client initiator.
 /// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
 ///   function receives data sent by the client to be written to the sink.
 /// * `cancel`: A [`CancellationToken`] used to signal when this loop should terminate.
@@ -134,7 +132,7 @@ impl ConnectionState {
 #[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl Sink,
-  sink_to_client_push: async_broadcast::Sender<Bytes>,
+  channel_map: ChannelMap,
   client_to_sink_pull: async_channel::Receiver<Bytes>,
   cancel: CancellationToken,
 ) {
@@ -164,9 +162,9 @@ pub async fn sink_loop(
           Ok(n) => {
             let sink_read_duration = Instant::now();
             let result = handle_sink_read(
+              &channel_map,
               n + unprocessed_data_start,
               &mut sink_buf_read,
-              sink_to_client_push.clone(),
               &mut compression_buffer
             ).instrument(current_span).await;
             trace!(target: METRICS_TARGET, duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
@@ -272,9 +270,9 @@ pub async fn sink_loop(
 ///   * If some bytes remain unprocessed, they will be copied to the beginning of the buffer
 ///     and the rest of the buffer will be zeroed out.
 pub async fn handle_sink_read(
+  channel_map: &ChannelMap,
   bytes_read: usize,
   sink_buf: &mut BytesMut,
-  sink_to_client_push: async_broadcast::Sender<Bytes>,
   decompression_buffer: &mut BytesMut,
 ) -> anyhow::Result<usize> {
   debug_assert!(decompression_buffer.len() <= SINK_COMPRESSION_BUFFER_SIZE);
@@ -312,9 +310,6 @@ pub async fn handle_sink_read(
     let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
     decompression_buffer.zeroize();
     trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes.as_ref());
-    if let Err(e) = sink_to_client_push.broadcast_direct(datagram_bytes).await {
-      bail!("Failed to send data to clients. {}", e);
-    }
     unprocessed_data_start += datagram_end + 1 - header_idx;
     trace!(
       "Removing processed data in the working buffer at index {}",
@@ -322,6 +317,23 @@ pub async fn handle_sink_read(
     );
     read_data = &sink_buf[min(bytes_read, unprocessed_data_start)..bytes_read];
     trace!(target: HUGE_DATA_TARGET, "Data in buffer after reading datagram: {:?}", &read_data);
+    let Ok(datagram) = root_as_datagram(&datagram_bytes) else {
+      continue;
+    };
+    trace!("Read {:?} datagram for connection {}", datagram.code(), datagram.identifier());
+    let channel_map_pin = channel_map.pin_owned();
+    if datagram.code() == ControlCode::Initial {
+      if let Some(initiator_channel) = channel_map_pin.get(&Identifier::ClientInitiator)
+        && initiator_channel.0.broadcast_direct(datagram_bytes).await.is_err()
+      {
+        bail!("Failed to send Initial datagram to client initiator");
+      }
+    } else if let Some(client_channel) =
+      channel_map_pin.get(&Identifier::Client(datagram.identifier()))
+      && let Err(e) = client_channel.0.broadcast_direct(datagram_bytes).await
+    {
+      bail!("Failed to send data to clients. {}", e);
+    }
   }
 
   if unprocessed_data_start > last_header_idx.unwrap_or(0) || last_header_idx.is_none() {
@@ -730,16 +742,24 @@ async fn send_ack(
 ///    The processing might signal connection termination, which breaks the loop.
 ///
 /// [`Close`]: ControlCode::Close
-#[instrument(skip_all, fields(connection_id = %connection.identifier, client_address = %connection.client.peer_addr().unwrap()))]
+#[instrument(skip_all, fields(connection_id = %connection.identifier, client_address))]
 pub async fn connection_loop(
   mut connection: ConnectionState,
-  mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
+  debug!("Connection {} loop starting", connection.identifier);
+  let current_span = Span::current();
+  let client_address =
+    connection.client.peer_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
+  current_span.record("client_address", &client_address);
+  let (mut sink_to_client_pull, _guard) = channel_get_or_insert_with_guard(
+    channel_map.clone(),
+    Identifier::Client(connection.identifier),
+  );
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
   loop {
-    let current_span = Span::current();
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
     let connection_blocked =
       connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
@@ -758,7 +778,7 @@ pub async fn connection_loop(
       data = sink_to_client_pull.recv_direct() => {
         let sink_read_start = Instant::now();
         let connection_terminating =
-          process_sink_read(&mut connection, data, &client_to_sink_push).instrument(current_span).await;
+          process_sink_read(&mut connection, data, &client_to_sink_push).instrument(current_span.clone()).await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
         if connection_terminating {
           break;
@@ -784,7 +804,7 @@ pub async fn connection_loop(
             client_to_sink_push.clone(),
             bytes_read,
             &mut tcp_buf,
-          ).instrument(current_span).await;
+          ).instrument(current_span.clone()).await;
           trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
           if connection_terminating {
             break;
@@ -817,7 +837,9 @@ mod tests {
   use crate::test_utils::{run_echo, setup_tracing};
   use crate::try_write::Sink;
   use crate::utils::create_upstream_listener;
+  use papaya::HashMap;
   use std::net::SocketAddr;
+  use std::sync::Arc;
   use std::time::Duration;
   use tokio::io::AsyncReadExt;
   use tokio::net::{TcpListener, TcpStream};
@@ -830,47 +852,46 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(5),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
     sink_buf.extend_from_slice(&[1, 2]);
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
-    let n = zstd_safe::compress(compression_buf.as_mut(), &[4, 5, 6], 9).unwrap();
+    let datagram1 = create_data_datagram(5, 1, &[4, 5, 6]);
+    let n = zstd_safe::compress(compression_buf.as_mut(), &datagram1, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[7, 8, 9]);
     let mut buffer_size = sink_buf.len();
 
-    let unprocessed_bytes = handle_sink_read(
-      sink_buf.len(),
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 3);
-    assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[4, 5, 6]));
+    assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
     assert_eq!(sink_buf[3..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
     sink_buf.resize(unprocessed_bytes, 0);
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
-    let n = zstd_safe::compress(compression_buf.as_mut(), &[5; 100], 9).unwrap();
+    let datagram2 = create_close_datagram(5, 2);
+    let n = zstd_safe::compress(compression_buf.as_mut(), &datagram2, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[11, 12, 13, 14, 15]);
     buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      sink_buf.len(),
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(sink_buf.len(), buffer_size);
     assert_eq!(unprocessed_bytes, 5);
-    assert_eq!(sink_to_client_pull.recv().await.unwrap(), Bytes::from_static(&[5; 100]));
+    assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
     assert_eq!(sink_buf[5..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
@@ -880,11 +901,16 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(5),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
 
-    let datagram1 = create_data_datagram(0, 1, b"datagram1");
-    let datagram2 = create_data_datagram(1, 2, b"datagram2");
-    let datagram3 = create_data_datagram(2, 3, b"datagram3");
+    let datagram1 = create_data_datagram(5, 1, b"datagram1");
+    let datagram2 = create_data_datagram(5, 2, b"datagram2");
+    let datagram3 = create_data_datagram(5, 3, b"datagram3");
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram1, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
@@ -899,14 +925,10 @@ mod tests {
     sink_buf.extend_from_slice(&compression_buf[..n]);
 
     let buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
@@ -921,7 +943,12 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
 
     let datagram_data = BytesMut::from(vec![65u8; CONNECTION_BUFFER_SIZE].as_slice());
     let datagram = create_data_datagram(0, 1, &datagram_data);
@@ -931,14 +958,10 @@ mod tests {
     sink_buf.extend_from_slice(&compression_buf[..n]);
 
     let buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram);
@@ -951,19 +974,20 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     let buffer_size = sink_buf.len();
 
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
@@ -976,7 +1000,12 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
 
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
@@ -984,14 +1013,10 @@ mod tests {
     sink_buf.extend_from_slice(&[1; 3]);
     let buffer_size = sink_buf.len();
 
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
@@ -1003,7 +1028,12 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(200);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
 
     sink_buf.extend_from_slice(&[70; 5]); // garbage
     let datagram1 = create_data_datagram(0, 1, b"datagram1");
@@ -1015,14 +1045,10 @@ mod tests {
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
 
     let buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_ok());
     assert_eq!(unprocessed_bytes, 7);
@@ -1035,19 +1061,20 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(200);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
 
     let buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, 7);
@@ -1059,20 +1086,15 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(20);
+    let channel_map = Arc::new(HashMap::new());
 
     sink_buf.fill(80);
     let buffer_size = sink_buf.len();
-    let unprocessed_bytes = handle_sink_read(
-      buffer_size,
-      &mut sink_buf,
-      sink_to_client_push.clone(),
-      &mut compression_buf,
-    )
-    .await
-    .unwrap();
+    let unprocessed_bytes =
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+        .await
+        .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
-    assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, 7);
     assert_eq!(sink_buf[..7], Bytes::from_static(&[80; 7]));
     assert_eq!(sink_buf[8..], BytesMut::zeroed(buffer_size - 8)[..]);
@@ -1083,15 +1105,16 @@ mod tests {
     setup_tracing().await;
     let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    let _sink_loop_handle = tokio::spawn(sink_loop(
-      sink_a,
-      sink_to_client_push.clone(),
-      client_to_sink_pull,
-      cancel.clone(),
-    ));
+    let _sink_loop_handle =
+      tokio::spawn(sink_loop(sink_a, channel_map.clone(), client_to_sink_pull, cancel.clone()));
 
     info!("Sending initial datagram");
     let initial_data = "test data";
@@ -1112,6 +1135,11 @@ mod tests {
     sink_b.flush().await.unwrap();
 
     info!("Sending ACK datagram");
+    let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(2),
+      (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+    );
     let ack_datagram = create_ack_datagram(2, 0, 0);
     handle_sink_write(&mut sink_b, ack_datagram, &mut sink_buf_write).await.unwrap();
     let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
@@ -1134,14 +1162,19 @@ mod tests {
     sink_b.flush().await.unwrap();
 
     let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
-    for (i, data_size) in sizes.into_iter().enumerate() {
+    for (i, data_size) in (0..).zip(sizes.into_iter()) {
+      let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
+      channel_map.pin().insert(
+        Identifier::Client(i),
+        (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
+      );
       let mut data = BytesMut::new();
       data.resize(data_size, 100u8);
-      let data_datagram = create_data_datagram(i as u64, 1, &data);
+      let data_datagram = create_data_datagram(i, 1, &data);
       handle_sink_write(&mut sink_b, data_datagram, &mut sink_buf_write).await.unwrap();
       let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
       let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
-      assert_eq!(data_datagram.identifier(), i as u64);
+      assert_eq!(data_datagram.identifier(), i);
       assert_eq!(data_datagram.code(), ControlCode::Data);
       assert_eq!(data_datagram.data().unwrap().bytes(), data);
       assert_eq!(sink_buf_write, BytesMut::zeroed(sink_buf_write.len()));
@@ -1152,23 +1185,25 @@ mod tests {
   async fn test_sink_loop_write() {
     setup_tracing().await;
     let (sink_a, sink_b) = tokio::io::duplex(4096);
-    let (sink_to_client_push_write, _sink_to_client_pull_write) = async_broadcast::broadcast(256);
+    let channel_map_write = Arc::new(HashMap::new());
+    let (sink_to_client_push_write, sink_to_client_pull_write) = async_broadcast::broadcast(256);
+    channel_map_write.pin().insert(
+      Identifier::Client(3),
+      (sink_to_client_push_write.clone(), sink_to_client_pull_write.deactivate()),
+    );
     let (sink_to_client_push_read, mut sink_to_client_pull_read) = async_broadcast::broadcast(256);
+    let channel_map_read = Arc::new(HashMap::new());
     let (client_to_sink_push_write, client_to_sink_pull_write) = async_channel::bounded(256);
+    channel_map_read.pin().insert(
+      Identifier::Client(3),
+      (sink_to_client_push_read.clone(), sink_to_client_pull_read.clone().deactivate()),
+    );
     let (_client_to_sink_push_read, client_to_sink_pull_read) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    let _sink_loop_write_handle = tokio::spawn(sink_loop(
-      sink_a,
-      sink_to_client_push_write.clone(),
-      client_to_sink_pull_write.clone(),
-      cancel.clone(),
-    ));
-    let _sink_loop_read_handle = tokio::spawn(sink_loop(
-      sink_b,
-      sink_to_client_push_read.clone(),
-      client_to_sink_pull_read.clone(),
-      cancel.clone(),
-    ));
+    let _sink_loop_write_handle =
+      tokio::spawn(sink_loop(sink_a, channel_map_write, client_to_sink_pull_write, cancel.clone()));
+    let _sink_loop_read_handle =
+      tokio::spawn(sink_loop(sink_b, channel_map_read, client_to_sink_pull_read, cancel.clone()));
 
     let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
     for (i, data_size) in sizes.into_iter().enumerate() {
@@ -1207,20 +1242,20 @@ mod tests {
 
   #[cfg(unix)]
   #[tokio::test]
-  async fn test_write_to_sink_full_sink_named_pipe() {
+  async fn test_write_to_sink_full_sink_unix_socket() {
     use tokio::net::{UnixListener, UnixStream};
     setup_tracing().await;
-    let uds_path = "test_serial_multiplexer.sock";
+    let uds_path = "test_write_to_sink_full_sink_unix_socket.sock";
     let uds_server = UnixListener::bind(uds_path).unwrap();
     let pipe_server_handle = tokio::spawn(async move { uds_server.accept().await.unwrap().0 });
     let sink_a = UnixStream::connect(uds_path).await.unwrap();
-    let sink_b = pipe_server_handle.await.unwrap();
+    let _sink_b = pipe_server_handle.await.unwrap();
     test_write_to_sink_full_sink(sink_a).await;
   }
 
   async fn test_write_to_sink_full_sink(mut sink_a: impl Sink) {
     loop {
-      if let Err(e) = sink_a.try_write(&BytesMut::zeroed(2usize.pow(20)))
+      if let Err(e) = sink_a.try_write(&BytesMut::zeroed(2usize.pow(20))).await
         && e.kind() == std::io::ErrorKind::WouldBlock
       {
         break;
@@ -1234,9 +1269,14 @@ mod tests {
   #[tokio::test]
   async fn test_connection_loop_sink_read() {
     setup_tracing().await;
-    let cancel = CancellationToken::new();
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::Client(0),
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+    let cancel = CancellationToken::new();
     let data = Bytes::from_static(b"test data");
 
     let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
@@ -1250,7 +1290,7 @@ mod tests {
       let connection = ConnectionState::new(identifier, client);
       tokio::spawn(connection_loop(
         connection,
-        sink_to_client_pull,
+        channel_map,
         client_to_sink_push.clone(),
         cancel.clone(),
       ));
@@ -1278,9 +1318,14 @@ mod tests {
   async fn test_connection_loop_blocked_timeout() {
     setup_tracing().await;
     let identifier = 0;
-    let cancel = CancellationToken::new();
-    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+    let cancel = CancellationToken::new();
 
     let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
     let (loop_task_sender, mut loop_task_receiver) = mpsc::channel::<JoinHandle<()>>(1);
@@ -1295,7 +1340,7 @@ mod tests {
       loop_task_sender
         .send(tokio::spawn(connection_loop(
           connection,
-          sink_to_client_pull,
+          channel_map,
           client_to_sink_push.clone(),
           cancel.clone(),
         )))
@@ -1318,9 +1363,14 @@ mod tests {
   #[tokio::test]
   async fn test_connection_loop_cancel() {
     setup_tracing().await;
-    let cancel = CancellationToken::new();
-    let (_sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+    let cancel = CancellationToken::new();
 
     let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
     let handle = tokio::spawn({
@@ -1333,7 +1383,7 @@ mod tests {
         let identifier = 0;
 
         let connection = ConnectionState::new(identifier, client);
-        connection_loop(connection, sink_to_client_pull, client_to_sink_push.clone(), cancel).await;
+        connection_loop(connection, channel_map, client_to_sink_push, cancel).await;
       }
     });
 
@@ -1588,16 +1638,17 @@ mod tests {
   async fn test_sink_loop_channel_closed() {
     setup_tracing().await;
     let (sink_a, _sink_b) = tokio::io::duplex(4096);
-    let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     client_to_sink_pull.close();
-    let _sink_loop_handle = tokio::spawn(sink_loop(
-      sink_a,
-      sink_to_client_push.clone(),
-      client_to_sink_pull,
-      cancel.clone(),
-    ));
+    let _sink_loop_handle =
+      tokio::spawn(sink_loop(sink_a, channel_map, client_to_sink_pull, cancel.clone()));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 
@@ -1605,16 +1656,17 @@ mod tests {
   async fn test_sink_read_sink_closed() {
     setup_tracing().await;
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
-    let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     sink_b.shutdown().await.unwrap();
-    let _sink_loop_handle = tokio::spawn(sink_loop(
-      sink_a,
-      sink_to_client_push.clone(),
-      client_to_sink_pull,
-      cancel.clone(),
-    ));
+    let _sink_loop_handle =
+      tokio::spawn(sink_loop(sink_a, channel_map, client_to_sink_pull, cancel.clone()));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

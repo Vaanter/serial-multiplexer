@@ -1,3 +1,4 @@
+use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::ConnectionState;
 use crate::host::{ConnectionType, IDENTIFIER_SEQUENCE};
 use bytes::Bytes;
@@ -6,11 +7,12 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
+use std::mem;
 use std::sync::atomic::Ordering;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{Span, debug, error, info};
 use tracing_attributes::instrument;
 
 type ServerBuilder = hyper::server::conn::http1::Builder;
@@ -24,24 +26,24 @@ type ServerBuilder = hyper::server::conn::http1::Builder;
 /// # Parameters
 ///
 /// * `listener`: A [`TcpListener`] whose connections will be accepted.
-/// * `sink_to_client_pull`:
-///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
+/// * `channel_map`: A [`ChannelMap`] to receive ACK datagram when initiating a connection.
 /// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
 ///   sink(s) when initiating a connection.
 /// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
 ///   [`crate::host::connection_initiator`] after initiation succeeds.
 /// * `cancel`:
 ///   A [`CancellationToken`] used to signal loop termination due to the app shutting down.
-#[instrument(skip_all, fields(listener_address = %listener.local_addr().unwrap()))]
+#[instrument(skip_all, fields(listener_address))]
 pub async fn run_http_listener(
   listener: TcpListener,
-  sink_to_client_pull: async_broadcast::Receiver<Bytes>,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
-  let listener_address = listener.local_addr().unwrap();
-  let sink_to_client_pull_inactive = sink_to_client_pull.deactivate();
+  let listener_address =
+    listener.local_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
+  Span::current().record("listener_address", &listener_address);
   loop {
     tokio::select! {
       biased;
@@ -55,7 +57,7 @@ pub async fn run_http_listener(
             info!("Client connected: {}", client_address);
             handle_http_connection(
               client,
-              sink_to_client_pull_inactive.clone(),
+              channel_map.clone(),
               client_to_sink_push.clone(),
               connection_sender.clone(),
             );
@@ -75,26 +77,20 @@ pub async fn run_http_listener(
 /// # Parameters
 ///
 /// * `client`: The TCP stream for the connected client.
-/// * `sink_to_client_pull`:
-///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
+/// * `channel_map`: A [`ChannelMap`] to receive ACK datagram when initiating a connection.
 /// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
 ///   sink(s) when initiating a connection.
 /// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
 ///   [`crate::host::connection_initiator`] after initiation succeeds.
 fn handle_http_connection(
   client: TcpStream,
-  sink_to_client_pull: async_broadcast::InactiveReceiver<Bytes>,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
 ) {
   let io = TokioIo::new(client);
   let serving = service_fn(move |req| {
-    serve_http(
-      req,
-      client_to_sink_push.clone(),
-      sink_to_client_pull.clone(),
-      connection_sender.clone(),
-    )
+    serve_http(req, channel_map.clone(), client_to_sink_push.clone(), connection_sender.clone())
   });
 
   tokio::spawn(async move {
@@ -120,16 +116,15 @@ fn handle_http_connection(
 /// # Parameters
 ///
 /// * `req`: The incoming HTTP request.
-/// * `client_to_sink_push`: An [`async_channel::Sender`] to send an Initial datagram to the
-///   sink(s) when initiating a connection.
+/// * `channel_map`: A [`ChannelMap`] to receive ACK datagram when initiating a connection.
 /// * `sink_to_client_pull`:
 ///   An [`async_broadcast::Receiver<Bytes>`] to receive ACK datagram when initiating a connection.
 /// * `connection_sender`: An [`mpsc::Sender`] used to send a connection to
 ///   [`crate::host::connection_initiator`] after initiation succeeds.
 async fn serve_http(
   req: Request<hyper::body::Incoming>,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
-  sink_to_client_pull: async_broadcast::InactiveReceiver<Bytes>,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
   debug!("Received request: {:?}", req);
@@ -137,7 +132,8 @@ async fn serve_http(
   if Method::CONNECT == req.method() {
     if let Some(target_address) = extract_authority(req.uri()) {
       let identifier = IDENTIFIER_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-      let mut sink_to_client_pull = sink_to_client_pull.activate();
+      let (mut sink_to_client_pull, guard) =
+        channel_get_or_insert_with_guard(channel_map.clone(), Identifier::Client(identifier));
       let connect_result = crate::host::initiate_connection(
         identifier,
         target_address.to_string(),
@@ -158,11 +154,14 @@ async fn serve_http(
 
             if let Err(e) = connection_sender.send((connection, ConnectionType::Http)).await {
               error!("Failed to finish setup for connection {}: {}", identifier, e);
+            } else {
+              // Forget the guard so the client's channel doesn't get removed
+              mem::forget(guard);
             }
           }
         });
       } else {
-        info!("Failed to initialize connection, sending 400 status.");
+        info!("Failed to initialize connection {}, sending 400 status.", identifier);
         return Ok(create_400_response(None::<Bytes>));
       }
 
@@ -209,6 +208,8 @@ mod tests {
   use crate::test_utils::{run_echo, setup_tracing};
   use bytes::Bytes;
   use http_body_util::BodyExt;
+  use papaya::HashMap;
+  use std::sync::Arc;
   use tokio::net::{TcpListener, TcpStream};
   use tokio::sync::mpsc;
   use tokio_util::sync::CancellationToken;
@@ -240,17 +241,17 @@ mod tests {
   async fn test_run_http_listener_smoke() {
     type ClientBuilder = hyper::client::conn::http1::Builder;
     setup_tracing().await;
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(4);
-    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(4);
+    let channel_map = Arc::new(HashMap::new());
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_address = listener.local_addr().unwrap();
     let (target_address, _) = run_echo().await;
-    info!("Echo server running at {:?}", target_address);
     let connection_type = ConnectionType::Http;
     let (connection_sender, mut connection_receiver) = mpsc::channel(4);
     tokio::spawn(run_http_listener(
       listener,
-      sink_to_client_pull,
+      channel_map.clone(),
       client_to_sink_push,
       connection_sender,
       CancellationToken::new(),
@@ -267,6 +268,12 @@ mod tests {
       assert_eq!(0, initial_datagram.sequence());
       assert_eq!(ControlCode::Initial, initial_datagram.code());
       assert_eq!(target_address.to_string().as_bytes(), initial_datagram.data().unwrap().bytes());
+      let sink_to_client_push = channel_map
+        .pin()
+        .get(&Identifier::Client(initial_datagram.identifier()))
+        .unwrap()
+        .0
+        .clone();
       sink_to_client_push
         .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
         .await

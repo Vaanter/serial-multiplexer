@@ -1,3 +1,4 @@
+use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::{ConnectionState, connection_loop};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
@@ -18,8 +19,8 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// # Parameters
 ///
-/// * `sink_to_client_pull`:
-///   A [`async_broadcast::Receiver<Bytes>`] to receive data from a sink.
+/// * `channel_map`:
+///   A [`ChannelMap`] to receive Initial datagrams from the sink.
 /// * `client_to_sink_push`: An [`async_channel::Sender<Bytes>`] to send data from clients back
 ///   to the sink(s).
 /// * `cancel`: A [`CancellationToken`] to signal when the function should terminate.
@@ -33,18 +34,19 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 ///   * If successful and a connection is established,
 ///     it spawns a new task that runs [`connection_loop`],
 ///     handling communication between the client connection and the sink.
-///   * If the connection initiation fails or exceeds the timeout, appropriate errors are logged.
-/// * If no data can be received from a sink(s) (i.e. all ports are closed),
+/// * If no data can be received from a sink(s) (i.e. all sinks are closed),
 ///   `cancel` will be triggered, and the loop ends.
 /// * The loop terminates when the cancellation token (`cancel`) is triggered.
 ///
 /// [`Initial`]: ControlCode::Initial
 pub async fn client_initiator(
-  mut sink_to_client_pull: async_broadcast::Receiver<Bytes>,
+  channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
   debug!("Starting client initiator");
+  let (mut sink_to_client_pull, _guard) =
+    channel_get_or_insert_with_guard(channel_map.clone(), Identifier::ClientInitiator);
   loop {
     tokio::select! {
       biased;
@@ -55,8 +57,8 @@ pub async fn client_initiator(
         match data {
           Ok(data) => {
             tokio::spawn({
-              let sink_to_client_pull = sink_to_client_pull.clone().deactivate();
               let client_to_sink_push = client_to_sink_push.clone();
+              let channel_map = channel_map.clone();
               let cancel = cancel.clone();
               async move {
                 match timeout(CLIENT_INITIATION_TIMEOUT,
@@ -64,8 +66,8 @@ pub async fn client_initiator(
                   Ok(Ok(Some(connection))) => {
                     tokio::spawn(connection_loop(
                       connection,
-                      sink_to_client_pull.activate(),
-                      client_to_sink_push.clone(),
+                      channel_map,
+                      client_to_sink_push,
                       cancel.clone()
                     ));
                   },
@@ -164,6 +166,8 @@ mod tests {
   use crate::protocol_utils::create_initial_datagram;
   use crate::schema_generated::serial_multiplexer::root_as_datagram;
   use crate::test_utils::{run_echo, setup_tracing};
+  use papaya::HashMap;
+  use std::sync::Arc;
 
   #[tokio::test]
   async fn test_initiate_client_connection_smoke() {
@@ -199,16 +203,17 @@ mod tests {
   async fn test_client_initiator_success() {
     setup_tracing().await;
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
     let initial = create_initial_datagram(123, &target_address);
 
-    tokio::spawn(client_initiator(
-      sink_to_client_pull,
-      client_to_sink_push,
-      CancellationToken::new(),
-    ));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 
     sink_to_client_push.broadcast_direct(initial).await.unwrap();
     let ack = client_to_sink_pull.recv().await.unwrap();
@@ -222,15 +227,16 @@ mod tests {
   async fn test_client_initiator_target_unreachable() {
     setup_tracing().await;
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let target_address = "127.0.0.1:0".to_string();
     let initial = create_initial_datagram(123, &target_address);
 
-    tokio::spawn(client_initiator(
-      sink_to_client_pull,
-      client_to_sink_push,
-      CancellationToken::new(),
-    ));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 
     sink_to_client_push.broadcast_direct(initial).await.unwrap();
     assert!(timeout(Duration::from_secs(1), client_to_sink_pull.recv()).await.is_err());
@@ -240,12 +246,17 @@ mod tests {
   async fn test_client_initiator_sink_closed() {
     setup_tracing().await;
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let cancel = CancellationToken::new();
 
-    tokio::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel.clone()));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, cancel.clone()));
 
-    drop(sink_to_client_push);
+    sink_to_client_push.close();
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

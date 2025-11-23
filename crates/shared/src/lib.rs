@@ -1,3 +1,4 @@
+pub mod channels;
 pub mod common;
 pub mod guest;
 pub mod host;
