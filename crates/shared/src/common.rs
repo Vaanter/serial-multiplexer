@@ -8,6 +8,7 @@ use memchr::memmem::Finder;
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::io::ErrorKind;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -89,25 +90,25 @@ impl ConnectionState {
 /// Asynchronous loop for handling communication between a `sink` and clients.
 ///
 /// This function manages bidirectional communication between a `sink` and clients using channels.
-/// It reads data from the sink and pushes it to the client via a broadcast channel,
-/// while also receiving data from the client and writing it to the sink.
-/// The loop terminates on a cancellation signal, sink disconnection, or an error during
-/// read/write operations.
+/// It reads data from the sink and pushes it to the appropriate client via separate broadcast channels,
+/// while also receiving data from clients and writing it to the sink.
+/// If the sink buffer becomes full, write operations are retried at intervals to prevent blocking.
+/// The loop terminates on a cancellation signal, sink disconnection, or an error during read/write operations.
 ///
 /// # Parameters
 ///
 /// * `sink`: A [`Sink`] data transfer medium through which two multiplexers communicate.
 /// * `channel_map`: A [`ChannelMap`] for sending received datagrams to clients/client initiator.
 /// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
-///   function receives data sent by the client to be written to the sink.
+///   function receives data sent by clients to be written to the sink.
 /// * `cancel`: A [`CancellationToken`] used to signal when this loop should terminate.
 ///
 /// # Behaviour
 ///
 /// * Continuously reads from the `sink` using a buffer of size [`SINK_BUFFER_SIZE`] and
-///   sends the processed data to clients via the `sink_to_client_push` channel.
-/// * Continuously listens for data from the `client_to_sink_pull` channel to write
-///   to the `sink`.
+///   sends the processed data to the appropriate client channel.
+/// * Continuously listens for data from the `client_to_sink_pull` channel to write to the `sink`.
+/// * Retries failed writes to the sink at intervals to prevent indefinite blocking when the sink is full.
 /// * Exits the loop gracefully when the cancellation token is triggered, the sink is
 ///   disconnected, or an error occurs during read/write operations.
 ///
@@ -115,13 +116,16 @@ impl ConnectionState {
 ///
 /// * `sink.read()`:
 ///   * Reads data from the `sink` into an internal buffer.
-///   * Processes any unprocessed bytes in the buffer and sends them to the client
-///     broadcast channel.
+///   * Processes any unprocessed bytes in the buffer and sends them to the appropriate client channel.
 ///   * Handles errors or disconnects from the `sink`, breaking the loop if necessary.
 ///
 /// * `client_to_sink_pull.recv()`:
-///   * Receives data from a client to write into the `sink`
+///   * Receives data from a client to write into the `sink`.
+///   * Only receives when there is no pending data to write.
 ///   * Uses the `handle_sink_write()` function to handle the actual write to the `sink`.
+///
+/// * `sleep(SINK_WRITE_RETRY_INTERVAL)`:
+///   * Retries writing pending data to the sink at regular intervals.
 ///
 /// * `cancel.cancelled()`:
 ///   * Terminates the loop immediately when cancellation is triggered.
@@ -220,16 +224,15 @@ pub async fn sink_loop(
 }
 
 /// Handles reading data from a sink buffer, processes complete datagrams, and forwards them
-/// to clients via a broadcast channel.
+/// to the appropriate client channels.
 /// Any unprocessed data is preserved for subsequent reads.
 ///
 /// # Parameters
 ///
+/// * `channel_map`: A [`ChannelMap`] containing separate channels for each client.
 /// * `bytes_read`: The number of bytes read into the sink buffer from the sink.
 /// * `sink_buf`:
 ///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
-/// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`]
-///   used to send processed datagrams to clients.
 /// * `decompression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
 ///   the datagram after decompression
 ///
@@ -241,7 +244,7 @@ pub async fn sink_loop(
 /// 3. Extracts each datagram from the buffer if it is complete
 ///    (based on the size after the header).
 /// 4. Decompresses the datagram
-/// 5. Sends the decompressed datagram to clients via the `sink_to_client_push` channel.
+/// 5. Sends the decompressed datagram to the appropriate client channel based on the datagram identifier.
 /// 6. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
 ///    Ensures already processed
 ///    data is removed or cleared appropriately.
@@ -254,8 +257,7 @@ pub async fn sink_loop(
 ///
 /// # Errors
 ///
-/// Returns an error if there is an issue with sending the datagram to the `sink_to_client_push`
-/// channel.
+/// Returns an error if there is an issue with sending the datagram to the appropriate client channel.
 /// The error is propagated using [`anyhow::Result`].
 ///
 /// # Notes
@@ -358,37 +360,27 @@ pub async fn handle_sink_read(
   Ok(unprocessed_bytes)
 }
 
-/// Handles writing datagrams to the sink.
-/// This function writes a predefined header,
-/// the length of the datagram, and the actual datagram in order.
+/// Handles writing of the datagram header, length, and compressed datagram to the sink.
+///
+/// Returns Ok(n) where n is the number of unwritten bytes.
 ///
 /// # Parameters
-/// * `sink`:
-///   A mutable reference to any type (`T`)
-///   that is used as a sink and where the data will be written.
-///   Currently, this will either be [`SerialStream`], [`NamedPipeClient`] or [`UnixStream`].
+/// * `sink`: A [`Sink`] data transfer medium through which two multiplexers communicate.
 /// * `data`:
 ///   A [`Bytes`] object representing the datagram that will be written to the sink.
-/// * `compression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
-///   the datagram after compression
+/// * `compression_buffer`: A buffer to store all bytes (header, length, and datagram) that need
+///   to be written to the sink.
 ///
 /// # Behaviour
 /// The function follows these steps:
 /// 1. Compresses the datagram using [`zstd_safe`] into `compression_buffer`
-/// 2. Writes a constant [`DATAGRAM_HEADER`] (the header) to the sink.
-/// 3. Writes the size of the `data` as [`LENGTH_BYTES`] bytes to the sink.
-/// 4. Writes the `datagram` itself to the sink.
-/// 5. Flushes the sink to ensure everything is written out.
+/// 2. Prepares the header, length, and compressed datagram in the buffer.
+/// 3. Attempts to write the data to the sink using `write_to_sink`.
+/// 4. If the sink is full, returns the number of unwritten bytes.
+/// 5. If successful, flushes the sink to ensure everything is written out.
 ///
 /// # Errors
-/// This function returns an `anyhow::Result<()>`, which will contain an error
-/// if any of the following operations fails:
-/// * Writing the [`DATAGRAM_HEADER`] to the sink.
-/// * Writing the length of the datagram to the sink.
-/// * Writing the `datagram` itself to the sink.
-/// * Flushing the sink after all writes.
-///
-/// The error message will include details about which operation failed.
+/// When compressing the datagram or writing to the sink fails.
 ///
 /// [`SerialStream`]: tokio_serial::SerialStream
 /// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
@@ -420,7 +412,7 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
         trace!("Wrote {} bytes to sink", bytes_written);
         bytes_sent = bytes_sent.saturating_add(bytes_written);
       }
-      Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+      Err(e) if e.kind() == ErrorKind::WouldBlock => {
         let leftover_bytes = data_to_send.len().saturating_sub(bytes_sent);
         trace!("Unable to write {} bytes to sink", leftover_bytes);
         data_to_send.copy_within(bytes_sent..data_to_send.len(), 0);
@@ -715,13 +707,12 @@ async fn send_ack(
   }
 }
 
-/// Handles reading and processing data to/from the client and serial port(s).
+/// Handles reading and processing data to/from the client and sink(s).
 ///
 /// # Parameters
 ///
 /// * `connection`: The current [`ConnectionState`] that holds the client's state and identifier.
-/// * `sink_to_client_pull`:
-///   A [`async_broadcast::Receiver<Bytes>`] to receive datagrams from the sink for processing.
+/// * `channel_map`: A [`ChannelMap`] containing the separate channel for this client.
 /// * `client_to_sink_push`:
 ///   An [`async_channel::Sender`] for sending data received from the client to the sink(s).
 /// * `cancel`:
@@ -731,14 +722,16 @@ async fn send_ack(
 ///
 /// The function runs in a loop that listens for three primary conditions:
 /// 1. **Cancellation signal**: If `cancel.cancelled()` is triggered, the connection is closed
-///    gracefully by shutting down the client, sending a [`Close`] datagram and exiting the loop.
-/// 2. **Incoming data from the server**:
-///    When [`sink_to_client_pull.recv()`] receives data from sink,
-///    it uses [`process_sink_read()`] to handle and forward the data to the client.
+///    gracefully by shutting down the client, sending a [`Close`] datagram, and exiting the loop.
+/// 2. **Incoming data from the sink**:
+///    Receives data from the connection's dedicated channel via `recv_direct()`,
+///    then uses [`process_sink_read()`] to handle and forward the data to the client.
 ///    The processing might signal connection termination, which breaks the loop.
 /// 3. **Incoming data from the client**:
-///    When [`connection.client.read()`] receives data from the client,
-///    it processes the data with [`handle_client_read()`].
+///    Uses [`peek()`](TcpStream::peek) to check for available data without blocking the STC
+///    channel. If data is available, reads it with [`try_read()`](TcpStream::try_read)
+///    and processes it with [`handle_client_read()`].
+///    If the connection is blocked (too many unacknowledged datagrams), sleeps instead of reading.
 ///    The processing might signal connection termination, which breaks the loop.
 ///
 /// [`Close`]: ControlCode::Close
@@ -786,7 +779,7 @@ pub async fn connection_loop(
       }
       bytes_read = async {
         if connection_blocked {
-          sleep(Duration::from_secs(3)).await;
+          sleep(Duration::from_secs(1)).await;
         }
         connection.client.peek(&mut tcp_buf).await
       } => {
@@ -1256,7 +1249,7 @@ mod tests {
   async fn test_write_to_sink_full_sink(mut sink_a: impl Sink) {
     loop {
       if let Err(e) = sink_a.try_write(&BytesMut::zeroed(2usize.pow(20))).await
-        && e.kind() == std::io::ErrorKind::WouldBlock
+        && e.kind() == ErrorKind::WouldBlock
       {
         break;
       }
@@ -1537,7 +1530,7 @@ mod tests {
     assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
     let mut client_buf = BytesMut::zeroed(2048);
     assert_eq!(
-      std::io::ErrorKind::WouldBlock,
+      ErrorKind::WouldBlock,
       connection.client.try_read(&mut client_buf).unwrap_err().kind()
     );
   }

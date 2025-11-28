@@ -197,8 +197,7 @@ pub mod common {
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `serial_paths`
   ///   property, which specifies paths of the erial ports to which this function will connect.
-  /// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
-  ///   client loops.
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
@@ -267,6 +266,10 @@ pub mod common {
   /// # Parameters
   ///
   /// * `properties`: A mutable reference to [`Host`] that provides the addresses for the listeners
+  /// * `address_pairs`: [`AddressPair`]s to create listeners for direct connections
+  /// * `socks5_proxy`: An address to which will the socks5 listener bind itself to
+  /// * `http_proxy`: An address to which will the http proxy listener bind itself to
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `connection_sender`: An [`mpsc::Sender`] channel where the connection information will be
   ///   sent when a client connects.
   /// * `cancel`: A [`CancellationToken`] to signal the listener loops to end due to application

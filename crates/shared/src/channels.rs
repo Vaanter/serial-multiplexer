@@ -4,7 +4,8 @@ use papaya::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
-/// Thread-safe map storing each client's channel used to send datagrams to/from the sink(s).
+/// Thread-safe map storing separate channels for each client and the client initiator.
+/// Each entry contains a broadcast sender and inactive receiver for sending datagrams from the sink(s).
 pub type ChannelMap = Arc<
   HashMap<Identifier, (async_broadcast::Sender<Bytes>, async_broadcast::InactiveReceiver<Bytes>)>,
 >;
@@ -17,7 +18,7 @@ pub struct ChannelMapGuard {
 
 impl Drop for ChannelMapGuard {
   fn drop(&mut self) {
-    debug!("Removing {:?} channels", self.identifier);
+    debug!("Removing {:?} channel", self.identifier);
     self.channel_map.pin().remove(&self.identifier);
   }
 }
@@ -33,7 +34,8 @@ pub enum Identifier {
 
 /// Retrieves or creates a broadcast channel for the given identifier.
 ///
-/// Creates a new channel if one doesn't exist, or activates an existing one.
+/// Each client and the client initiator have separate channels for receiving datagrams from the sink(s).
+/// Creates a new channel with capacity `ACK_THRESHOLD * 2` if one doesn't exist, or activates an existing one.
 /// The returned guard automatically removes the channel when dropped.
 ///
 /// # Parameters
