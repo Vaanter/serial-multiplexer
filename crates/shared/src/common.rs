@@ -11,7 +11,7 @@ use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -752,12 +752,15 @@ pub async fn connection_loop(
     Identifier::Client(connection.identifier),
   );
   let mut tcp_buf = BytesMut::zeroed(CONNECTION_BUFFER_SIZE);
+  let mut unprocessed_bytes: usize = 0;
   loop {
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
+    let mut available_buffer_end = tcp_buf.len();
     let connection_blocked =
       connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
     if connection_blocked {
       trace!("Connection blocked. {:?}", connection);
+      available_buffer_end = unprocessed_bytes.saturating_add(1);
     }
     tokio::select! {
       biased;
@@ -779,16 +782,17 @@ pub async fn connection_loop(
       }
       bytes_read = async {
         if connection_blocked {
-          sleep(Duration::from_secs(1)).await;
+          sleep(Duration::from_secs(3)).await;
         }
-        connection.client.peek(&mut tcp_buf).await
+        connection.client.read(&mut tcp_buf[unprocessed_bytes..available_buffer_end]).await
       } => {
         if matches!(bytes_read, Ok(0) | Err(_)) {
+          debug!("Client disconnected");
           send_close_datagram(&mut connection, &client_to_sink_push).await;
           break;
         }
         if !connection_blocked {
-          let bytes_read = connection.client.try_read(&mut tcp_buf);
+          unprocessed_bytes = 0;
           connection.sequence += 1;
           let client_read_start = Instant::now();
           let connection_terminating = handle_client_read(
@@ -799,11 +803,18 @@ pub async fn connection_loop(
             &mut tcp_buf,
           ).instrument(current_span.clone()).await;
           trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
+          tcp_buf.zeroize();
           if connection_terminating {
             break;
           }
+        } else if unprocessed_bytes == tcp_buf.len() {
+          debug!("Buffer overrun, closing connection");
+          if let Err(e) = connection.client.shutdown().await {
+            error!("Failed to shutdown connection. {e}");
+          }
+          send_close_datagram(&mut connection, &client_to_sink_push).await;
+          break;
         }
-        tcp_buf.zeroize();
       }
     }
   }
@@ -1260,7 +1271,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_connection_loop_sink_read() {
+  async fn test_connection_loop_sink_read_write() {
     setup_tracing().await;
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -1301,6 +1312,12 @@ mod tests {
     let ack = root_as_datagram(&ack_bytes).unwrap();
     assert_eq!(ControlCode::Ack, ack.code());
     assert_eq!(1, u64::from_be_bytes(ack.data().unwrap().bytes().try_into().unwrap()));
+    client.write_all(&data).await.unwrap();
+    let data_bytes = client_to_sink_pull.recv().await.unwrap();
+    let data_datagram = root_as_datagram(&data_bytes).unwrap();
+    assert_eq!(ControlCode::Data, data_datagram.code());
+    assert_eq!(2, data_datagram.sequence());
+    assert_eq!(&data, data_datagram.data().unwrap().bytes());
     let close_datagram = create_close_datagram(0, 2);
     sink_to_client_push.broadcast_direct(close_datagram).await.unwrap();
     let n = client.read(&mut client_buf).await.unwrap();
