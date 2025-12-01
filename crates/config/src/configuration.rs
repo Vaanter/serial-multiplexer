@@ -141,6 +141,7 @@ pub enum GuestSink {
   #[cfg(not(windows))]
   UnixSocket(UnixSocketGuest),
   /// Communicate with multiplexer in host mode via a Windows named pipe
+  #[cfg(windows)]
   WindowsPipe(WindowsPipeGuest),
 }
 
