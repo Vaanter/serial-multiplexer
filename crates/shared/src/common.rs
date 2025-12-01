@@ -792,14 +792,13 @@ pub async fn connection_loop(
           break;
         }
         if !connection_blocked {
-          unprocessed_bytes = 0;
           connection.sequence += 1;
           let client_read_start = Instant::now();
           let connection_terminating = handle_client_read(
             connection.identifier,
             connection.sequence,
             client_to_sink_push.clone(),
-            bytes_read,
+            bytes_read.map(|b| b + unprocessed_bytes),
             &mut tcp_buf,
           ).instrument(current_span.clone()).await;
           trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
@@ -807,6 +806,7 @@ pub async fn connection_loop(
           if connection_terminating {
             break;
           }
+          unprocessed_bytes = 0;
         } else if unprocessed_bytes == tcp_buf.len() {
           debug!("Buffer overrun, closing connection");
           if let Err(e) = connection.client.shutdown().await {
