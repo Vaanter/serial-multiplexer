@@ -80,6 +80,10 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
           GuestSink::Serial(ref serial) => {
             ensure!(!serial.serial_paths.is_empty(), "No serial ports configured");
           }
+          #[cfg(windows)]
+          GuestSink::WindowsPipe(ref pipes) => {
+            ensure!(!pipes.pipe_paths.is_empty(), "No Windows name pipe path configured");
+          }
           #[cfg(not(windows))]
           GuestSink::UnixSocket(ref unix_socket) => {
             use std::path::PathBuf;

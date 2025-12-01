@@ -155,6 +155,19 @@ pub mod common {
             .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
       }
+      #[cfg(windows)]
+      GuestSink::WindowsPipe(ref windows_pipe_properties) => {
+        use crate::runner::windows::listen_accept_windows_named_pipe;
+        let pipe_sinks = listen_accept_windows_named_pipe(
+          windows_pipe_properties,
+          channel_map.clone(),
+          client_to_sink_pull.clone(),
+          cancel.clone(),
+        )
+        .await
+        .context("Failed to create Windows name pipe based sink loops.")?;
+        sink_loops.extend(pipe_sinks);
+      }
       #[cfg(unix)]
       GuestSink::UnixSocket(unix_socket) => {
         {
@@ -483,15 +496,17 @@ pub mod common {
 
 #[cfg(windows)]
 mod windows {
-  use anyhow::Error;
+  use anyhow::{Context, Error, anyhow};
   use bytes::Bytes;
-  use config::configuration::WindowsPipeHost;
+  use config::configuration::{WindowsPipeGuest, WindowsPipeHost};
+  use futures::future::try_join_all;
   use futures::stream::FuturesUnordered;
   use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
   use std::collections::HashSet;
   use std::time::Duration;
   use tokio::io::AsyncWriteExt;
+  use tokio::net::windows::named_pipe;
   use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
   use tokio::task::JoinHandle;
   use tokio::time::sleep;
@@ -575,6 +590,85 @@ mod windows {
   /// Attempts to open a named pipe at the specified path for reading and writing
   fn prepare_pipe(pipe_path: &str) -> Result<NamedPipeClient, Error> {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
+  }
+
+  pub async fn listen_accept_windows_named_pipe(
+    properties: &WindowsPipeGuest,
+    channel_map: ChannelMap,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
+    cancel: CancellationToken,
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let pipe_instances = properties.pipe_paths.iter().try_fold(
+      Vec::with_capacity(properties.pipe_paths.len()),
+      |mut instances, path| match named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(path)
+      {
+        Ok(instance) => {
+          debug!("Listening for a Windows named pipe connection on {}", path);
+          instances.push(instance);
+          Ok(instances)
+        }
+        Err(e) => {
+          instances.into_iter().for_each(|i| {
+            if let Err(e) = i.disconnect() {
+              error!("Failed to disconnect Windows named pipe. {:?}", e);
+            }
+          });
+          Err(e).context(format!("Failed to create Windows named pipe server '{}'", path))
+        }
+      },
+    )?;
+
+    let instance_tasks: Vec<_> = pipe_instances
+      .into_iter()
+      .map(|instance| {
+        tokio::spawn(async move {
+          match instance.connect().await {
+            Ok(_) => Ok(instance),
+            Err(e) => Err((instance, e)),
+          }
+        })
+      })
+      .collect();
+
+    let connected_instances =
+      try_join_all(instance_tasks).await.context("Failed waiting for all pipe tasks to finish")?;
+    if connected_instances.iter().any(|i| i.is_err()) {
+      let mut ret_error = anyhow::anyhow!("Some Windows pipes failed to connect");
+      for instance in connected_instances {
+        match instance {
+          Ok(instance) => {
+            if let Err(e) = instance.disconnect() {
+              ret_error =
+                ret_error.context(format!("Failed to disconnect Windows named pipe. {e}"));
+            }
+          }
+          Err((instance, e)) => {
+            let mut anyhow_e = anyhow!(e);
+            if let Err(e) = instance.disconnect() {
+              anyhow_e =
+                anyhow_e.context(format!("Also failed to disconnect Windows named pipe. {e}"));
+            }
+            ret_error = ret_error.context(anyhow_e);
+          }
+        }
+      }
+      return Err(ret_error);
+    }
+    Ok(
+      connected_instances
+        .into_iter()
+        .map(|i| {
+          tokio::spawn(sink_loop(
+            i.unwrap(),
+            channel_map.clone(),
+            client_to_sink_pull.clone(),
+            cancel.clone(),
+          ))
+        })
+        .collect(),
+    )
   }
 
   #[cfg(test)]

@@ -140,6 +140,8 @@ pub enum GuestSink {
   /// Communicate with multiplexer in host mode via a Unix socket
   #[cfg(not(windows))]
   UnixSocket(UnixSocketGuest),
+  /// Communicate with multiplexer in host mode via a Windows named pipe
+  WindowsPipe(WindowsPipeGuest),
 }
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
@@ -153,6 +155,15 @@ pub struct SerialGuest {
   #[arg(long, hide = true, default_value_t = default_baud_rate())]
   #[serde(default = "default_baud_rate")]
   pub baud_rate: u32,
+}
+
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WindowsPipeGuest {
+  /// Path(s) to the pipe(s) for communication with a multiplexer in host mode
+  #[arg(short, long)]
+  #[serde(default)]
+  pub pipe_paths: Vec<String>,
 }
 
 #[cfg(not(windows))]
