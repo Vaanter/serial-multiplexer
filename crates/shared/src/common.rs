@@ -406,7 +406,7 @@ pub async fn handle_sink_write(
 async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow::Result<usize> {
   trace!("Writing {} bytes to sink", data_to_send.len());
   let mut bytes_sent = 0;
-  while bytes_sent < data_to_send.len().saturating_sub(bytes_sent) {
+  while bytes_sent < data_to_send.len() {
     match sink.try_write(data_to_send).await {
       Ok(bytes_written) => {
         trace!("Wrote {} bytes to sink", bytes_written);
