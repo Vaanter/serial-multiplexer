@@ -38,6 +38,7 @@ const _: () = {
     maximum_size += ((128 << 10) - (CONNECTION_BUFFER_SIZE)) >> 11;
   }
   assert!(maximum_size < SINK_COMPRESSION_BUFFER_SIZE);
+  assert!(CONNECTION_BUFFER_SIZE.is_multiple_of(4));
 };
 
 /// An array representing a header used to identify the start of a datagram in a byte stream
@@ -404,18 +405,20 @@ pub async fn handle_sink_write(
 }
 
 async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow::Result<usize> {
-  trace!("Writing {} bytes to sink", data_to_send.len());
+  let bytes_to_send = data_to_send.len();
+  trace!("Writing {} bytes to sink", bytes_to_send);
   let mut bytes_sent = 0;
-  while bytes_sent < data_to_send.len() {
+  while bytes_sent < bytes_to_send {
     match sink.try_write(data_to_send).await {
       Ok(bytes_written) => {
         trace!("Wrote {} bytes to sink", bytes_written);
         bytes_sent = bytes_sent.saturating_add(bytes_written);
       }
       Err(e) if e.kind() == ErrorKind::WouldBlock => {
-        let leftover_bytes = data_to_send.len().saturating_sub(bytes_sent);
+        let leftover_bytes = bytes_to_send.saturating_sub(bytes_sent);
         trace!("Unable to write {} bytes to sink", leftover_bytes);
-        data_to_send.copy_within(bytes_sent..data_to_send.len(), 0);
+        data_to_send.copy_within(bytes_sent..bytes_to_send, 0);
+        data_to_send[bytes_to_send.saturating_sub(bytes_sent)..].zeroize();
         return Ok(leftover_bytes);
       }
       Err(e) => bail!(e),
@@ -755,12 +758,16 @@ pub async fn connection_loop(
   let mut unprocessed_bytes: usize = 0;
   loop {
     tcp_buf.resize(CONNECTION_BUFFER_SIZE, 0);
-    let mut available_buffer_end = tcp_buf.len();
     let connection_blocked =
       connection.largest_acked < connection.sequence.saturating_sub(ACK_THRESHOLD);
     if connection_blocked {
-      trace!("Connection blocked. {:?}", connection);
-      available_buffer_end = unprocessed_bytes.saturating_add(1);
+      trace!(
+        sequence = connection.sequence,
+        largest_processed = connection.largest_processed,
+        largest_acked = connection.largest_acked,
+        buffer_fullness = unprocessed_bytes,
+        "Connection blocked."
+      );
     }
     tokio::select! {
       biased;
@@ -783,8 +790,10 @@ pub async fn connection_loop(
       bytes_read = async {
         if connection_blocked {
           sleep(Duration::from_secs(3)).await;
+          connection.client.read(&mut tcp_buf[unprocessed_bytes..unprocessed_bytes.saturating_add(4)]).await
+        } else {
+          connection.client.read(&mut tcp_buf[unprocessed_bytes..]).await
         }
-        connection.client.read(&mut tcp_buf[unprocessed_bytes..available_buffer_end]).await
       } => {
         if matches!(bytes_read, Ok(0) | Err(_)) {
           debug!("Client disconnected");
@@ -807,13 +816,16 @@ pub async fn connection_loop(
             break;
           }
           unprocessed_bytes = 0;
-        } else if unprocessed_bytes == tcp_buf.len() {
-          debug!("Buffer overrun, closing connection");
-          if let Err(e) = connection.client.shutdown().await {
-            error!("Failed to shutdown connection. {e}");
+        } else {
+          unprocessed_bytes = unprocessed_bytes.saturating_add(4);
+          if unprocessed_bytes == tcp_buf.len() {
+            debug!("Buffer overrun, closing connection");
+            if let Err(e) = connection.client.shutdown().await {
+              error!("Failed to shutdown connection. {e}");
+            }
+            send_close_datagram(&mut connection, &client_to_sink_push).await;
+            break;
           }
-          send_close_datagram(&mut connection, &client_to_sink_push).await;
-          break;
         }
       }
     }
@@ -1271,6 +1283,14 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_write_to_sink_closed() {
+    let (mut sink_a, _sink_b) = tokio::io::duplex(128);
+    sink_a.shutdown().await.unwrap();
+    let mut data = BytesMut::from("test_data");
+    assert!(write_to_sink(&mut sink_a, &mut data).await.is_err());
+  }
+
+  #[tokio::test]
   async fn test_connection_loop_sink_read_write() {
     setup_tracing().await;
     let channel_map = Arc::new(HashMap::new());
@@ -1313,11 +1333,18 @@ mod tests {
     assert_eq!(ControlCode::Ack, ack.code());
     assert_eq!(1, u64::from_be_bytes(ack.data().unwrap().bytes().try_into().unwrap()));
     client.write_all(&data).await.unwrap();
-    let data_bytes = client_to_sink_pull.recv().await.unwrap();
-    let data_datagram = root_as_datagram(&data_bytes).unwrap();
-    assert_eq!(ControlCode::Data, data_datagram.code());
-    assert_eq!(2, data_datagram.sequence());
-    assert_eq!(&data, data_datagram.data().unwrap().bytes());
+    let mut data_start = 0;
+    let mut seq = 2;
+    while data_start < data.len() {
+      let data_bytes = client_to_sink_pull.recv().await.unwrap();
+      let data_datagram = root_as_datagram(&data_bytes).unwrap();
+      assert_eq!(ControlCode::Data, data_datagram.code());
+      assert_eq!(seq, data_datagram.sequence() as usize);
+      let datagram_data = data_datagram.data().unwrap().bytes();
+      assert_eq!(&data[data_start..data_start + datagram_data.len()], datagram_data);
+      data_start += datagram_data.len();
+      seq += 1;
+    }
     let close_datagram = create_close_datagram(0, 2);
     sink_to_client_push.broadcast_direct(close_datagram).await.unwrap();
     let n = client.read(&mut client_buf).await.unwrap();
@@ -1374,11 +1401,6 @@ mod tests {
   async fn test_connection_loop_cancel() {
     setup_tracing().await;
     let channel_map = Arc::new(HashMap::new());
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
-    channel_map.pin().insert(
-      Identifier::ClientInitiator,
-      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
-    );
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
 
@@ -1409,6 +1431,50 @@ mod tests {
     assert_eq!(close_datagram.code(), ControlCode::Close);
     assert_eq!(close_datagram.data().unwrap().bytes(), &[]);
     assert!(timeout(Duration::from_secs(1), handle).await.is_ok());
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn test_connection_loop_blocked_buffer_overrun() {
+    setup_tracing().await;
+    let identifier = 0;
+    let channel_map = Arc::new(HashMap::new());
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
+    let cancel = CancellationToken::new();
+
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let (loop_task_sender, mut loop_task_receiver) = mpsc::channel::<JoinHandle<()>>(1);
+    let _handle = tokio::spawn(async move {
+      let listener = create_upstream_listener("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      address_sender.send(address).await.unwrap();
+      let (client, _) = listener.accept().await.unwrap();
+
+      let mut connection = ConnectionState::new(identifier, client);
+      connection.sequence += ACK_THRESHOLD + 1;
+      loop_task_sender
+        .send(tokio::spawn(connection_loop(
+          connection,
+          channel_map,
+          client_to_sink_push.clone(),
+          cancel.clone(),
+        )))
+        .await
+        .unwrap();
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let mut client = TcpStream::connect(server_address).await.unwrap();
+    let loop_task = loop_task_receiver.recv().await.unwrap();
+    let client_data = BytesMut::from(vec![90u8; CONNECTION_BUFFER_SIZE - 4].as_slice());
+    client.write_all(&client_data).await.unwrap();
+    assert!(!loop_task.is_finished());
+    client.write_all(&client_data).await.unwrap();
+    let close_data = client_to_sink_pull.recv().await.unwrap();
+    let close_datagram = root_as_datagram(&close_data).unwrap();
+    assert_eq!(close_datagram.code(), ControlCode::Close);
+    assert_eq!(close_datagram.identifier(), identifier);
+    timeout(Duration::from_secs(1), _handle).await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), loop_task).await.unwrap().unwrap();
   }
 
   #[tokio::test]
