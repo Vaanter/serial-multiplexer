@@ -38,6 +38,7 @@ const _: () = {
     maximum_size += ((128 << 10) - (CONNECTION_BUFFER_SIZE)) >> 11;
   }
   assert!(maximum_size < SINK_COMPRESSION_BUFFER_SIZE);
+  // Blocked connections read 4 bytes at a time to check if the connection was closed
   assert!(CONNECTION_BUFFER_SIZE.is_multiple_of(4));
 };
 
@@ -795,12 +796,7 @@ pub async fn connection_loop(
           connection.client.read(&mut tcp_buf[unprocessed_bytes..]).await
         }
       } => {
-        if matches!(bytes_read, Ok(0) | Err(_)) {
-          debug!("Client disconnected");
-          send_close_datagram(&mut connection, &client_to_sink_push).await;
-          break;
-        }
-        if !connection_blocked {
+        if matches!(bytes_read, Ok(0) | Err(_)) || !connection_blocked {
           connection.sequence += 1;
           let client_read_start = Instant::now();
           let connection_terminating = handle_client_read(
@@ -811,7 +807,6 @@ pub async fn connection_loop(
             &mut tcp_buf,
           ).instrument(current_span.clone()).await;
           trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
-          tcp_buf.zeroize();
           if connection_terminating {
             break;
           }
