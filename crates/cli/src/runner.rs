@@ -1,7 +1,11 @@
 pub mod common {
   use anyhow::{Context, bail, ensure};
   use bytes::Bytes;
-  use config::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
+  use config::configuration::{
+    AddressPair, ConfigArgs, GuestSink, HostSink,
+    Modes::{Guest, Host},
+    SerialGuest,
+  };
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
   use papaya::HashMap;
@@ -24,9 +28,12 @@ pub mod common {
   use tracing::{debug, error, info, trace};
 
   pub async fn create_host_tasks(
-    properties: Host,
+    config: ConfigArgs,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
+    let Some(Host(properties)) = config.mode else {
+      bail!("Attempted to start host mode with guest properties, this should never happen!");
+    };
     let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
     let (connection_sender, connection_receiver) =
@@ -92,7 +99,9 @@ pub mod common {
     .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
-    run_channel_watcher(channel_map, client_to_sink_push, Some(connection_sender));
+    if config.watch_channels {
+      run_channel_watcher(channel_map, client_to_sink_push, Some(connection_sender));
+    }
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
   }
@@ -129,15 +138,18 @@ pub mod common {
           Some(c) => c.capacity(),
           None => 0,
         };
-        trace!(target: "serial_multiplexer::CCW", "CTS: {}, CS: {}, STC: [{}]", cts_len, cs_len, stc_lens);
+        trace!(target: "serial_multiplexer::CW", "CTS: {}, CS: {}, STC: [{}]", cts_len, cs_len, stc_lens);
       }
     });
   }
 
   pub async fn create_guest_tasks(
-    properties: Guest,
+    config: ConfigArgs,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
+    let Some(Guest(properties)) = config.mode else {
+      bail!("Attempted to start guest mode with host properties, this should never happen!");
+    };
     debug!("Creating guest tasks");
     let channel_map = Arc::new(HashMap::new());
     let (initiator_push, initiator_pull) = async_broadcast::broadcast::<Bytes>(512);
@@ -195,7 +207,9 @@ pub mod common {
       task::spawn(client_initiator(channel_map.clone(), client_to_sink_push.clone(), cancel));
     tasks.push(initiator_task);
 
-    run_channel_watcher(channel_map, client_to_sink_push, None);
+    if config.watch_channels {
+      run_channel_watcher(channel_map, client_to_sink_push, None);
+    }
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }

@@ -18,7 +18,7 @@ pub struct ConfigArgs {
   pub mode: Option<Modes>,
   /// Logging verbosity, default is WARN, each repetition increases the logging level.
   /// 1 = INFO, 2 = DEBUG, 3+ = TRACE
-  #[arg(short, long, default_value = "0", action = clap::ArgAction::Count)]
+  #[arg(short, long, default_value = "0", action = clap::ArgAction::Count, hide = true)]
   #[serde(skip)]
   pub verbose: u8,
   /// Path to the config file
@@ -34,6 +34,9 @@ pub struct ConfigArgs {
   /// Specifies how many worker threads will be used. Must be a positive integer.
   #[arg(short, long)]
   pub threads: Option<usize>,
+  /// Allows periodic logging of channel states
+  #[arg(short, long, hide = true)]
+  pub watch_channels: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]

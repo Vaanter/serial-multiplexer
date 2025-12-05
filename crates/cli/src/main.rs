@@ -1,6 +1,6 @@
 use crate::runner::common::{create_guest_tasks, create_host_tasks};
 use anyhow::{Context, bail, ensure};
-use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, Guest, GuestSink, Host, Modes};
+use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, GuestSink, Modes};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
 use std::num::NonZeroUsize;
@@ -75,7 +75,7 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
 
   runtime.block_on(async {
     match config.mode {
-      Some(Modes::Guest(guest)) => {
+      Some(Modes::Guest(ref guest)) => {
         match guest.sink_type {
           GuestSink::Serial(ref serial) => {
             ensure!(!serial.serial_paths.is_empty(), "No serial ports configured");
@@ -91,9 +91,9 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
           }
         }
 
-        run_guest(guest).await
+        run_guest(config).await
       }
-      Some(Modes::Host(host)) => {
+      Some(Modes::Host(ref host)) => {
         #[cfg(windows)]
         {
           use config::configuration::HostSink;
@@ -101,10 +101,12 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
           ensure!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
         }
         ensure!(
-          !(host.address_pairs.is_empty() && host.socks5_proxy.is_none()),
-          "No address pairs or socks5 proxy configured"
+          !(host.address_pairs.is_empty()
+            && host.socks5_proxy.is_none()
+            && host.http_proxy.is_none()),
+          "No address pairs or socks5/HTTP proxy configured"
         );
-        run_host(host).await
+        run_host(config).await
       }
       None => {
         bail!("No mode specified");
@@ -126,7 +128,7 @@ fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
 }
 
 #[instrument(skip_all)]
-async fn run_host(properties: Host) -> anyhow::Result<()> {
+async fn run_host(properties: ConfigArgs) -> anyhow::Result<()> {
   let cancel = CancellationToken::new();
   let joined_tasks = match create_host_tasks(properties, cancel.clone()).await {
     Ok(joined_tasks) => joined_tasks,
@@ -139,7 +141,7 @@ async fn run_host(properties: Host) -> anyhow::Result<()> {
 }
 
 #[instrument(skip_all)]
-async fn run_guest(properties: Guest) -> anyhow::Result<()> {
+async fn run_guest(properties: ConfigArgs) -> anyhow::Result<()> {
   let cancel = CancellationToken::new();
 
   let joined_tasks = match create_guest_tasks(properties, cancel.clone()).await {
