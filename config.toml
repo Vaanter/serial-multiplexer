@@ -11,6 +11,7 @@ address_pairs = [
     {listener_address = "127.0.0.1:1235", target_address = "google.com:443"},
 ]
 socks5_proxy = "127.0.0.1:2345"
+http_proxy = "127.0.0.1:2355"
 
 #[mode.guest]
 #sink_type.serial.serial_paths = ['COM1', 'COM2', 'COM3', 'COM4']

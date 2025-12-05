@@ -163,6 +163,8 @@ jobs:
           mv linux-optimized/${{ env.BINARY_NAME }} ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64-v3
           mv windows-standard/${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64.exe
           mv windows-optimized/${{ env.BINARY_NAME }}.exe ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64-v3.exe
+          mv configs/config-host.toml config-host-${{ env.VERSION }}.toml
+          mv configs/config-guest.toml config-guest-${{ env.VERSION }}.toml
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -171,6 +173,8 @@ jobs:
             ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64-v3
             ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64.exe
             ${{ env.BINARY_NAME }}-${{ env.VERSION }}-windows-x86-64-v3.exe
+            config-host-${{ env.VERSION }}.toml
+            config-guest-${{ env.VERSION }}.toml
           name: Release v${{ env.VERSION }}
           tag_name: v${{ env.VERSION }}
           draft: false
