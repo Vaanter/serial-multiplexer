@@ -52,7 +52,7 @@ pub mod common {
       )
       .await
       .context("Failed to create unix socket based sink loop.")?;
-      sink_loops.extend([socket_task]);
+      sink_loops.extend(socket_task);
     }
 
     #[cfg(windows)]
@@ -184,7 +184,7 @@ pub mod common {
       GuestSink::UnixSocket(unix_socket) => {
         {
           use crate::runner::linux::connect_to_unix_socket;
-          let socket_task = connect_to_unix_socket(
+          let socket_tasks = connect_to_unix_socket(
             &unix_socket,
             channel_map.clone(),
             client_to_sink_pull,
@@ -192,7 +192,7 @@ pub mod common {
           )
           .await
           .context("Failed to create unix socket based sink loop.")?;
-          sink_loops.push(socket_task);
+          sink_loops.extend(socket_tasks);
         }
         #[cfg(not(unix))]
         {
@@ -758,14 +758,17 @@ mod linux {
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use config::configuration::{UnixSocketGuest, UnixSocketHost};
+  use futures::future::try_join_all;
   use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
+  use std::collections::HashSet;
   use std::fs::remove_file;
   use std::io::ErrorKind;
+  use tokio::io::AsyncWriteExt;
   use tokio::net::{UnixListener, UnixStream};
   use tokio::task::JoinHandle;
   use tokio_util::sync::CancellationToken;
-  use tracing::debug;
+  use tracing::{debug, error};
 
   /// A shorthand function to create a task running a sink loop with a Unix socket as the sink.
   ///
@@ -803,12 +806,43 @@ mod linux {
     channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> anyhow::Result<JoinHandle<()>> {
-    debug!("Attempting to connect to a unix socket at {}", &properties.socket_path);
-    let unix_socket =
-      UnixStream::connect(&properties.socket_path).await.context("Failed to connect to socket")?;
-    debug!(peer_address = ?unix_socket.peer_addr()?, "Connected to unix socket");
-    Ok(create_unix_socket_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
+    let mut connected_sockets = Vec::with_capacity(distinct_socket_paths.len());
+    for socket_path in distinct_socket_paths {
+      debug!("Attempting to connect to a unix socket at {}", socket_path);
+      match UnixStream::connect(socket_path).await.context("Failed to connect to socket") {
+        Ok(socket) => {
+          debug!(peer_address = ?socket.peer_addr()?, "Connected to unix socket");
+          connected_sockets.push(socket);
+        }
+        Err(e) => {
+          error!("Failed to connect to socket at {}: {}", socket_path, e);
+          let mut ret_error =
+            anyhow::anyhow!("Failed to connect to socket at {}", socket_path).context(e);
+          for mut connected_socket in connected_sockets {
+            if let Err(e) = connected_socket.shutdown().await {
+              ret_error = ret_error.context("Also failed to shutdown connected socket").context(e);
+            }
+          }
+          return Err(ret_error);
+        }
+      }
+    }
+
+    Ok(
+      connected_sockets
+        .into_iter()
+        .map(|socket| {
+          create_unix_socket_loop(
+            socket,
+            channel_map.clone(),
+            client_to_socket_pull.clone(),
+            cancel.clone(),
+          )
+        })
+        .collect(),
+    )
   }
 
   /// Creates and listens on a Unix socket, then creates a sink loop when a client connects.
@@ -836,21 +870,81 @@ mod linux {
   pub async fn listen_accept_unix_connection(
     properties: &UnixSocketHost,
     channel_map: ChannelMap,
-    client_to_socket_pull: async_channel::Receiver<Bytes>,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> anyhow::Result<JoinHandle<()>> {
-    if let Err(e) = remove_file(&properties.socket_path)
-      && e.kind() != ErrorKind::NotFound
-    {
-      bail!("Failed to remove socket file: {}", e);
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
+    for socket_path in distinct_socket_paths.iter() {
+      if let Err(e) = remove_file(&socket_path)
+        && e.kind() != ErrorKind::NotFound
+      {
+        bail!("Failed to remove socket file: {}", e);
+      }
     }
-    debug!("Listening for a unix socket connection on {}", &properties.socket_path);
-    let socket_listener =
-      UnixListener::bind(&properties.socket_path).context("Failed to bind to socket")?;
-    let (unix_socket, _) =
-      socket_listener.accept().await.context("Failed to accept socket connection")?;
-    debug!(peer_address = ?unix_socket.peer_addr()?, "Accepted unix socket connection");
-    Ok(create_unix_socket_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
+    let pipe_instances = distinct_socket_paths.iter().try_fold(
+      Vec::with_capacity(distinct_socket_paths.len()),
+      |mut instances, path| match UnixListener::bind(path) {
+        Ok(instance) => {
+          debug!("Listening for a unix socket connection on {}", path);
+          instances.push(instance);
+          Ok(instances)
+        }
+        Err(e) => Err(e).context(format!("Failed to bind a unix socket to '{}'", path)),
+      },
+    )?;
+
+    let instance_tasks: Vec<_> = pipe_instances
+      .into_iter()
+      .map(|instance| {
+        tokio::spawn(async move {
+          match instance.accept().await {
+            Ok((s, pa)) => {
+              debug!(
+                "Unix listener '{}' accepted connection from '{}'",
+                instance.local_addr().map_or(String::new(), |la| format!("{la:?}")),
+                format!("{pa:?}")
+              );
+              Ok(s)
+            }
+            Err(e) => Err(e),
+          }
+        })
+      })
+      .collect();
+
+    let connected_instances = try_join_all(instance_tasks)
+      .await
+      .context("Failed waiting for all socket tasks to finish")?;
+    if connected_instances.iter().any(|i| i.is_err()) {
+      let mut ret_error = anyhow::anyhow!("Some Unix listener failed to accept connection");
+      for instance in connected_instances {
+        match instance {
+          Ok(mut instance) => {
+            if let Err(e) = instance.shutdown().await {
+              ret_error =
+                ret_error.context(format!("Failed to disconnect Unix socket connection. {e}"));
+            }
+          }
+          Err(e) => {
+            ret_error = ret_error.context(e);
+          }
+        }
+      }
+      return Err(ret_error);
+    }
+    Ok(
+      connected_instances
+        .into_iter()
+        .map(|i| {
+          tokio::spawn(sink_loop(
+            i.unwrap(),
+            channel_map.clone(),
+            client_to_sink_pull.clone(),
+            cancel.clone(),
+          ))
+        })
+        .collect(),
+    )
   }
 
   #[cfg(test)]
@@ -865,12 +959,14 @@ mod linux {
     #[tokio::test]
     async fn listen_connect_accept_send_test() {
       setup_tracing().await;
-      let socket_path = "test_socket.sock";
+      let socket_path = vec!["test_socket.sock".to_string()];
       let sink_properties = UnixSocketHost {
-        socket_path: socket_path.to_string(),
+        socket_paths: socket_path.clone(),
+        ..Default::default()
       };
       let unix_socket_properties = UnixSocketGuest {
-        socket_path: socket_path.to_string(),
+        socket_paths: socket_path.clone(),
+        ..Default::default()
       };
 
       let channel_map = Arc::new(HashMap::new());
@@ -883,7 +979,7 @@ mod linux {
           let client_to_sink_pull = client_to_sink_pull.clone();
           let channel_map = channel_map.clone();
           async move {
-            let sink_loop = listen_accept_unix_connection(
+            let sink_loops = listen_accept_unix_connection(
               &sink_properties,
               channel_map,
               client_to_sink_pull,
@@ -892,7 +988,9 @@ mod linux {
             .await
             .unwrap();
             cancel.cancelled().await;
-            sink_loop.await.unwrap();
+            for sink_loop in sink_loops {
+              sink_loop.await.unwrap();
+            }
           }
         });
 
@@ -907,7 +1005,9 @@ mod linux {
         .await;
         cancel.cancel();
         host_loop.await.unwrap();
-        sink_loop.unwrap().await.unwrap();
+        for sink_loop in sink_loop.unwrap() {
+          sink_loop.await.unwrap();
+        }
       })
       .await
       .unwrap();

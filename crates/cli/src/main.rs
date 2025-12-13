@@ -87,7 +87,10 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
           #[cfg(not(windows))]
           GuestSink::UnixSocket(ref unix_socket) => {
             use std::path::PathBuf;
-            ensure!(unix_socket.socket_path.parse::<PathBuf>().is_ok(), "No unix socket configured")
+            ensure!(
+              unix_socket.socket_paths.iter().all(|path| path.parse::<PathBuf>().is_ok()),
+              "No unix socket configured"
+            )
           }
         }
 
