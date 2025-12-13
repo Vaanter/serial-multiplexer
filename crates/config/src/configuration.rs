@@ -129,13 +129,14 @@ pub struct Guest {
 #[cfg(not(windows))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 pub struct UnixSocketGuest {
-  /// Path to a Unix socket for communication with a multiplexer in host mode
-  #[arg(short, long)]
+  /// Path to a single Unix socket for communication with a multiplexer in guest mode.
+  /// Usable only with config version 1.
+  #[arg(long)]
   #[deprecated]
   pub socket_path: Option<String>,
-  /// Paths to Unix sockets for communication with a multiplexer in host mode
-  #[arg(short, long, default_values_t = default_socket_paths())]
-  #[serde(default = "default_socket_paths")]
+  /// Paths to Unix socket(s) for communication with a multiplexer in host mode.
+  /// Usable since config version 2.
+  #[arg(short, long)]
   pub socket_paths: Vec<String>,
 }
 
@@ -177,13 +178,14 @@ pub struct WindowsPipeGuest {
 #[cfg(not(windows))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 pub struct UnixSocketHost {
-  /// Path to a Unix socket for communication with a multiplexer in guest mode
-  #[arg(short, long)]
+  /// Path to a single Unix socket for communication with a multiplexer in guest mode.
+  /// Usable only with config version 1.
+  #[arg(long)]
   #[deprecated]
   pub socket_path: Option<String>,
-  /// Paths to Unix sockets for communication with a multiplexer in host mode
-  #[arg(short, long, default_values_t = default_socket_paths())]
-  #[serde(default = "default_socket_paths")]
+  /// Paths to Unix socket(s) for communication with a multiplexer in host mode.
+  /// Usable since config version 2.
+  #[arg(short, long)]
   pub socket_paths: Vec<String>,
 }
 
@@ -193,11 +195,6 @@ const fn default_baud_rate() -> u32 {
 
 fn default_config_path() -> String {
   "config.toml".to_string()
-}
-
-#[cfg(not(windows))]
-fn default_socket_paths() -> Vec<String> {
-  vec!["serial_multiplexer.sock".to_string()]
 }
 
 impl ConfigArgs {
@@ -218,8 +215,42 @@ impl ConfigArgs {
         if !exists(&config_file_path).unwrap_or(false) {
           c.version = "2".to_string()
         }
+        c.upgrade_versions();
         c
       })
       .map_err(Box::new)
+  }
+
+  fn upgrade_versions(&mut self) {
+    self.upgrade_1_to_2();
+  }
+
+  #[allow(deprecated)]
+  fn upgrade_1_to_2(&mut self) {
+    if self.version == "1" {
+      self.version = "2".to_string();
+      #[cfg(not(windows))]
+      match &mut self.mode {
+        Some(Modes::Host(host)) => {
+          // Allow this because adding a new sink type would cause a compilation error with just let
+          #[allow(irrefutable_let_patterns)]
+          if let HostSink::UnixSocket(ref mut socket) = host.sink_type {
+            socket.socket_paths.clear();
+            if let Some(socket_path) = socket.socket_path.as_mut() {
+              socket.socket_paths.push(std::mem::take(socket_path));
+            }
+          }
+        }
+        Some(Modes::Guest(guest)) => {
+          if let GuestSink::UnixSocket(ref mut socket) = guest.sink_type {
+            socket.socket_paths.clear();
+            if let Some(socket_path) = socket.socket_path.as_mut() {
+              socket.socket_paths.push(std::mem::take(socket_path))
+            }
+          }
+        }
+        None => {}
+      }
+    }
   }
 }
