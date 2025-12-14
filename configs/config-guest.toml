@@ -1,10 +1,10 @@
-version = "1"
+version = "2"
 #log_file = "serial-multiplexer.log"
 tracing_filter = "serial_multiplexer=debug,serial_multiplexer::CW=info,serial_multiplexer::huge_data=info,serial_multiplexer::metrics=info"
 threads = 4
 watch_channels = false
 
 [mode.guest]
-sink_type.serial.serial_paths = ['/dev/ttyS0', '/dev/ttyS1', '/dev/ttyS2', '/dev/ttyS3']
+#sink_type.serial.serial_paths = ['/dev/ttyS0', '/dev/ttyS1', '/dev/ttyS2', '/dev/ttyS3']
 #sink_type.serial.serial_paths = ['COM1', 'COM2', 'COM3', 'COM4']
-#sink_type.unix_socket.socket_path = '/tmp/serial_multiplexer.sock'
+sink_type.unix_socket.socket_paths = ['serial_multiplexer.sock']
