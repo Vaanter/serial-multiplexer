@@ -348,7 +348,7 @@ pub async fn handle_sink_read(
   if unprocessed_data_start >= bytes_read {
     trace!("Whole buffer was read, zeroing out processed data");
     sink_buf.zeroize();
-  } else {
+  } else if unprocessed_data_start > 0 {
     trace!(
       "Copying unprocessed data (start index: {}) to the start of buffer and zeroing out the rest",
       unprocessed_data_start
