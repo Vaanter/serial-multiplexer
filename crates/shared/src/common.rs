@@ -409,7 +409,7 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
   trace!("Writing {} bytes to sink", bytes_to_send);
   let mut bytes_sent = 0;
   while bytes_sent < bytes_to_send {
-    match timeout(Duration::from_millis(10), sink.write(data_to_send)).await {
+    match timeout(Duration::from_millis(10), sink.write(&data_to_send[bytes_sent..])).await {
       Ok(Ok(bytes_written)) => {
         trace!("Wrote {} bytes to sink", bytes_written);
         bytes_sent = bytes_sent.saturating_add(bytes_written);
