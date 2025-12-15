@@ -8,12 +8,11 @@ use memchr::memmem::Finder;
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::ErrorKind;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, trace};
 use tracing_attributes::instrument;
@@ -410,19 +409,19 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
   trace!("Writing {} bytes to sink", bytes_to_send);
   let mut bytes_sent = 0;
   while bytes_sent < bytes_to_send {
-    match sink.try_write(data_to_send).await {
-      Ok(bytes_written) => {
+    match timeout(Duration::from_millis(10), sink.write(data_to_send)).await {
+      Ok(Ok(bytes_written)) => {
         trace!("Wrote {} bytes to sink", bytes_written);
         bytes_sent = bytes_sent.saturating_add(bytes_written);
       }
-      Err(e) if e.kind() == ErrorKind::WouldBlock => {
+      Ok(Err(e)) => bail!(e),
+      Err(_) => {
         let leftover_bytes = bytes_to_send.saturating_sub(bytes_sent);
         trace!("Unable to write {} bytes to sink", leftover_bytes);
         data_to_send.copy_within(bytes_sent..bytes_to_send, 0);
         data_to_send[bytes_to_send.saturating_sub(bytes_sent)..].zeroize();
         return Ok(leftover_bytes);
       }
-      Err(e) => bail!(e),
     };
   }
   trace!("All bytes written to sink");
@@ -849,6 +848,7 @@ mod tests {
   use crate::try_write::Sink;
   use crate::utils::create_upstream_listener;
   use papaya::HashMap;
+  use std::io::ErrorKind;
   use std::net::SocketAddr;
   use std::sync::Arc;
   use std::time::Duration;
