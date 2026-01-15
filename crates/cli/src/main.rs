@@ -3,6 +3,7 @@ use anyhow::{Context, bail, ensure};
 use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, GuestSink, Modes};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::thread::available_parallelism;
 use std::time::Duration;
@@ -10,12 +11,14 @@ use tokio::signal::ctrl_c;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, debug, error, info};
+use tracing::{Level, Subscriber, debug, error, info};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_attributes::instrument;
-use tracing_subscriber::Layer;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Registry};
+use tracing_subscriber::{Layer, registry};
 
 mod runner;
 
@@ -26,26 +29,9 @@ fn main() -> anyhow::Result<()> {
     "Unsupported config version"
   );
 
-  let (writer, _guard) = if let Some(ref log_file_name) = config.log_file {
-    let mut log_file_options = OpenOptions::new();
-    log_file_options.write(true).truncate(true).create(true);
-    let log_file = log_file_options.open(log_file_name).context("Failed to access log file")?;
-    tracing_appender::non_blocking(log_file)
-  } else {
-    tracing_appender::non_blocking(std::io::stdout())
-  };
+  // Must not be dropped, so the logs can actually be written out
+  let _tracing_guards = initiate_tracing(&config)?;
 
-  let fmt_layer = tracing_subscriber::fmt::Layer::default()
-    .with_writer(writer)
-    .with_file(false)
-    // ansi should be disabled when logging to a file because it would make it difficult to read
-    .with_ansi(config.log_file.is_none())
-    .with_line_number(false)
-    .with_thread_ids(true)
-    .with_target(false)
-    .with_filter(build_filter(config.tracing_filter.clone(), config.verbose));
-
-  Registry::default().with(fmt_layer).init();
   debug!("config: {:?}", config);
   match execute(config) {
     Ok(()) => Ok(()),
@@ -54,6 +40,55 @@ fn main() -> anyhow::Result<()> {
       Err(e)
     }
   }
+}
+
+/// Initializes tracing with stdout and optional file logging.
+///
+/// # Parameters
+/// * `config` - Configuration containing log file path, tracing filter, and verbosity level
+///
+/// # Returns
+/// `WorkerGuard`s that must be kept alive for logging to function
+fn initiate_tracing(config: &ConfigArgs) -> anyhow::Result<Vec<WorkerGuard>> {
+  let mut tracing_guards = Vec::with_capacity(2);
+
+  let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+  tracing_guards.push(stdout_guard);
+
+  let stdout_layer = setup_tracing_layer(config, stdout_writer, true);
+
+  let registry_setup = Registry::default().with(stdout_layer);
+
+  if let Some(ref log_file_name) = config.log_file {
+    let mut log_file_options = OpenOptions::new();
+    log_file_options.write(true).truncate(true).create(true);
+    let log_file = log_file_options.open(log_file_name).context("Failed to access log file")?;
+    let (file_writer, file_guard) = tracing_appender::non_blocking(log_file);
+    tracing_guards.push(file_guard);
+
+    let file_layer = setup_tracing_layer(config, file_writer, false);
+
+    registry_setup.with(file_layer).init();
+  } else {
+    registry_setup.init();
+  }
+  Ok(tracing_guards)
+}
+
+fn setup_tracing_layer<S, W>(config: &ConfigArgs, writer: W, ansi: bool) -> impl Layer<S>
+where
+  S: Subscriber + for<'span> registry::LookupSpan<'span>,
+  W: Write + for<'a> MakeWriter<'a> + 'static,
+{
+  tracing_subscriber::fmt::Layer::default()
+    .with_writer(writer)
+    .with_file(false)
+    // ansi should be disabled when logging to a file because it would make it difficult to read
+    .with_ansi(ansi)
+    .with_line_number(false)
+    .with_thread_ids(true)
+    .with_target(false)
+    .with_filter(build_filter(config.tracing_filter.clone(), config.verbose))
 }
 
 fn execute(config: ConfigArgs) -> anyhow::Result<()> {
