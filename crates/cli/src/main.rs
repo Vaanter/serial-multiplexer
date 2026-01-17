@@ -3,8 +3,9 @@ use anyhow::{Context, bail, ensure};
 use config::configuration::{ALLOWED_CONFIG_VERSIONS, ConfigArgs, GuestSink, Modes};
 use futures::future::{JoinAll, MaybeDone};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{IsTerminal, Write, stdin};
 use std::num::NonZeroUsize;
+use std::process::ExitCode;
 use std::thread::available_parallelism;
 use std::time::Duration;
 use tokio::signal::ctrl_c;
@@ -22,22 +23,38 @@ use tracing_subscriber::{Layer, registry};
 
 mod runner;
 
-fn main() -> anyhow::Result<()> {
-  let config = ConfigArgs::build_config().context("Failed to parse config")?;
-  ensure!(
-    ALLOWED_CONFIG_VERSIONS.iter().any(|v| *v == config.version),
-    "Unsupported config version"
-  );
+fn main() -> ExitCode {
+  fn inner_main() -> anyhow::Result<()> {
+    let config = ConfigArgs::build_config().context("Failed to parse config")?;
+    ensure!(
+      ALLOWED_CONFIG_VERSIONS.iter().any(|v| *v == config.version),
+      "Unsupported config version"
+    );
 
-  // Must not be dropped, so the logs can actually be written out
-  let _tracing_guards = initiate_tracing(&config)?;
+    // Must not be dropped, so the logs can actually be written out
+    let _tracing_guards = initiate_tracing(&config)?;
 
-  debug!("config: {:?}", config);
-  match execute(config) {
-    Ok(()) => Ok(()),
+    debug!("config: {:?}", config);
+    match execute(config) {
+      Ok(()) => Ok(()),
+      Err(e) => {
+        error!("{}", e);
+        Err(e)
+      }
+    }
+  }
+  match inner_main() {
+    Ok(()) => ExitCode::from(0),
     Err(e) => {
-      error!("{}", e);
-      Err(e)
+      if stdin().is_terminal() {
+        eprintln!("\nFatal error:\n{}", e);
+        let mut enter_buffer = String::new();
+        println!("\nPress enter to exit");
+        if let Err(e) = stdin().read_line(&mut enter_buffer) {
+          eprintln!("Failed to read enter from the terminal. {}", e);
+        }
+      }
+      ExitCode::from(1)
     }
   }
 }
@@ -116,8 +133,8 @@ fn execute(config: ConfigArgs) -> anyhow::Result<()> {
             ensure!(!serial.serial_paths.is_empty(), "No serial ports configured");
           }
           #[cfg(windows)]
-          GuestSink::WindowsPipe(ref pipes) => {
-            ensure!(!pipes.pipe_paths.is_empty(), "No Windows name pipe path configured");
+          GuestSink::WindowsPipe(ref windows_pipe_properties) => {
+            ensure!(!windows_pipe_properties.pipe_paths.is_empty(), "No pipe paths configured");
           }
           #[cfg(not(windows))]
           GuestSink::UnixSocket(ref unix_socket) => {
@@ -160,8 +177,7 @@ fn build_filter(filter_string: Option<String>, verbosity: u8) -> EnvFilter {
     n if n > 2 => Level::TRACE,
     _ => Level::WARN,
   };
-  let filter_string =
-    filter_string.unwrap_or_else(|| format!("{}={}", env!("CARGO_CRATE_NAME"), level));
+  let filter_string = filter_string.unwrap_or_else(|| format!("serial_multiplexer={}", level));
   EnvFilter::new(filter_string)
 }
 
