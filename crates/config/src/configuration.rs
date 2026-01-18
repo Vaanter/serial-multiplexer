@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::exists;
 use std::str::FromStr;
 
-pub const ALLOWED_CONFIG_VERSIONS: [&str; 1] = ["1"];
+pub const ALLOWED_CONFIG_VERSIONS: [&str; 2] = ["1", "2"];
 
 #[derive(Parser, Clone, Debug, Serialize, Deserialize)]
 #[clap(version, about, author)]
@@ -18,7 +18,7 @@ pub struct ConfigArgs {
   pub mode: Option<Modes>,
   /// Logging verbosity, default is WARN, each repetition increases the logging level.
   /// 1 = INFO, 2 = DEBUG, 3+ = TRACE
-  #[arg(short, long, default_value = "0", action = clap::ArgAction::Count)]
+  #[arg(short, long, default_value = "0", action = clap::ArgAction::Count, hide = true)]
   #[serde(skip)]
   pub verbose: u8,
   /// Path to the config file
@@ -31,10 +31,12 @@ pub struct ConfigArgs {
   /// A filter for the traces (logs). To set a global filter at a specific level, use "serial_multiplexer=<LEVEL>"
   #[arg(long)]
   pub tracing_filter: Option<String>,
-
   /// Specifies how many worker threads will be used. Must be a positive integer.
   #[arg(short, long)]
   pub threads: Option<usize>,
+  /// Allows periodic logging of channel states
+  #[arg(short, long, hide = true)]
+  pub watch_channels: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
@@ -59,9 +61,12 @@ pub struct Host {
   #[arg(long)]
   #[serde(default)]
   pub address_pairs: Vec<AddressPair>,
-  /// Address at which the proxy will listen for incoming connections.
+  /// Address at which the SOCKS5 proxy will listen for incoming connections.
   #[arg(long)]
   pub socks5_proxy: Option<String>,
+  /// Address at which the HTTP proxy will listen for incoming connections.
+  #[arg(long)]
+  pub http_proxy: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Args, Serialize, Deserialize)]
@@ -98,7 +103,7 @@ pub enum HostSink {
   /// Communicate with multiplexer in guest mode via Windows pipe(s) (VirtualBox)
   #[cfg(windows)]
   WindowsPipe(WindowsPipeHost),
-  /// Communicate with multiplexer in guest mode via a Unix socket
+  /// Communicate with multiplexer in guest mode via Unix socket(s)
   #[cfg(not(windows))]
   UnixSocket(UnixSocketHost),
 }
@@ -124,10 +129,15 @@ pub struct Guest {
 #[cfg(not(windows))]
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 pub struct UnixSocketGuest {
-  /// Path to a Unix socket for communication with a multiplexer in host mode
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub socket_path: String,
+  /// Path to a single Unix socket for communication with a multiplexer in guest mode.
+  /// Usable only with config version 1.
+  #[arg(long)]
+  #[deprecated]
+  pub socket_path: Option<String>,
+  /// Paths to Unix socket(s) for communication with a multiplexer in host mode.
+  /// Usable since config version 2.
+  #[arg(short, long)]
+  pub socket_paths: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]
@@ -135,9 +145,12 @@ pub struct UnixSocketGuest {
 pub enum GuestSink {
   /// Communicate with multiplexer in host mode via serial port(s)
   Serial(SerialGuest),
-  /// Communicate with multiplexer in host mode via a Unix socket
+  /// Communicate with multiplexer in host mode via Unix socket(s)
   #[cfg(not(windows))]
   UnixSocket(UnixSocketGuest),
+  /// Communicate with multiplexer in host mode via a Windows named pipe
+  #[cfg(windows)]
+  WindowsPipe(WindowsPipeGuest),
 }
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
@@ -153,13 +166,27 @@ pub struct SerialGuest {
   pub baud_rate: u32,
 }
 
-#[cfg(not(windows))]
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Args, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WindowsPipeGuest {
+  /// Path(s) to the pipe(s) for communication with a multiplexer in host mode
+  #[arg(short, long)]
+  #[serde(default)]
+  pub pipe_paths: Vec<String>,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Args, Serialize, Deserialize)]
 pub struct UnixSocketHost {
-  /// Path to a Unix socket for communication with a multiplexer in guest mode
-  #[arg(short, long, default_value_t = default_socket_path())]
-  #[serde(default = "default_socket_path")]
-  pub socket_path: String,
+  /// Path to a single Unix socket for communication with a multiplexer in guest mode.
+  /// Usable only with config version 1.
+  #[arg(long)]
+  #[deprecated]
+  pub socket_path: Option<String>,
+  /// Paths to Unix socket(s) for communication with a multiplexer in host mode.
+  /// Usable since config version 2.
+  #[arg(short, long)]
+  pub socket_paths: Vec<String>,
 }
 
 const fn default_baud_rate() -> u32 {
@@ -168,11 +195,6 @@ const fn default_baud_rate() -> u32 {
 
 fn default_config_path() -> String {
   "config.toml".to_string()
-}
-
-#[cfg(not(windows))]
-fn default_socket_path() -> String {
-  "serial_multiplexer.sock".to_string()
 }
 
 impl ConfigArgs {
@@ -191,10 +213,44 @@ impl ConfigArgs {
           c.mode = Some(args_mode);
         }
         if !exists(&config_file_path).unwrap_or(false) {
-          c.version = "1".to_string()
+          c.version = "2".to_string()
         }
+        c.upgrade_versions();
         c
       })
       .map_err(Box::new)
+  }
+
+  fn upgrade_versions(&mut self) {
+    self.upgrade_1_to_2();
+  }
+
+  #[allow(deprecated)]
+  fn upgrade_1_to_2(&mut self) {
+    if self.version == "1" {
+      self.version = "2".to_string();
+      #[cfg(not(windows))]
+      match &mut self.mode {
+        Some(Modes::Host(host)) => {
+          // Allow this because adding a new sink type would cause a compilation error with just let
+          #[allow(irrefutable_let_patterns)]
+          if let HostSink::UnixSocket(ref mut socket) = host.sink_type {
+            socket.socket_paths.clear();
+            if let Some(socket_path) = socket.socket_path.as_mut() {
+              socket.socket_paths.push(std::mem::take(socket_path));
+            }
+          }
+        }
+        Some(Modes::Guest(guest)) => {
+          if let GuestSink::UnixSocket(ref mut socket) = guest.sink_type {
+            socket.socket_paths.clear();
+            if let Some(socket_path) = socket.socket_path.as_mut() {
+              socket.socket_paths.push(std::mem::take(socket_path))
+            }
+          }
+        }
+        None => {}
+      }
+    }
   }
 }

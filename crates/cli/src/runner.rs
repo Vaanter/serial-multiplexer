@@ -1,29 +1,43 @@
 pub mod common {
-  use anyhow::{Context, ensure};
+  use anyhow::{Context, bail, ensure};
   use bytes::Bytes;
-  use config::configuration::{AddressPair, Guest, GuestSink, Host, HostSink, SerialGuest};
+  use config::configuration::{
+    AddressPair, ConfigArgs, GuestSink, HostSink,
+    Modes::{Guest, Host},
+    SerialGuest,
+  };
   use futures::future::{JoinAll, MaybeDone, join_all, maybe_done};
   use futures::stream::FuturesUnordered;
+  use papaya::HashMap;
+  use serial_multiplexer_lib::channels::{ChannelMap, Identifier};
   use serial_multiplexer_lib::common::{ConnectionState, sink_loop};
   use serial_multiplexer_lib::guest::client_initiator;
   use serial_multiplexer_lib::host::{ConnectionType, connection_initiator, run_listener};
+  use serial_multiplexer_lib::host_http::run_http_listener;
   use serial_multiplexer_lib::utils::create_upstream_listener;
-  use std::collections::HashSet;
+  use std::collections::{BTreeMap, HashSet};
+  use std::sync::Arc;
+  use std::time::Duration;
   use tokio::io::AsyncWriteExt;
   use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
+  use tokio::time::{MissedTickBehavior, interval};
   use tokio_serial::SerialPortBuilderExt;
   use tokio_util::sync::CancellationToken;
-  use tracing::{debug, error, info};
+  use tracing::{debug, error, info, trace};
 
   pub async fn create_host_tasks(
-    properties: Host,
+    config: ConfigArgs,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
+    let Some(Host(properties)) = config.mode else {
+      bail!("Attempted to start host mode with guest properties, this should never happen!");
+    };
+    let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
-    let (connection_sender, connection_receiver) = mpsc::channel(512);
+    let (connection_sender, connection_receiver) =
+      mpsc::channel::<(ConnectionState, ConnectionType)>(512);
 
     let mut sink_loops = FuturesUnordered::new();
     #[cfg(unix)]
@@ -32,13 +46,13 @@ pub mod common {
       let HostSink::UnixSocket(ref unix_socket_properties) = properties.sink_type;
       let socket_task = listen_accept_unix_connection(
         &unix_socket_properties,
-        sink_to_client_push,
-        client_to_sink_pull,
+        channel_map.clone(),
+        client_to_sink_pull.clone(),
         cancel.clone(),
       )
       .await
       .context("Failed to create unix socket based sink loop.")?;
-      sink_loops.extend([socket_task]);
+      sink_loops.extend(socket_task);
     }
 
     #[cfg(windows)]
@@ -47,8 +61,8 @@ pub mod common {
       let HostSink::WindowsPipe(ref windows_pipe_properties) = properties.sink_type;
       let pipe_loop_tasks = create_windows_pipe_loops(
         windows_pipe_properties,
-        sink_to_client_push,
-        client_to_sink_pull,
+        channel_map.clone(),
+        client_to_sink_pull.clone(),
         cancel.clone(),
       )
       .await
@@ -65,8 +79,8 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task = tokio::spawn(connection_initiator(
-      client_to_sink_push,
-      sink_to_client_pull,
+      channel_map.clone(),
+      client_to_sink_push.clone(),
       connection_receiver,
       cancel.clone(),
     ));
@@ -75,46 +89,110 @@ pub mod common {
     let listener_tasks = initialize_listeners(
       &properties.address_pairs,
       &properties.socks5_proxy,
-      connection_sender,
+      &properties.http_proxy,
+      channel_map.clone(),
+      connection_sender.clone(),
+      client_to_sink_push.clone(),
       cancel,
     )
     .await
     .context("Failed to initialize listeners")?;
     ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
 
+    if config.watch_channels {
+      run_channel_watcher(channel_map, client_to_sink_push, Some(connection_sender));
+    }
+
     Ok(maybe_done(join_all(tasks.into_iter().chain(listener_tasks).chain(sink_loops))))
   }
 
+  fn run_channel_watcher(
+    channel_map: ChannelMap,
+    client_to_sink_push: async_channel::Sender<Bytes>,
+    connection_sender: Option<mpsc::Sender<(ConnectionState, ConnectionType)>>,
+  ) {
+    tokio::spawn(async move {
+      let mut interval = interval(Duration::from_secs(1));
+      interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+      loop {
+        interval.tick().await;
+        let cts_len =
+          client_to_sink_push.capacity().unwrap_or(0).saturating_sub(client_to_sink_push.len());
+
+        let channels: BTreeMap<Identifier, usize> = channel_map
+          .pin()
+          .iter()
+          .map(|(id, (stc, _))| (*id, stc.capacity().saturating_sub(stc.len())))
+          .collect();
+        let stc_lens = channels.into_iter().fold(
+          String::with_capacity(channel_map.len() * 20),
+          |mut a, (id, len)| {
+            if !a.is_empty() {
+              a.push_str(", ");
+            }
+            a.push_str(&format!("'{:?}': {}", id, len));
+            a
+          },
+        );
+        let cs_len = match &connection_sender {
+          Some(c) => c.capacity(),
+          None => 0,
+        };
+        trace!(target: "serial_multiplexer::CW", "CTS: {}, CS: {}, STC: [{}]", cts_len, cs_len, stc_lens);
+      }
+    });
+  }
+
   pub async fn create_guest_tasks(
-    properties: Guest,
+    config: ConfigArgs,
     cancel: CancellationToken,
   ) -> anyhow::Result<MaybeDone<JoinAll<JoinHandle<()>>>> {
+    let Some(Guest(properties)) = config.mode else {
+      bail!("Attempted to start guest mode with host properties, this should never happen!");
+    };
     debug!("Creating guest tasks");
+    let channel_map = Arc::new(HashMap::new());
+    let (initiator_push, initiator_pull) = async_broadcast::broadcast::<Bytes>(512);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
-    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast::<Bytes>(512);
+    channel_map
+      .pin()
+      .insert(Identifier::ClientInitiator, (initiator_push, initiator_pull.deactivate()));
 
     let mut sink_loops = FuturesUnordered::new();
     match properties.sink_type {
       GuestSink::Serial(serial) => {
         let serial_port_sinks =
-          initialize_serials(&serial, sink_to_client_push, client_to_sink_pull, cancel.clone())
+          initialize_serials(&serial, channel_map.clone(), client_to_sink_pull, cancel.clone())
             .await
             .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
+      }
+      #[cfg(windows)]
+      GuestSink::WindowsPipe(ref windows_pipe_properties) => {
+        use crate::runner::windows::listen_accept_windows_named_pipe;
+        let pipe_sinks = listen_accept_windows_named_pipe(
+          windows_pipe_properties,
+          channel_map.clone(),
+          client_to_sink_pull.clone(),
+          cancel.clone(),
+        )
+        .await
+        .context("Failed to create Windows name pipe based sink loops.")?;
+        sink_loops.extend(pipe_sinks);
       }
       #[cfg(unix)]
       GuestSink::UnixSocket(unix_socket) => {
         {
           use crate::runner::linux::connect_to_unix_socket;
-          let socket_task = connect_to_unix_socket(
+          let socket_tasks = connect_to_unix_socket(
             &unix_socket,
-            sink_to_client_push,
+            channel_map.clone(),
             client_to_sink_pull,
             cancel.clone(),
           )
           .await
           .context("Failed to create unix socket based sink loop.")?;
-          sink_loops.push(socket_task);
+          sink_loops.extend(socket_tasks);
         }
         #[cfg(not(unix))]
         {
@@ -126,8 +204,12 @@ pub mod common {
     let tasks = FuturesUnordered::new();
 
     let initiator_task =
-      task::spawn(client_initiator(sink_to_client_pull, client_to_sink_push, cancel));
+      task::spawn(client_initiator(channel_map.clone(), client_to_sink_push.clone(), cancel));
     tasks.push(initiator_task);
+
+    if config.watch_channels {
+      run_channel_watcher(channel_map, client_to_sink_push, None);
+    }
 
     Ok(maybe_done(join_all(tasks.into_iter().chain(sink_loops))))
   }
@@ -142,8 +224,7 @@ pub mod common {
   /// # Parameters
   /// * `properties`: A reference to [`Guest`], a struct that contains the `serial_paths`
   ///   property, which specifies paths of the erial ports to which this function will connect.
-  /// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
-  ///   client loops.
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
@@ -154,7 +235,7 @@ pub mod common {
   /// if successful, otherwise an error if connecting to any of the serial ports fails.
   pub async fn initialize_serials(
     properties: &SerialGuest,
-    sink_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
@@ -194,7 +275,7 @@ pub mod common {
     for serial in serials_ok {
       let serial_task = task::spawn(sink_loop(
         serial,
-        sink_to_client_push.clone(),
+        channel_map.clone(),
         client_to_sink_pull.clone(),
         cancel.clone(),
       ));
@@ -212,6 +293,10 @@ pub mod common {
   /// # Parameters
   ///
   /// * `properties`: A mutable reference to [`Host`] that provides the addresses for the listeners
+  /// * `address_pairs`: [`AddressPair`]s to create listeners for direct connections
+  /// * `socks5_proxy`: An address to which will the socks5 listener bind itself to
+  /// * `http_proxy`: An address to which will the http proxy listener bind itself to
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `connection_sender`: An [`mpsc::Sender`] channel where the connection information will be
   ///   sent when a client connects.
   /// * `cancel`: A [`CancellationToken`] to signal the listener loops to end due to application
@@ -228,7 +313,10 @@ pub mod common {
   pub async fn initialize_listeners(
     address_pairs: &[AddressPair],
     socks5_proxy: &Option<String>,
+    http_proxy: &Option<String>,
+    channel_map: ChannelMap,
     connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    client_to_sink_push: async_channel::Sender<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing listeners");
@@ -248,11 +336,28 @@ pub mod common {
     }
 
     if let Some(socks5_proxy) = socks5_proxy {
-      let socks5_task =
-        setup_listener(socks5_proxy, ConnectionType::Socks5, connection_sender, cancel)
-          .await
-          .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
+      let socks5_task = setup_listener(
+        socks5_proxy,
+        ConnectionType::Socks5,
+        connection_sender.clone(),
+        cancel.clone(),
+      )
+      .await
+      .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
       listener_tasks.push(socks5_task);
+    }
+
+    if let Some(http_proxy) = http_proxy {
+      let http_task = setup_http_listener(
+        http_proxy,
+        channel_map,
+        client_to_sink_push,
+        connection_sender,
+        cancel,
+      )
+      .await
+      .context(format!("Failed to setup http proxy listener at address '{http_proxy}'"))?;
+      listener_tasks.push(http_task);
     }
 
     Ok(listener_tasks)
@@ -290,24 +395,54 @@ pub mod common {
       ConnectionType::Direct { ref target_address } => {
         info!("Created listener at {} for {}", listener_address, target_address);
       }
+      ConnectionType::Http => {
+        bail!("HTTP requires a custom listener");
+      }
     }
 
     Ok(tokio::spawn(run_listener(listener, connection_type, connection_sender, cancel)))
+  }
+
+  async fn setup_http_listener(
+    listener_address: &str,
+    channel_map: ChannelMap,
+    client_to_sink_push: async_channel::Sender<Bytes>,
+    connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
+    cancel: CancellationToken,
+  ) -> anyhow::Result<JoinHandle<()>> {
+    let listener = create_upstream_listener(listener_address).await?;
+    info!("Created HTTP listener at {}", listener_address);
+    Ok(tokio::spawn(run_http_listener(
+      listener,
+      channel_map,
+      client_to_sink_push,
+      connection_sender,
+      cancel,
+    )))
   }
 
   #[cfg(test)]
   mod tests {
     use crate::runner::common::initialize_listeners;
     use config::configuration::AddressPair;
+    use papaya::HashMap;
+    use serial_multiplexer_lib::channels::Identifier;
     use serial_multiplexer_lib::host::ConnectionType;
+    use serial_multiplexer_lib::protocol_utils::create_ack_datagram;
+    use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn test_initialize_listeners() {
+      setup_tracing().await;
       let cancel = CancellationToken::new();
+      let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
+      let channel_map = Arc::new(HashMap::new());
       let address_pairs = vec![
         AddressPair {
           listener_address: "127.0.0.1:2000".to_string(),
@@ -319,16 +454,20 @@ pub mod common {
         },
       ];
       let socks5_proxy = "127.0.0.1:5000".to_string();
+      let http_proxy = "127.0.0.1:5500".to_string();
 
       let listener_task = initialize_listeners(
         &address_pairs,
         &Some(socks5_proxy.clone()),
+        &Some(http_proxy.clone()),
+        channel_map.clone(),
         connection_sender,
+        client_to_sink_push,
         cancel,
       )
       .await
       .unwrap();
-      assert_eq!(listener_task.len(), 3);
+      assert_eq!(listener_task.len(), 4);
 
       let mut connection_id = 0;
       for address_pair in address_pairs.iter() {
@@ -349,20 +488,39 @@ pub mod common {
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), socks5_client.local_addr().unwrap());
       assert_eq!(connection_type, ConnectionType::Socks5);
+      connection_id += 1;
+      let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
+      channel_map.pin().insert(
+        Identifier::Client(connection_id),
+        (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+      );
+      let mut http_client = TcpStream::connect(http_proxy).await.unwrap();
+      http_client
+        .write_all(b"CONNECT google.com:443 HTTP/1.1\r\nHost: google.com\r\n\r\n")
+        .await
+        .unwrap();
+      sink_to_client_push.broadcast_direct(create_ack_datagram(connection_id, 0, 0)).await.unwrap();
+      let (state, connection_type) = connection_receiver.recv().await.unwrap();
+      assert_eq!(state.identifier, connection_id);
+      assert_eq!(state.client.peer_addr().unwrap(), http_client.local_addr().unwrap());
+      assert_eq!(connection_type, ConnectionType::Http);
     }
   }
 }
 
 #[cfg(windows)]
 mod windows {
-  use anyhow::Error;
+  use anyhow::{Context, Error, anyhow};
   use bytes::Bytes;
-  use config::configuration::WindowsPipeHost;
+  use config::configuration::{WindowsPipeGuest, WindowsPipeHost};
+  use futures::future::try_join_all;
   use futures::stream::FuturesUnordered;
+  use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
   use std::collections::HashSet;
   use std::time::Duration;
   use tokio::io::AsyncWriteExt;
+  use tokio::net::windows::named_pipe;
   use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
   use tokio::task::JoinHandle;
   use tokio::time::sleep;
@@ -380,9 +538,9 @@ mod windows {
   /// # Parameters:
   /// * `properties`: A reference to [`Host`], a struct that contains the `pipe_paths`
   ///   property, which specifies paths to the named pipes.
-  /// * `pipe_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
+  /// * `sink_to_client_push`: A [`async_broadcast::Sender<Bytes>`] used to send received datagrams to
   ///   client loops.
-  /// * `client_to_pipe_pull`: An [`async_channel::Receiver`], through which the sink loop
+  /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the
   ///   loop(s) should terminate.
@@ -392,8 +550,8 @@ mod windows {
   /// if successful, otherwise an error if connecting to any of the pipes fails.
   pub async fn create_windows_pipe_loops(
     properties: &WindowsPipeHost,
-    pipe_to_client_push: async_broadcast::Sender<Bytes>,
-    client_to_pipe_pull: async_channel::Receiver<Bytes>,
+    channel_map: ChannelMap,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     let mut pipes_ok = Vec::new();
@@ -435,10 +593,9 @@ mod windows {
     let pipe_loops = FuturesUnordered::new();
     for pipe in pipes_ok {
       let cancel = cancel.clone();
-      let pipe_to_client_push = pipe_to_client_push.clone();
-      let client_to_pipe_pull = client_to_pipe_pull.clone();
-      let pipe_task =
-        tokio::spawn(sink_loop(pipe, pipe_to_client_push, client_to_pipe_pull, cancel));
+      let client_to_sink_pull = client_to_sink_pull.clone();
+      let channel_map = channel_map.clone();
+      let pipe_task = tokio::spawn(sink_loop(pipe, channel_map, client_to_sink_pull, cancel));
       pipe_loops.push(pipe_task);
     }
     Ok(pipe_loops)
@@ -449,17 +606,98 @@ mod windows {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
   }
 
+  pub async fn listen_accept_windows_named_pipe(
+    properties: &WindowsPipeGuest,
+    channel_map: ChannelMap,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
+    cancel: CancellationToken,
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let pipe_instances = properties.pipe_paths.iter().try_fold(
+      Vec::with_capacity(properties.pipe_paths.len()),
+      |mut instances, path| match named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(path)
+      {
+        Ok(instance) => {
+          debug!("Listening for a Windows named pipe connection on {}", path);
+          instances.push(instance);
+          Ok(instances)
+        }
+        Err(e) => {
+          instances.into_iter().for_each(|i| {
+            if let Err(e) = i.disconnect() {
+              error!("Failed to disconnect Windows named pipe. {:?}", e);
+            }
+          });
+          Err(e).context(format!("Failed to create Windows named pipe server '{}'", path))
+        }
+      },
+    )?;
+
+    let instance_tasks: Vec<_> = pipe_instances
+      .into_iter()
+      .map(|instance| {
+        tokio::spawn(async move {
+          match instance.connect().await {
+            Ok(_) => Ok(instance),
+            Err(e) => Err((instance, e)),
+          }
+        })
+      })
+      .collect();
+
+    let connected_instances =
+      try_join_all(instance_tasks).await.context("Failed waiting for all pipe tasks to finish")?;
+    if connected_instances.iter().any(|i| i.is_err()) {
+      let mut ret_error = anyhow::anyhow!("Some Windows pipes failed to connect");
+      for instance in connected_instances {
+        match instance {
+          Ok(instance) => {
+            if let Err(e) = instance.disconnect() {
+              ret_error =
+                ret_error.context(format!("Failed to disconnect Windows named pipe. {e}"));
+            }
+          }
+          Err((instance, e)) => {
+            let mut anyhow_e = anyhow!(e);
+            if let Err(e) = instance.disconnect() {
+              anyhow_e =
+                anyhow_e.context(format!("Also failed to disconnect Windows named pipe. {e}"));
+            }
+            ret_error = ret_error.context(anyhow_e);
+          }
+        }
+      }
+      return Err(ret_error);
+    }
+    Ok(
+      connected_instances
+        .into_iter()
+        .map(|i| {
+          tokio::spawn(sink_loop(
+            i.unwrap(),
+            channel_map.clone(),
+            client_to_sink_pull.clone(),
+            cancel.clone(),
+          ))
+        })
+        .collect(),
+    )
+  }
+
   #[cfg(test)]
   mod tests {
     use super::*;
+    use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
     use tokio::net::windows::named_pipe::ServerOptions;
     use tokio::time::timeout;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn create_windows_pipe_loops_non_existent_test() {
       setup_tracing().await;
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let sink_properties = WindowsPipeHost {
@@ -468,7 +706,7 @@ mod windows {
 
       let result = create_windows_pipe_loops(
         &sink_properties,
-        sink_to_client_push,
+        channel_map,
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -494,7 +732,7 @@ mod windows {
         pipe3.disconnect().unwrap();
       });
 
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
       let sink_properties = WindowsPipeHost {
@@ -503,7 +741,7 @@ mod windows {
 
       let result = create_windows_pipe_loops(
         &sink_properties,
-        sink_to_client_push,
+        channel_map,
         client_to_sink_pull,
         cancel.clone(),
       )
@@ -520,24 +758,28 @@ mod linux {
   use anyhow::{Context, bail};
   use bytes::Bytes;
   use config::configuration::{UnixSocketGuest, UnixSocketHost};
+  use futures::future::try_join_all;
+  use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
+  use std::collections::HashSet;
   use std::fs::remove_file;
   use std::io::ErrorKind;
+  use tokio::io::AsyncWriteExt;
   use tokio::net::{UnixListener, UnixStream};
   use tokio::task::JoinHandle;
   use tokio_util::sync::CancellationToken;
-  use tracing::debug;
+  use tracing::{debug, error};
 
   /// A shorthand function to create a task running a sink loop with a Unix socket as the sink.
   ///
   /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
   ) -> JoinHandle<()> {
-    tokio::spawn(sink_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+    tokio::spawn(sink_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
   }
 
   /// Attempts to connect to a Unix socket and set up a sink loop.
@@ -561,15 +803,46 @@ mod linux {
   /// otherwise an error if connecting to the Unix socket fails.
   pub async fn connect_to_unix_socket(
     properties: &UnixSocketGuest,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
+    channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> anyhow::Result<JoinHandle<()>> {
-    debug!("Attempting to connect to a unix socket at {}", &properties.socket_path);
-    let unix_socket =
-      UnixStream::connect(&properties.socket_path).await.context("Failed to connect to socket")?;
-    debug!(peer_address = ?unix_socket.peer_addr()?, "Connected to unix socket");
-    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
+    let mut connected_sockets = Vec::with_capacity(distinct_socket_paths.len());
+    for socket_path in distinct_socket_paths {
+      debug!("Attempting to connect to a unix socket at {}", socket_path);
+      match UnixStream::connect(socket_path).await.context("Failed to connect to socket") {
+        Ok(socket) => {
+          debug!(peer_address = ?socket.peer_addr()?, "Connected to unix socket");
+          connected_sockets.push(socket);
+        }
+        Err(e) => {
+          error!("Failed to connect to socket at {}: {}", socket_path, e);
+          let mut ret_error =
+            anyhow::anyhow!("Failed to connect to socket at {}", socket_path).context(e);
+          for mut connected_socket in connected_sockets {
+            if let Err(e) = connected_socket.shutdown().await {
+              ret_error = ret_error.context("Also failed to shutdown connected socket").context(e);
+            }
+          }
+          return Err(ret_error);
+        }
+      }
+    }
+
+    Ok(
+      connected_sockets
+        .into_iter()
+        .map(|socket| {
+          create_unix_socket_loop(
+            socket,
+            channel_map.clone(),
+            client_to_socket_pull.clone(),
+            cancel.clone(),
+          )
+        })
+        .collect(),
+    )
   }
 
   /// Creates and listens on a Unix socket, then creates a sink loop when a client connects.
@@ -596,62 +869,128 @@ mod linux {
   ///   * The connected client does not have an address
   pub async fn listen_accept_unix_connection(
     properties: &UnixSocketHost,
-    socket_to_client_push: async_broadcast::Sender<Bytes>,
-    client_to_socket_pull: async_channel::Receiver<Bytes>,
+    channel_map: ChannelMap,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
     cancel: CancellationToken,
-  ) -> anyhow::Result<JoinHandle<()>> {
-    if let Err(e) = remove_file(&properties.socket_path)
-      && e.kind() != ErrorKind::NotFound
-    {
-      bail!("Failed to remove socket file: {}", e);
+  ) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
+    for socket_path in distinct_socket_paths.iter() {
+      if let Err(e) = remove_file(&socket_path)
+        && e.kind() != ErrorKind::NotFound
+      {
+        bail!("Failed to remove socket file: {}", e);
+      }
     }
-    debug!("Listening for a unix socket connection on {}", &properties.socket_path);
-    let socket_listener =
-      UnixListener::bind(&properties.socket_path).context("Failed to bind to socket")?;
-    let (unix_socket, _) =
-      socket_listener.accept().await.context("Failed to accept socket connection")?;
-    debug!(peer_address = ?unix_socket.peer_addr()?, "Accepted unix socket connection");
-    Ok(create_unix_socket_loop(unix_socket, socket_to_client_push, client_to_socket_pull, cancel))
+    let pipe_instances = distinct_socket_paths.iter().try_fold(
+      Vec::with_capacity(distinct_socket_paths.len()),
+      |mut instances, path| match UnixListener::bind(path) {
+        Ok(instance) => {
+          debug!("Listening for a unix socket connection on {}", path);
+          instances.push(instance);
+          Ok(instances)
+        }
+        Err(e) => Err(e).context(format!("Failed to bind a unix socket to '{}'", path)),
+      },
+    )?;
+
+    let instance_tasks: Vec<_> = pipe_instances
+      .into_iter()
+      .map(|instance| {
+        tokio::spawn(async move {
+          match instance.accept().await {
+            Ok((s, pa)) => {
+              debug!(
+                "Unix listener '{}' accepted connection from '{}'",
+                instance.local_addr().map_or(String::new(), |la| format!("{la:?}")),
+                format!("{pa:?}")
+              );
+              Ok(s)
+            }
+            Err(e) => Err(e),
+          }
+        })
+      })
+      .collect();
+
+    let connected_instances = try_join_all(instance_tasks)
+      .await
+      .context("Failed waiting for all socket tasks to finish")?;
+    if connected_instances.iter().any(|i| i.is_err()) {
+      let mut ret_error = anyhow::anyhow!("Some Unix listener failed to accept connection");
+      for instance in connected_instances {
+        match instance {
+          Ok(mut instance) => {
+            if let Err(e) = instance.shutdown().await {
+              ret_error =
+                ret_error.context(format!("Failed to disconnect Unix socket connection. {e}"));
+            }
+          }
+          Err(e) => {
+            ret_error = ret_error.context(e);
+          }
+        }
+      }
+      return Err(ret_error);
+    }
+    Ok(
+      connected_instances
+        .into_iter()
+        .map(|i| {
+          tokio::spawn(sink_loop(
+            i.unwrap(),
+            channel_map.clone(),
+            client_to_sink_pull.clone(),
+            cancel.clone(),
+          ))
+        })
+        .collect(),
+    )
   }
 
   #[cfg(test)]
   mod tests {
     use super::*;
+    use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
     #[tokio::test]
     async fn listen_connect_accept_send_test() {
       setup_tracing().await;
-      let socket_path = "test_socket.sock";
+      let socket_path = vec!["test_socket.sock".to_string()];
       let sink_properties = UnixSocketHost {
-        socket_path: socket_path.to_string(),
+        socket_paths: socket_path.clone(),
+        ..Default::default()
       };
       let unix_socket_properties = UnixSocketGuest {
-        socket_path: socket_path.to_string(),
+        socket_paths: socket_path.clone(),
+        ..Default::default()
       };
 
-      let (sink_to_client_push, _sink_to_client_pull) = async_broadcast::broadcast(256);
+      let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
 
       timeout(Duration::from_secs(3), async {
         let host_loop = tokio::spawn({
           let cancel = cancel.clone();
-          let sink_to_client_push = sink_to_client_push.clone();
           let client_to_sink_pull = client_to_sink_pull.clone();
+          let channel_map = channel_map.clone();
           async move {
-            let sink_loop = listen_accept_unix_connection(
+            let sink_loops = listen_accept_unix_connection(
               &sink_properties,
-              sink_to_client_push,
+              channel_map,
               client_to_sink_pull,
               cancel.clone(),
             )
             .await
             .unwrap();
             cancel.cancelled().await;
-            sink_loop.await.unwrap();
+            for sink_loop in sink_loops {
+              sink_loop.await.unwrap();
+            }
           }
         });
 
@@ -659,14 +998,16 @@ mod linux {
         sleep(Duration::from_secs(1)).await;
         let sink_loop = connect_to_unix_socket(
           &unix_socket_properties,
-          sink_to_client_push,
+          channel_map,
           client_to_sink_pull,
           cancel.clone(),
         )
         .await;
         cancel.cancel();
         host_loop.await.unwrap();
-        sink_loop.unwrap().await.unwrap();
+        for sink_loop in sink_loop.unwrap() {
+          sink_loop.await.unwrap();
+        }
       })
       .await
       .unwrap();

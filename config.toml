@@ -1,6 +1,7 @@
 version = "1"
 log_file = "serial-multiplexer.log"
-tracing_filter = "serial_multiplexer=debug,serial_multiplexer::huge_data=info,serial_multiplexer::metrics=debug"
+tracing_filter = "serial_multiplexer=debug,serial_multiplexer::CW=info,serial_multiplexer::huge_data=info,serial_multiplexer::metrics=debug"
+watch_channels = true
 
 [mode.host]
 sink_type.windows_pipe.pipe_paths = ['\\.\pipe\myPipe1', '\\.\pipe\myPipe2', '\\.\pipe\myPipe3', '\\.\pipe\myPipe4']
@@ -10,6 +11,7 @@ address_pairs = [
     {listener_address = "127.0.0.1:1235", target_address = "google.com:443"},
 ]
 socks5_proxy = "127.0.0.1:2345"
+http_proxy = "127.0.0.1:2355"
 
 #[mode.guest]
 #sink_type.serial.serial_paths = ['COM1', 'COM2', 'COM3', 'COM4']

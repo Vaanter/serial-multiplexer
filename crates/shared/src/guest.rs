@@ -1,3 +1,4 @@
+use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::{ConnectionState, connection_loop};
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
@@ -18,9 +19,9 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// # Parameters
 ///
-/// * `serial_to_client_pull`:
-///   A [`async_broadcast::Receiver<Bytes>`] to receive data from a sink.
-/// * `client_to_serial_push`: An [`async_channel::Sender<Bytes>`] to send data from clients back
+/// * `channel_map`:
+///   A [`ChannelMap`] to receive Initial datagrams from the sink.
+/// * `client_to_sink_push`: An [`async_channel::Sender<Bytes>`] to send data from clients back
 ///   to the sink(s).
 /// * `cancel`: A [`CancellationToken`] to signal when the function should terminate.
 ///
@@ -33,39 +34,40 @@ const CLIENT_INITIATION_TIMEOUT: Duration = Duration::from_secs(3);
 ///   * If successful and a connection is established,
 ///     it spawns a new task that runs [`connection_loop`],
 ///     handling communication between the client connection and the sink.
-///   * If the connection initiation fails or exceeds the timeout, appropriate errors are logged.
-/// * If no data can be received from a sink(s) (i.e. all ports are closed),
+/// * If no data can be received from a sink(s) (i.e. all sinks are closed),
 ///   `cancel` will be triggered, and the loop ends.
 /// * The loop terminates when the cancellation token (`cancel`) is triggered.
 ///
 /// [`Initial`]: ControlCode::Initial
 pub async fn client_initiator(
-  mut serial_to_client_pull: async_broadcast::Receiver<Bytes>,
-  client_to_serial_push: async_channel::Sender<Bytes>,
+  channel_map: ChannelMap,
+  client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
   debug!("Starting client initiator");
+  let (mut sink_to_client_pull, _guard) =
+    channel_get_or_insert_with_guard(channel_map.clone(), Identifier::ClientInitiator);
   loop {
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
         break;
       }
-      data = serial_to_client_pull.recv() => {
+      data = sink_to_client_pull.recv_direct() => {
         match data {
           Ok(data) => {
             tokio::spawn({
-              let serial_to_client_pull = serial_to_client_pull.clone();
-              let client_to_serial_push = client_to_serial_push.clone();
+              let client_to_sink_push = client_to_sink_push.clone();
+              let channel_map = channel_map.clone();
               let cancel = cancel.clone();
               async move {
                 match timeout(CLIENT_INITIATION_TIMEOUT,
-                  initiate_client_connection(data, client_to_serial_push.clone())).await {
+                  initiate_client_connection(data, client_to_sink_push.clone())).await {
                   Ok(Ok(Some(connection))) => {
                     tokio::spawn(connection_loop(
                       connection,
-                      serial_to_client_pull.clone(),
-                      client_to_serial_push.clone(),
+                      channel_map,
+                      client_to_sink_push,
                       cancel.clone()
                     ));
                   },
@@ -99,7 +101,7 @@ pub async fn client_initiator(
 /// # Parameters
 ///
 /// * `data`: The raw [`Bytes`] representing the incoming datagram.
-/// * `client_to_serial_push`:
+/// * `client_to_sink_push`:
 ///   An [`async_channel::Sender<Bytes>`] to send datagrams to the sink(s).
 ///
 /// # Returns
@@ -125,7 +127,7 @@ pub async fn client_initiator(
 /// [`ACK`]: ControlCode::Ack
 async fn initiate_client_connection(
   data: Bytes,
-  client_to_serial_push: async_channel::Sender<Bytes>,
+  client_to_sink_push: async_channel::Sender<Bytes>,
 ) -> anyhow::Result<Option<ConnectionState>> {
   match datagram_from_bytes(&data) {
     Ok(datagram) => {
@@ -140,10 +142,10 @@ async fn initiate_client_connection(
       };
       info!("Connecting to downstream: {}", target_address);
       let mut downstream = connect_downstream(&target_address).await?;
-      let ack = create_ack_datagram(identifier, 0);
+      let ack = create_ack_datagram(identifier, 0, 0);
       let ack_datagram = datagram_from_bytes(&ack);
       debug!("Sending ACK: {:?}", ack_datagram);
-      if let Err(e) = client_to_serial_push.send(ack).await {
+      if let Err(e) = client_to_sink_push.send(ack).await {
         if let Err(e) = downstream.shutdown().await {
           error!("Failed to shutdown downstream after failing to send ACK: {}", e);
         }
@@ -164,88 +166,97 @@ mod tests {
   use crate::protocol_utils::create_initial_datagram;
   use crate::schema_generated::serial_multiplexer::root_as_datagram;
   use crate::test_utils::{run_echo, setup_tracing};
+  use papaya::HashMap;
+  use std::sync::Arc;
 
   #[tokio::test]
   async fn test_initiate_client_connection_smoke() {
     setup_tracing().await;
-    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let datagram = create_initial_datagram(123, 0, &target_address);
+    let datagram = create_initial_datagram(123, &target_address);
 
     let connection =
-      initiate_client_connection(datagram, client_to_serial_push.clone()).await.unwrap().unwrap();
+      initiate_client_connection(datagram, client_to_sink_push.clone()).await.unwrap().unwrap();
     assert_eq!(connection.identifier, 123);
     assert_eq!(connection.sequence, 0);
     assert_eq!(connection.largest_processed, 0);
     assert_eq!(connection.client.peer_addr().unwrap().to_string(), target_address);
-    let ack_data = client_to_serial_pull.recv().await.unwrap();
+    let ack_data = client_to_sink_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&ack_data).unwrap();
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.identifier(), 123);
-    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
   }
 
   #[tokio::test]
   async fn test_initiate_client_connection_invalid_datagram() {
     setup_tracing().await;
-    let (client_to_serial_push, _) = async_channel::bounded(10);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
 
-    let connection = initiate_client_connection(Bytes::new(), client_to_serial_push.clone()).await;
+    let connection = initiate_client_connection(Bytes::new(), client_to_sink_push.clone()).await;
     assert!(matches!(connection, Ok(None)));
   }
 
   #[tokio::test]
   async fn test_client_initiator_success() {
     setup_tracing().await;
-    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let initial = create_initial_datagram(123, 0, &target_address);
+    let initial = create_initial_datagram(123, &target_address);
 
-    tokio::spawn(client_initiator(
-      serial_to_client_pull,
-      client_to_serial_push,
-      CancellationToken::new(),
-    ));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 
-    serial_to_client_push.broadcast_direct(initial).await.unwrap();
-    let ack = client_to_serial_pull.recv().await.unwrap();
+    sink_to_client_push.broadcast_direct(initial).await.unwrap();
+    let ack = client_to_sink_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&ack).unwrap();
     assert_eq!(ack_datagram.code(), ControlCode::Ack);
     assert_eq!(ack_datagram.identifier(), 123);
-    assert_eq!(ack_datagram.data().unwrap().len(), 0);
+    assert_eq!(ack_datagram.data().unwrap().bytes(), 0u64.to_be_bytes());
   }
 
-  #[tokio::test]
+  #[tokio::test(start_paused = true)]
   async fn test_client_initiator_target_unreachable() {
     setup_tracing().await;
-    let (client_to_serial_push, client_to_serial_pull) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let target_address = "127.0.0.1:0".to_string();
-    let initial = create_initial_datagram(123, 0, &target_address);
+    let initial = create_initial_datagram(123, &target_address);
 
-    tokio::spawn(client_initiator(
-      serial_to_client_pull,
-      client_to_serial_push,
-      CancellationToken::new(),
-    ));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 
-    serial_to_client_push.broadcast_direct(initial).await.unwrap();
-    assert!(timeout(Duration::from_secs(1), client_to_serial_pull.recv()).await.is_err());
+    sink_to_client_push.broadcast_direct(initial).await.unwrap();
+    assert!(timeout(Duration::from_secs(1), client_to_sink_pull.recv()).await.is_err());
   }
 
   #[tokio::test]
-  async fn test_client_initiator_pipe_closed() {
+  async fn test_client_initiator_sink_closed() {
     setup_tracing().await;
-    let (client_to_serial_push, _) = async_channel::bounded(10);
-    let (serial_to_client_push, serial_to_client_pull) = async_broadcast::broadcast(10);
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
+    let channel_map = Arc::new(HashMap::new());
+    let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
+    channel_map.pin().insert(
+      Identifier::ClientInitiator,
+      (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
+    );
     let cancel = CancellationToken::new();
 
-    tokio::spawn(client_initiator(serial_to_client_pull, client_to_serial_push, cancel.clone()));
+    tokio::spawn(client_initiator(channel_map, client_to_sink_push, cancel.clone()));
 
-    drop(serial_to_client_push);
+    sink_to_client_push.close();
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

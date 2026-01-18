@@ -12,7 +12,12 @@ bytes = { workspace = true }
 fast-socks5 = { workspace = true }
 flatbuffers = { workspace = true }
 futures = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 memchr = { workspace = true }
+papaya = { workspace = true }
 tokio = { workspace = true }
 tokio-serial = { workspace = true }
 tokio-util = { workspace = true }
