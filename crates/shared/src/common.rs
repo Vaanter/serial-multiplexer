@@ -65,6 +65,7 @@ const SINK_WRITE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// * `largest_acked` (`u64`) - The largest sequence number for which this connection received an ACK.
 /// * `datagram_queue` (`BTreeMap<u64, Bytes>`) - A map (ordered by sequence number) storing datagrams
 ///   that are awaiting processing because they arrived out-of-order.
+/// * `client_address` (`String`) - A display string of clients connection used in traces
 #[derive(Debug)]
 pub struct ConnectionState {
   pub identifier: u64,
@@ -73,10 +74,13 @@ pub struct ConnectionState {
   pub largest_processed: u64,
   pub largest_acked: u64,
   pub datagram_queue: BTreeMap<u64, Bytes>,
+  pub client_address: String,
 }
 
 impl ConnectionState {
-  pub const fn new(identifier: u64, client: TcpStream) -> Self {
+  pub fn new(identifier: u64, client: TcpStream) -> Self {
+    let client_address =
+      client.peer_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
     Self {
       identifier,
       client,
@@ -84,6 +88,7 @@ impl ConnectionState {
       largest_processed: 0,
       largest_acked: 0,
       datagram_queue: BTreeMap::new(),
+      client_address,
     }
   }
 }
@@ -738,18 +743,15 @@ async fn send_ack(
 ///    The processing might signal connection termination, which breaks the loop.
 ///
 /// [`Close`]: ControlCode::Close
-#[instrument(skip_all, fields(connection_id = %connection.identifier, client_address))]
+#[instrument(skip_all, fields(connection_id = %connection.identifier, client_address = connection.client_address))]
 pub async fn connection_loop(
   mut connection: ConnectionState,
   channel_map: ChannelMap,
   client_to_sink_push: async_channel::Sender<Bytes>,
   cancel: CancellationToken,
 ) {
-  debug!("Connection {} loop starting", connection.identifier);
   let current_span = Span::current();
-  let client_address =
-    connection.client.peer_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
-  current_span.record("client_address", &client_address);
+  debug!("Connection loop starting");
   let (mut sink_to_client_pull, _guard) = channel_get_or_insert_with_guard(
     channel_map.clone(),
     Identifier::Client(connection.identifier),
