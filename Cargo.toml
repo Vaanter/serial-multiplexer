@@ -1,6 +1,6 @@
 [workspace.package]
 authors = ["Valentín Bolfík <valentin.bolfik@gmail.com>"]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 
 [workspace]
