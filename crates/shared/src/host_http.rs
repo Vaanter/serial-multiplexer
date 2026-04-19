@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Span, debug, error, info};
+use tracing::{debug, error, info};
 use tracing_attributes::instrument;
 
 type ServerBuilder = hyper::server::conn::http1::Builder;
@@ -33,7 +33,9 @@ type ServerBuilder = hyper::server::conn::http1::Builder;
 ///   [`crate::host::connection_initiator`] after initiation succeeds.
 /// * `cancel`:
 ///   A [`CancellationToken`] used to signal loop termination due to the app shutting down.
-#[instrument(skip_all, fields(listener_address))]
+#[instrument(skip_all, fields(
+  client_address = crate::utils::display_address(listener.local_addr())
+))]
 pub async fn run_http_listener(
   listener: TcpListener,
   channel_map: ChannelMap,
@@ -41,14 +43,11 @@ pub async fn run_http_listener(
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
-  let listener_address =
-    listener.local_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
-  Span::current().record("listener_address", &listener_address);
   loop {
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
-        info!("Closing HTTP listener {}", listener_address);
+        info!("Closing HTTP listener");
         break;
       }
       new_client = listener.accept() => {

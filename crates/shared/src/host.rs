@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{Span, debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_attributes::instrument;
 
 #[cfg(not(test))]
@@ -39,21 +39,20 @@ impl ConnectionType {
   }
 }
 
-#[instrument(skip_all, fields(listener_address))]
+#[instrument(skip_all, fields(
+  client_address = crate::utils::display_address(listener.local_addr())
+))]
 pub async fn run_listener(
   listener: TcpListener,
   connection_type: ConnectionType,
   connection_sender: mpsc::Sender<(ConnectionState, ConnectionType)>,
   cancel: CancellationToken,
 ) {
-  let listener_address =
-    listener.local_addr().map(|a| format!("{:?}", a)).unwrap_or("???".to_string());
-  Span::current().record("listener_address", &listener_address);
   loop {
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
-        info!("Closing listener {}", listener_address);
+        info!("Closing listener");
         break;
       }
       new_client = listener.accept() => {

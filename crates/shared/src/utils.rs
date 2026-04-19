@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail};
+use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tracing::{debug, warn};
 use tracing_attributes::instrument;
@@ -36,4 +37,11 @@ pub async fn connect_downstream(downstream: &str) -> anyhow::Result<TcpStream> {
     return Ok(downstream);
   }
   bail!("Failed to connect to downstream {}", downstream);
+}
+
+/// Converts a Result containing a SocketAddr to a displayable string.
+///
+/// Returns a debug-formatted socket address on success, or "???" if the Result is an error.
+pub fn display_address<E>(addr: Result<SocketAddr, E>) -> String {
+  addr.map(|a| format!("{:?}", a)).unwrap_or("???".to_string())
 }
