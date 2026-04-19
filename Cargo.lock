@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -933,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "serial-multiplexer"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "serial-multiplexer-lib"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-broadcast",
