@@ -170,8 +170,10 @@ pub async fn sink_loop(
               &channel_map,
               n + unprocessed_data_start,
               &mut sink_buf_read,
-              &mut compression_buffer
-            ).instrument(current_span).await;
+              &mut compression_buffer,
+            )
+            .instrument(current_span)
+            .await;
             trace!(target: METRICS_TARGET, duration = ?sink_read_duration.elapsed(), "Finished reading data from sink");
             match result {
               Ok(unprocessed_bytes) => unprocessed_data_start = unprocessed_bytes,
@@ -192,7 +194,8 @@ pub async fn sink_loop(
           Ok(data) => {
             let sink_write_duration = Instant::now();
             let write_result = handle_sink_write(&mut sink, data, &mut sink_buf_write)
-              .instrument(current_span).await;
+              .instrument(current_span)
+              .await;
             trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
             match write_result {
               Ok(n) => unwritten_data_end = n,
@@ -201,7 +204,7 @@ pub async fn sink_loop(
                 break;
               }
             }
-          },
+          }
           Err(e) => {
             info!("Sink receiver closed, {}", e);
             break;
@@ -210,7 +213,8 @@ pub async fn sink_loop(
       }
       () = sleep(SINK_WRITE_RETRY_INTERVAL), if unwritten_data_end > 0 => {
         let write_result = write_to_sink(&mut sink, &mut sink_buf_write[0..unwritten_data_end])
-          .instrument(current_span).await;
+          .instrument(current_span)
+          .await;
         match write_result {
           Ok(n) => unwritten_data_end = n,
           Err(e) => {
@@ -781,7 +785,9 @@ pub async fn connection_loop(
       data = sink_to_client_pull.recv_direct() => {
         let sink_read_start = Instant::now();
         let connection_terminating =
-          process_sink_read(&mut connection, data, &client_to_sink_push).instrument(current_span.clone()).await;
+          process_sink_read(&mut connection, data, &client_to_sink_push)
+            .instrument(current_span.clone())
+            .await;
         trace!(target: METRICS_TARGET, duration = ?sink_read_start.elapsed(), "Finished processing sink read");
         if connection_terminating {
           break;
@@ -790,7 +796,10 @@ pub async fn connection_loop(
       bytes_read = async {
         if connection_blocked {
           sleep(Duration::from_secs(3)).await;
-          connection.client.read(&mut tcp_buf[unprocessed_bytes..unprocessed_bytes.saturating_add(4)]).await
+          connection
+            .client
+            .read(&mut tcp_buf[unprocessed_bytes..unprocessed_bytes.saturating_add(4)])
+            .await
         } else {
           connection.client.read(&mut tcp_buf[unprocessed_bytes..]).await
         }
@@ -804,7 +813,9 @@ pub async fn connection_loop(
             client_to_sink_push.clone(),
             bytes_read.map(|b| b + unprocessed_bytes),
             &mut tcp_buf,
-          ).instrument(current_span.clone()).await;
+          )
+          .instrument(current_span.clone())
+          .await;
           trace!(target: METRICS_TARGET, duration = ?client_read_start.elapsed(), "Finished processing client read");
           if connection_terminating {
             break;

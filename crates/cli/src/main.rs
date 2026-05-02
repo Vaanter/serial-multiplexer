@@ -227,7 +227,7 @@ async fn run_indefinitely(
           if timeout(Duration::from_secs(2), running_tasks).await.is_err() {
             info!("Failed to shutdown gracefully. Forcing shutdown.");
           }
-        },
+        }
         Err(e) => {
           error!("Failed to handle Ctrl+C: {}", e);
         }

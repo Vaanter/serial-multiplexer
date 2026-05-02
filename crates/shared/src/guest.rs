@@ -61,28 +61,35 @@ pub async fn client_initiator(
               let channel_map = channel_map.clone();
               let cancel = cancel.clone();
               async move {
-                match timeout(CLIENT_INITIATION_TIMEOUT,
-                  initiate_client_connection(data, client_to_sink_push.clone())).await {
+                match timeout(
+                  CLIENT_INITIATION_TIMEOUT,
+                  initiate_client_connection(data, client_to_sink_push.clone()),
+                )
+                .await
+                {
                   Ok(Ok(Some(connection))) => {
                     tokio::spawn(connection_loop(
                       connection,
                       channel_map,
                       client_to_sink_push,
-                      cancel.clone()
+                      cancel.clone(),
                     ));
-                  },
+                  }
                   Ok(Err(e)) => {
                     error!("Failed to initiate client connection: {}", e);
-                  },
+                  }
                   Err(_) => {
                     error!("Failed to initiate client connection in time");
                   }
                   Ok(Ok(None)) => {}
-              }}
+                }
+              }
             });
           }
           Err(RecvError::Overflowed(amount)) => {
-            warn!("Missed {amount} datagrams due to lag, some INITIAL datagrams might have been skipped");
+            warn!(
+              "Missed {amount} datagrams due to lag, some INITIAL datagrams might have been skipped"
+            );
           }
           Err(RecvError::Closed) => {
             error!("Failed to receive data, {}", RecvError::Closed);

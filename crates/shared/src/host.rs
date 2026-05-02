@@ -98,7 +98,7 @@ pub async fn connection_initiator(
             connection_type,
             channel_map.clone(),
             client_to_sink_push.clone(),
-            cancel.clone()
+            cancel.clone(),
           ));
         } else {
           warn!("Connection receiver closed");
