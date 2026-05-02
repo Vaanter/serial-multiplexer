@@ -1,7 +1,7 @@
 use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::protocol_utils::{create_ack_datagram, create_close_datagram, create_data_datagram};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
-use crate::try_write::Sink;
+use crate::sink::Sink;
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
@@ -844,8 +844,8 @@ mod tests {
   use super::*;
   use crate::protocol_utils::{create_ack_datagram, create_data_datagram, create_initial_datagram};
   use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
+  use crate::sink::Sink;
   use crate::test_utils::{run_echo, setup_tracing};
-  use crate::try_write::Sink;
   use crate::utils::create_upstream_listener;
   use papaya::HashMap;
   use std::io::ErrorKind;
@@ -1266,8 +1266,9 @@ mod tests {
 
   async fn test_write_to_sink_full_sink(mut sink_a: impl Sink) {
     loop {
-      if let Err(e) = sink_a.try_write(&BytesMut::zeroed(2usize.pow(20))).await
-        && e.kind() == ErrorKind::WouldBlock
+      if timeout(Duration::from_millis(500), sink_a.write_all(&BytesMut::zeroed(2usize.pow(20))))
+        .await
+        .is_err()
       {
         break;
       }
