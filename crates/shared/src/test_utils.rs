@@ -1,31 +1,37 @@
 use crate::protocol_utils::create_ack_datagram;
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use bytes::{Bytes, BytesMut};
+use std::io::{stderr, stdout};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::Level;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-static TRACING_SETUP: AtomicBool = AtomicBool::new(false);
-static PERMIT: Semaphore = Semaphore::const_new(1);
-
-pub async fn setup_tracing() {
-  let _permit = PERMIT.acquire().await.unwrap();
-  let Ok(false) = TRACING_SETUP.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-  else {
-    return;
-  };
-  let subscriber = tracing_subscriber::fmt()
-    .with_env_filter(format!("serial_multiplexer={}", Level::TRACE))
+static TRACING_LOCK: LazyLock<()> = LazyLock::new(|| {
+  let subscriber1 = tracing_subscriber::fmt::Layer::default()
+    .with_writer(stdout)
+    .with_file(false)
+    .with_line_number(false)
+    .with_thread_ids(true)
+    .with_target(false)
+    .with_filter(EnvFilter::new(format!("serial_multiplexer={}", Level::TRACE)));
+  let subscriber2 = tracing_subscriber::fmt::Layer::default()
+    .with_writer(stderr)
     .with_file(true)
     .with_line_number(true)
     .with_thread_ids(true)
     .with_target(true)
-    .finish();
-  let _ = tracing::subscriber::set_global_default(subscriber);
+    .with_filter(EnvFilter::new(format!("serial_multiplexer={}", Level::TRACE)));
+  Registry::default().with(subscriber1).with(subscriber2).init();
+});
+
+pub fn setup_tracing() {
+  LazyLock::force(&TRACING_LOCK);
 }
 
 pub async fn run_echo() -> (SocketAddr, JoinHandle<()>) {

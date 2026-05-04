@@ -76,7 +76,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_channel_get_or_insert_with_guard_created_and_dropped() {
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let id = Identifier::Client(50);
     let (_pull, guard) = channel_get_or_insert_with_guard(channel_map.clone(), id);
@@ -87,7 +87,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_channel_get_or_insert_with_guard_forgotten() {
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let id = Identifier::Client(50);
     let (_pull, guard) = channel_get_or_insert_with_guard(channel_map.clone(), id);

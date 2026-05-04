@@ -438,7 +438,7 @@ pub mod common {
 
     #[tokio::test]
     async fn test_initialize_listeners() {
-      setup_tracing().await;
+      setup_tracing();
       let cancel = CancellationToken::new();
       let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
       let (connection_sender, mut connection_receiver) = mpsc::channel(128);
@@ -696,7 +696,7 @@ mod windows {
 
     #[tokio::test(start_paused = true)]
     async fn create_windows_pipe_loops_non_existent_test() {
-      setup_tracing().await;
+      setup_tracing();
       let channel_map = Arc::new(HashMap::new());
       let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
       let cancel = CancellationToken::new();
@@ -716,7 +716,7 @@ mod windows {
 
     #[tokio::test]
     async fn create_windows_pipe_loops_multiple_test() {
-      setup_tracing().await;
+      setup_tracing();
       let pipe1_path = "\\\\.\\pipe\\test_pipe_multiplexer_1";
       let pipe2_path = "\\\\.\\pipe\\test_pipe_multiplexer_2";
       let pipe3_path = "\\\\.\\pipe\\test_pipe_multiplexer_3";
@@ -958,7 +958,7 @@ mod linux {
 
     #[tokio::test]
     async fn listen_connect_accept_send_test() {
-      setup_tracing().await;
+      setup_tracing();
       let socket_path = vec!["test_socket.sock".to_string()];
       let sink_properties = UnixSocketHost {
         socket_paths: socket_path.clone(),

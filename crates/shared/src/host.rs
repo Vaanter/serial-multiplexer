@@ -307,7 +307,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_run_listener_smoke() {
-    setup_tracing().await;
+    setup_tracing();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listener_address = listener.local_addr().unwrap();
     let (target_address, _) = run_echo().await;
@@ -327,7 +327,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_initiate_connection_success() {
-    setup_tracing().await;
+    setup_tracing();
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(256);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let (address, _) = run_echo().await;
@@ -364,7 +364,7 @@ mod tests {
 
   #[tokio::test]
   async fn initiate_socks5_connection_success() {
-    setup_tracing().await;
+    setup_tracing();
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(256);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let (connection_sender, mut connection_receiver) = mpsc::channel(128);
@@ -411,7 +411,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_connection_initiator() {
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -457,7 +457,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_new_connection_direct_success() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -506,7 +506,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_new_connection_socks5_success() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -562,7 +562,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn test_handle_new_connection_socks5_no_socks5_data() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);

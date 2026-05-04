@@ -239,7 +239,7 @@ mod tests {
   #[tokio::test]
   async fn test_run_http_listener_smoke() {
     type ClientBuilder = hyper::client::conn::http1::Builder;
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
 

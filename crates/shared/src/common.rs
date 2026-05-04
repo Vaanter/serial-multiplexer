@@ -871,7 +871,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_double_with_rubbish() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -920,7 +920,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_multiple_datagrams() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -962,7 +962,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_large() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -993,7 +993,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_size_not_read() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -1019,7 +1019,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_data_partially_read() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -1047,7 +1047,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_data_garbage_cleanup() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(200);
     let channel_map = Arc::new(HashMap::new());
@@ -1080,7 +1080,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_data_partial_header() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::new();
     let mut compression_buf = BytesMut::zeroed(200);
     let channel_map = Arc::new(HashMap::new());
@@ -1105,7 +1105,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_sink_read_data_garbage_filled() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
@@ -1124,7 +1124,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_sink_loop_read_sink() {
-    setup_tracing().await;
+    setup_tracing();
     let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
     let channel_map = Arc::new(HashMap::new());
@@ -1205,7 +1205,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_sink_loop_write() {
-    setup_tracing().await;
+    setup_tracing();
     let (sink_a, sink_b) = tokio::io::duplex(4096);
     let channel_map_write = Arc::new(HashMap::new());
     let (sink_to_client_push_write, sink_to_client_pull_write) = async_broadcast::broadcast(256);
@@ -1249,7 +1249,7 @@ mod tests {
   #[tokio::test]
   async fn test_write_to_sink_full_sink_named_pipe() {
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
-    setup_tracing().await;
+    setup_tracing();
     let pipe_path = "\\\\.\\pipe\\test_pipe_multiplexer_sink_loop";
     let pipe_server = ServerOptions::new().first_pipe_instance(true).create(pipe_path).unwrap();
     let pipe_server_handle = tokio::spawn(async move {
@@ -1266,7 +1266,7 @@ mod tests {
   #[tokio::test]
   async fn test_write_to_sink_full_sink_unix_socket() {
     use tokio::net::{UnixListener, UnixStream};
-    setup_tracing().await;
+    setup_tracing();
     let uds_path = "test_write_to_sink_full_sink_unix_socket.sock";
     let uds_server = UnixListener::bind(uds_path).unwrap();
     let pipe_server_handle = tokio::spawn(async move { uds_server.accept().await.unwrap().0 });
@@ -1299,7 +1299,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_connection_loop_sink_read_write() {
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -1360,7 +1360,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn test_connection_loop_blocked_timeout() {
-    setup_tracing().await;
+    setup_tracing();
     let identifier = 0;
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -1406,7 +1406,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_connection_loop_cancel() {
-    setup_tracing().await;
+    setup_tracing();
     let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
@@ -1442,7 +1442,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn test_connection_loop_blocked_buffer_overrun() {
-    setup_tracing().await;
+    setup_tracing();
     let identifier = 0;
     let channel_map = Arc::new(HashMap::new());
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
@@ -1486,7 +1486,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_client_read_smoke() {
-    setup_tracing().await;
+    setup_tracing();
     let contents = "test data";
     let mut bytes = BytesMut::from(contents);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(1);
@@ -1505,7 +1505,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_client_read_client_disconnect() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Ok(0);
@@ -1518,7 +1518,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_handle_client_read_client_error() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Err(std::io::Error::other("test error"));
@@ -1531,7 +1531,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_smoke() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data = BytesMut::from("test data");
@@ -1558,7 +1558,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_out_of_order() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data1 = BytesMut::from("test data1");
@@ -1595,7 +1595,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_invalid_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
@@ -1608,7 +1608,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_different_identifier() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
@@ -1627,7 +1627,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_close_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
@@ -1640,7 +1640,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_ack_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let (target_address, _) = run_echo().await;
     let identifier = 123;
@@ -1656,7 +1656,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_process_sink_read_multi_ack_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let (target_address_a, _) = run_echo().await;
     let (target_address_b, _) = run_echo().await;
@@ -1691,7 +1691,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn test_process_sink_old_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
     let identifier = 123;
     let data = BytesMut::from("test data");
@@ -1719,7 +1719,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_sink_loop_channel_closed() {
-    setup_tracing().await;
+    setup_tracing();
     let (sink_a, _sink_b) = tokio::io::duplex(4096);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -1737,7 +1737,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_sink_read_sink_closed() {
-    setup_tracing().await;
+    setup_tracing();
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);

@@ -178,7 +178,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_initiate_client_connection_smoke() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
@@ -199,7 +199,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_initiate_client_connection_invalid_datagram() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
 
     let connection = initiate_client_connection(Bytes::new(), client_to_sink_push.clone()).await;
@@ -208,7 +208,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_client_initiator_success() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -232,7 +232,7 @@ mod tests {
 
   #[tokio::test(start_paused = true)]
   async fn test_client_initiator_target_unreachable() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
@@ -251,7 +251,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_client_initiator_sink_closed() {
-    setup_tracing().await;
+    setup_tracing();
     let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
