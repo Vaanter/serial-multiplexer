@@ -33,7 +33,7 @@ hyper = { version = "1.9.0", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1.20", features = ["http1", "tokio"] }
 papaya = "0.2.4"
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.1", features = ["full", "test-util"] }
+tokio = { version = "1.52.2", features = ["full", "test-util"] }
 tokio-serial = "5.4.5"
 tokio-util = "0.7.18"
 tracing = "0.1.44"
