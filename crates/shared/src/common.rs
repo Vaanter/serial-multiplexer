@@ -644,12 +644,7 @@ async fn process_datagram(
       }
       result
     }
-    Err(async_broadcast::RecvError::Closed) => {
-      if let Err(e) = connection.client.shutdown().await {
-        error!("Failed to shutdown client: {}", e);
-      }
-      result | 0b10
-    }
+    Err(async_broadcast::RecvError::Closed) => result | 0b10,
     Err(_) => result,
   }
 }
@@ -1556,6 +1551,37 @@ mod tests {
     let client = TcpStream::connect(server_address).await.unwrap();
     let mut connection = ConnectionState::new(identifier, client);
     assert!(!process_sink_read(&mut connection, Ok(datagram), &client_to_sink_push).await);
+    handle.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn test_process_sink_read_closed_sink_to_client_channel() {
+    setup_tracing();
+    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(256);
+    let identifier = 123;
+
+    let (address_sender, mut address_receiver) = mpsc::channel::<SocketAddr>(1);
+    let handle = tokio::spawn(async move {
+      let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let address = listener.local_addr().unwrap();
+      address_sender.send(address).await.unwrap();
+      let (mut client, _) = listener.accept().await.unwrap();
+      let mut client_buf = BytesMut::zeroed(2048);
+      let n = client.read(&mut client_buf).await.unwrap();
+      assert_eq!(n, 0);
+    });
+
+    let server_address = address_receiver.recv().await.unwrap();
+    let client = TcpStream::connect(server_address).await.unwrap();
+    let mut connection = ConnectionState::new(identifier, client);
+    assert!(
+      process_sink_read(
+        &mut connection,
+        Err(async_broadcast::RecvError::Closed),
+        &client_to_sink_push
+      )
+      .await
+    );
     handle.await.unwrap();
   }
 
