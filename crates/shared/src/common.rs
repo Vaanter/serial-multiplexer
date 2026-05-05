@@ -589,11 +589,7 @@ pub async fn process_sink_read(
     if let Err(e) = connection.client.shutdown().await {
       error!("Failed to shutdown client: {}", e);
     }
-    connection.sequence += 1;
-    let datagram = create_close_datagram(connection.identifier, connection.sequence);
-    if let Err(e) = client_to_sink_push.send(datagram).await {
-      error!("Failed to send CLOSE datagram for connection: {}", e);
-    }
+    send_close_datagram(connection, client_to_sink_push).await;
     return true;
   }
   false
