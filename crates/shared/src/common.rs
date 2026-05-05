@@ -423,14 +423,17 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
         let leftover_bytes = bytes_to_send.saturating_sub(bytes_sent);
         trace!("Unable to write {} bytes to sink", leftover_bytes);
         data_to_send.copy_within(bytes_sent..bytes_to_send, 0);
-        data_to_send[bytes_to_send.saturating_sub(bytes_sent)..].zeroize();
+        data_to_send[leftover_bytes..].zeroize();
+        if bytes_sent > 0 {
+          sink.flush().await.context("Failed to flush data to sink")?;
+        }
         return Ok(leftover_bytes);
       }
     };
   }
   trace!("All bytes written to sink");
-  sink.flush().await.context("Failed to flush data to sink")?;
   data_to_send.zeroize();
+  sink.flush().await.context("Failed to flush data to sink")?;
   Ok(0)
 }
 
