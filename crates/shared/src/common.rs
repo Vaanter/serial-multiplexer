@@ -581,7 +581,11 @@ pub async fn process_sink_read(
   data: Result<Bytes, async_broadcast::RecvError>,
   client_to_sink_push: &async_channel::Sender<Bytes>,
 ) -> bool {
-  let processing_result = process_datagram(connection, data).await;
+  let processing_result = match data {
+    Ok(data_buf) => process_datagram(connection, data_buf).await,
+    Err(async_broadcast::RecvError::Closed) => 0b10,
+    Err(_) => 0b00,
+  };
   if processing_result & 0b01 == 0b01 {
     send_ack(connection, client_to_sink_push).await;
   }
@@ -595,54 +599,45 @@ pub async fn process_sink_read(
   false
 }
 
-async fn process_datagram(
-  connection: &mut ConnectionState,
-  data: Result<Bytes, async_broadcast::RecvError>,
-) -> u8 {
+async fn process_datagram(connection: &mut ConnectionState, data_buf: Bytes) -> u8 {
   let mut result = 0b00; // from right: should send ACK, should shut down client connection
-  match data {
-    Ok(data_buf) => {
-      let datagram = match root_as_datagram(&data_buf) {
-        Ok(datagram) => datagram,
-        Err(e) => {
-          error!("Received malformed datagram: {:?}, ignoring", e);
-          return result;
-        }
-      };
-      if datagram.identifier() != connection.identifier {
-        // Not our datagram, ignore it
-        return result;
-      }
-      let datagram_sequence = datagram.sequence();
-      debug!(
-        "Received {} datagram with seq: {} and {} bytes of data",
-        format!("{:?}", datagram.code()).to_uppercase(),
-        datagram_sequence,
-        datagram.data().map_or(0, |d| d.len())
-      );
-      trace!(target: HUGE_DATA_TARGET, "Datagrams in queue: {:?}", connection.datagram_queue);
-      if datagram_sequence >= (connection.largest_processed + 2) {
-        trace!(
-          "Received datagram out of order, seq: {}, largest sent: {}",
-          datagram_sequence, connection.largest_processed
-        );
-        connection.datagram_queue.insert(datagram_sequence, data_buf);
-        return result;
-      } else if datagram_sequence == (connection.largest_processed + 1) {
-        trace!(
-          "Received datagram in order, seq: {}, largest sent: {}",
-          datagram_sequence, connection.largest_processed
-        );
-        connection.datagram_queue.insert(datagram_sequence, data_buf);
-        result |= evaluate_datagram_queue(connection).await;
-      } else {
-        debug!("Received a datagram that was already processed before, ignoring");
-      }
-      result
+  let datagram = match root_as_datagram(&data_buf) {
+    Ok(datagram) => datagram,
+    Err(e) => {
+      error!("Received malformed datagram: {:?}, ignoring", e);
+      return result;
     }
-    Err(async_broadcast::RecvError::Closed) => result | 0b10,
-    Err(_) => result,
+  };
+  if datagram.identifier() != connection.identifier {
+    // Not our datagram, ignore it
+    return result;
   }
+  let datagram_sequence = datagram.sequence();
+  debug!(
+    "Received {} datagram with seq: {} and {} bytes of data",
+    format!("{:?}", datagram.code()).to_uppercase(),
+    datagram_sequence,
+    datagram.data().map_or(0, |d| d.len())
+  );
+  trace!(target: HUGE_DATA_TARGET, "Datagrams in queue: {:?}", connection.datagram_queue);
+  if datagram_sequence >= (connection.largest_processed + 2) {
+    trace!(
+      "Received datagram out of order, seq: {}, largest sent: {}",
+      datagram_sequence, connection.largest_processed
+    );
+    connection.datagram_queue.insert(datagram_sequence, data_buf);
+    return result;
+  } else if datagram_sequence == (connection.largest_processed + 1) {
+    trace!(
+      "Received datagram in order, seq: {}, largest sent: {}",
+      datagram_sequence, connection.largest_processed
+    );
+    connection.datagram_queue.insert(datagram_sequence, data_buf);
+    result |= evaluate_datagram_queue(connection).await;
+  } else {
+    debug!("Received a datagram that was already processed before, ignoring");
+  }
+  result
 }
 
 async fn evaluate_datagram_queue(connection: &mut ConnectionState) -> u8 {
