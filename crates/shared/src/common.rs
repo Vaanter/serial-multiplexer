@@ -811,7 +811,7 @@ pub async fn connection_loop(
           }
           unprocessed_bytes = 0;
         } else {
-          unprocessed_bytes = unprocessed_bytes.saturating_add(4);
+          unprocessed_bytes = unprocessed_bytes.saturating_add(bytes_read.unwrap_or(4));
           if unprocessed_bytes == tcp_buf.len() {
             debug!("Buffer overrun, closing connection");
             if let Err(e) = connection.client.shutdown().await {
