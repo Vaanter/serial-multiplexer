@@ -475,7 +475,7 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
 /// any sensitive data after processing.
 pub async fn handle_client_read(
   identifier: u64,
-  sequence: u64,
+  sequence: &mut u64,
   client_to_sink_push: async_channel::Sender<Bytes>,
   bytes_read: std::io::Result<usize>,
   read_buf: &mut BytesMut,
@@ -491,7 +491,8 @@ pub async fn handle_client_read(
         "Number of bytes read from client must not exceed the buffer"
       );
       debug!("Read {} bytes from client", n);
-      let datagram = create_data_datagram(identifier, sequence, &read_buf[..n]);
+      *sequence = sequence.strict_add(1);
+      let datagram = create_data_datagram(identifier, *sequence, &read_buf[..n]);
       trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", datagram.as_ref());
       read_buf[..n].zeroize();
       debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
@@ -508,7 +509,7 @@ pub async fn handle_client_read(
     }
   };
   if connection_ending {
-    let datagram = create_close_datagram(identifier, sequence);
+    let datagram = create_close_datagram(identifier, *sequence);
     if let Err(e) = client_to_sink_push.send(datagram).await {
       error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
     }
@@ -794,11 +795,10 @@ pub async fn connection_loop(
         }
       } => {
         if matches!(bytes_read, Ok(0) | Err(_)) || !connection_blocked {
-          connection.sequence += 1;
           let client_read_start = Instant::now();
           let connection_terminating = handle_client_read(
             connection.identifier,
-            connection.sequence,
+            &mut connection.sequence,
             client_to_sink_push.clone(),
             bytes_read.map(|b| b + unprocessed_bytes),
             &mut tcp_buf,
@@ -1222,14 +1222,21 @@ mod tests {
       data.resize(data_size, 100u8);
       let data_copy = Bytes::copy_from_slice(&data);
       data.resize(CONNECTION_BUFFER_SIZE, 50u8);
-      handle_client_read(3, i as u64, client_to_sink_push_write.clone(), Ok(data_size), &mut data)
-        .await;
+      let mut sequence = i as u64;
+      handle_client_read(
+        3,
+        &mut sequence,
+        client_to_sink_push_write.clone(),
+        Ok(data_size),
+        &mut data,
+      )
+      .await;
       let datagram_bytes =
         timeout(Duration::from_secs(1), sink_to_client_pull_read.recv()).await.unwrap().unwrap();
       let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
       assert_eq!(initial_datagram.identifier(), 3);
       assert_eq!(initial_datagram.code(), ControlCode::Data);
-      assert_eq!(initial_datagram.sequence(), i as u64);
+      assert_eq!(initial_datagram.sequence(), sequence);
       assert_eq!(initial_datagram.data().unwrap().bytes(), &data_copy);
     }
   }
@@ -1483,7 +1490,9 @@ mod tests {
     let identifier = 123;
     let bytes_read = Ok(bytes.len());
 
-    assert!(!handle_client_read(identifier, 1, client_to_sink_push, bytes_read, &mut bytes).await);
+    assert!(
+      !handle_client_read(identifier, &mut 1, client_to_sink_push, bytes_read, &mut bytes).await
+    );
     let sink_read = client_to_sink_pull.recv().await.unwrap();
     let datagram = root_as_datagram(&sink_read).expect("Received datagram should be valid");
     assert_eq!(datagram.identifier(), identifier);
@@ -1495,27 +1504,37 @@ mod tests {
   #[tokio::test]
   async fn test_handle_client_read_client_disconnect() {
     setup_tracing();
-    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Ok(0);
 
     assert!(
-      handle_client_read(identifier, 1, client_to_sink_push, bytes_read, &mut BytesMut::new())
+      handle_client_read(identifier, &mut 1, client_to_sink_push, bytes_read, &mut BytesMut::new())
         .await
     );
+    let close_data = client_to_sink_pull.recv().await.unwrap();
+    let close_datagram = root_as_datagram(&close_data).unwrap();
+    assert_eq!(close_datagram.identifier(), identifier);
+    assert_eq!(close_datagram.code(), ControlCode::Close);
+    assert_eq!(close_datagram.data().unwrap().bytes(), &[]);
   }
 
   #[tokio::test]
   async fn test_handle_client_read_client_error() {
     setup_tracing();
-    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(1);
+    let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(1);
     let identifier = 123;
     let bytes_read = Err(std::io::Error::other("test error"));
 
     assert!(
-      handle_client_read(identifier, 2, client_to_sink_push, bytes_read, &mut BytesMut::new())
+      handle_client_read(identifier, &mut 2, client_to_sink_push, bytes_read, &mut BytesMut::new())
         .await
     );
+    let close_data = client_to_sink_pull.recv().await.unwrap();
+    let close_datagram = root_as_datagram(&close_data).unwrap();
+    assert_eq!(close_datagram.identifier(), identifier);
+    assert_eq!(close_datagram.code(), ControlCode::Close);
+    assert_eq!(close_datagram.data().unwrap().bytes(), &[]);
   }
 
   #[tokio::test]
