@@ -509,10 +509,7 @@ pub async fn handle_client_read(
     }
   };
   if connection_ending {
-    let datagram = create_close_datagram(identifier, *sequence);
-    if let Err(e) = client_to_sink_push.send(datagram).await {
-      error!("Failed to send CLOSE datagram for connection {}: {}", identifier, e);
-    }
+    send_close_datagram(identifier, sequence, &client_to_sink_push).await;
   }
   connection_ending
 }
@@ -594,7 +591,7 @@ pub async fn process_sink_read(
     if let Err(e) = connection.client.shutdown().await {
       error!("Failed to shutdown client: {}", e);
     }
-    send_close_datagram(connection, client_to_sink_push).await;
+    send_close_datagram(connection.identifier, &mut connection.sequence, client_to_sink_push).await;
     return true;
   }
   false
@@ -769,7 +766,7 @@ pub async fn connection_loop(
         if let Err(e) = connection.client.shutdown().await {
           error!("Failed to shutdown client after server shutdown: {}", e);
         }
-        send_close_datagram(&mut connection, &client_to_sink_push).await;
+        send_close_datagram(connection.identifier, &mut connection.sequence, &client_to_sink_push).await;
         break;
       }
       data = sink_to_client_pull.recv_direct() => {
@@ -817,7 +814,7 @@ pub async fn connection_loop(
             if let Err(e) = connection.client.shutdown().await {
               error!("Failed to shutdown connection. {e}");
             }
-            send_close_datagram(&mut connection, &client_to_sink_push).await;
+            send_close_datagram(connection.identifier, &mut connection.sequence, &client_to_sink_push).await;
             break;
           }
         }
@@ -828,12 +825,13 @@ pub async fn connection_loop(
 }
 
 async fn send_close_datagram(
-  connection: &mut ConnectionState,
+  identifier: u64,
+  sequence: &mut u64,
   client_to_sink_push: &async_channel::Sender<Bytes>,
 ) {
   trace!("Sending CLOSE datagram");
-  connection.sequence += 1;
-  let datagram = create_close_datagram(connection.identifier, connection.sequence);
+  *sequence = sequence.strict_add(1);
+  let datagram = create_close_datagram(identifier, *sequence);
   if let Err(e) = client_to_sink_push.send(datagram).await {
     error!("Failed to send CLOSE datagram for connection: {}", e);
   }
