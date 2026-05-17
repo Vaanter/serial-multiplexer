@@ -21,7 +21,7 @@ use zeroize::Zeroize;
 /// Specifies how many datagrams without ACK a connection can have
 /// before the TCP connection gets plugged.
 pub const ACK_THRESHOLD: u64 = 32;
-
+/// The size of buffers used for reading and writing data to the sink.
 const SINK_BUFFER_SIZE: usize = 2usize.pow(17);
 /// The maximum size of a (de)compressed datagram.
 pub const SINK_COMPRESSION_BUFFER_SIZE: usize = 2usize.pow(15);
@@ -43,6 +43,7 @@ const _: () = {
 
 /// An array representing a header used to identify the start of a datagram in a byte stream
 const DATAGRAM_HEADER: [u8; 8] = [2, 200, 94, 2, 6, 9, 4, 20];
+/// Size of the datagram header in bytes
 const HEADER_BYTES: usize = DATAGRAM_HEADER.len();
 pub const HUGE_DATA_TARGET: &str = "serial_multiplexer::huge_data";
 pub const METRICS_TARGET: &str = "serial_multiplexer::metrics";
@@ -106,34 +107,13 @@ impl ConnectionState {
 ///
 /// # Behaviour
 ///
-/// * Continuously reads from the `sink` using a buffer of size [`SINK_BUFFER_SIZE`] and
-///   sends the processed data to the appropriate client channel.
+/// * Continuously reads data from the `sink` using a buffer of size [`SINK_BUFFER_SIZE`] and
+///   uses [`handle_sink_read`] to process them.
 /// * Continuously listens for data from the `client_to_sink_pull` channel to write to the `sink`.
-/// * Retries failed writes to the sink at intervals to prevent indefinite blocking when the sink is full.
+/// * Retries failed writes to the sink at intervals [`SINK_WRITE_RETRY_INTERVAL`] to prevent
+///   indefinite blocking when the sink is full.
 /// * Exits the loop gracefully when the cancellation token is triggered, the sink is
 ///   disconnected, or an error occurs during read/write operations.
-///
-/// # Key Operations:
-///
-/// * `sink.read()`:
-///   * Reads data from the `sink` into an internal buffer.
-///   * Processes any unprocessed bytes in the buffer and sends them to the appropriate client channel.
-///   * Handles errors or disconnects from the `sink`, breaking the loop if necessary.
-///
-/// * `client_to_sink_pull.recv()`:
-///   * Receives data from a client to write into the `sink`.
-///   * Only receives when there is no pending data to write.
-///   * Uses the `handle_sink_write()` function to handle the actual write to the `sink`.
-///
-/// * `sleep(SINK_WRITE_RETRY_INTERVAL)`:
-///   * Retries writing pending data to the sink at regular intervals.
-///
-/// * `cancel.cancelled()`:
-///   * Terminates the loop immediately when cancellation is triggered.
-///
-/// [`SerialStream`]: tokio_serial::SerialStream
-/// [`NamedPipeClient`]: tokio::net::windows::named_pipe::NamedPipeServer
-/// [`UnixStream`]: tokio::net::unix::socket::UnixSocket
 #[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl Sink,
@@ -251,8 +231,7 @@ pub async fn sink_loop(
 /// 4. Decompresses the datagram
 /// 5. Sends the decompressed datagram to the appropriate client channel based on the datagram identifier.
 /// 6. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
-///    Ensures already processed
-///    data is removed or cleared appropriately.
+///    Ensures already processed is zeroed.
 ///
 /// # Returns
 ///
@@ -408,6 +387,16 @@ pub async fn handle_sink_write(
   write_to_sink(sink, data_to_send).await
 }
 
+/// Attempts to write data to the sink.
+///
+/// Repeatedly writes bytes from a buffer until all have been written, or no more can be currently
+/// written. Each write has a timeout to determine whether the sink is blocked (e.g. its internal
+/// buffer is full). If the sink is blocked, the remaining data is copied to the start of the buffer
+/// and the rest is zeroized.
+///
+/// # Returns
+/// An [`anyhow::Result`] with the number of bytes remaining, or an error if the write fails.
+///
 async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow::Result<usize> {
   let bytes_to_send = data_to_send.len();
   trace!("Writing {} bytes to sink", bytes_to_send);
@@ -517,63 +506,14 @@ pub async fn handle_client_read(
 /// Processes incoming datagrams for a connection and handles
 /// their sequencing, processing, and appropriate action based on their control code.
 ///
-/// This function accepts a [`ConnectionState`] object and a [`Result`] containing either
-/// a [`Bytes`] buffer of the datagram payload or an error.
-/// It processes the datagrams based on their sequence number
-/// and performs operations such as forwarding data
-/// to the client or closing the connection if a [`Close`] datagram is received.
-///
-/// # Parameters
-///
-/// * `connection`: A mutable reference to a [`ConnectionState`] object, which represents
-///   the current connection state.
-/// * `data`: A [`Result`] containing the incoming datagram payload encapsulated in [`Bytes`]
-///   or an error of type [`broadcast::error::RecvError`].
+/// Valid channel reads are processed in [process_datagram]. Which also indicates whether an ACK
+/// datagram should be sent or the connection closed. The connection will also close after reading
+/// from a closed channel.
 ///
 /// # Returns
-/// A `bool` indicating:
 /// * `true`: if the connection should be terminated, either due to receiving a `CLOSE`
 ///   control code from the client or because the sink channel is closed.
 /// * `false`: if the connection should remain active.
-///
-/// # Behaviour
-///
-/// 1. **Datagram Validation**:
-///     * If the datagram's identifier does not match the connection's, it is ignored.
-///     * If the received datagram is malformed, it is logged and ignored.
-///
-/// 2. **Sequencing and Queuing**:
-///     * If the datagram's sequence is higher than the expected next sequence, it is
-///       queued for future processing (out-of-order reception).
-///     * If the datagram is in sequence, it and any subsequent queued datagrams are processed
-///       in order until no more in-sequence datagrams remain.
-///
-/// 3. **Processing and Actions**:
-///     * If valid payload data is present in a datagram:
-///         * Attempts to forward it to the client.
-///         * Any write or flush errors are logged and terminate the function with `true`.
-///     * If a [`Close`] control code is received, the client connection is shut down, the
-///       termination is logged, and the function returns `true`.
-///
-/// 4. **Error Handling**:
-///     * If a [`broadcast::error::RecvError::Closed`] is encountered, it shuts down the client
-///       connection and returns `true`.
-///
-/// # Example Workflow
-/// 1. Receives incoming datagrams from a sink.
-/// 2. Validates the datagrams' identifier and integrity.
-/// 3. Orders incoming datagrams by their sequence number, queuing out-of-order ones.
-/// 4. Forwards valid data to the client.
-/// 5. Handles special control codes like [`Close`] by shutting down the connection.
-///
-/// # Errors
-/// * Malformed datagrams are logged and ignored.
-///
-/// # Notes
-/// * Connection's `datagram_queue` and `largest_processed` are used to ensure in-order
-///   delivery of datagrams.
-///
-/// [`Close`]: ControlCode::Close
 pub async fn process_sink_read(
   connection: &mut ConnectionState,
   data: Result<Bytes, async_broadcast::RecvError>,
@@ -597,6 +537,21 @@ pub async fn process_sink_read(
   false
 }
 
+/// Processes a datagram for a connection.
+///
+/// Based on the sequence number of the datagram, decides the processing order of the datagram.
+/// * A datagram with sequence number one higher than [ConnectionState::largest_processed] is deemed
+///   in-order and gets processed in [evaluate_datagram_queue].
+/// * Higher by two or more are out-of-order and are added to the [ConnectionState::datagram_queue],
+///   to be processed when an in-order datagram arrives.
+/// * A datagram with an equal or lower sequence number should have already been processed and thus
+///   is not evaluated again.
+///
+/// Does nothing if the datagram buffer doesn't contain a valid datagram, or if the datagram's
+/// and connection's identifiers do not match.
+///
+/// # Returns
+/// A bitfield specifying the result as: \[should send ACK, should shut down client connection\]
 async fn process_datagram(connection: &mut ConnectionState, data_buf: Bytes) -> u8 {
   let mut result = 0b00; // from right: should send ACK, should shut down client connection
   let datagram = match root_as_datagram(&data_buf) {
@@ -638,6 +593,17 @@ async fn process_datagram(connection: &mut ConnectionState, data_buf: Bytes) -> 
   result
 }
 
+/// Iterates over connections datagram queue and evaluates each datagram based on its control code.
+///
+/// Actions based on the control code:
+/// * [ControlCode::Close][]: Returns 0b10 to signal the caller to close the connection.
+/// * [ControlCode::Ack][]: Parses the acked sequence from datagram's data section,
+///   * If it's not a valid number, returns 0b10 to close the connection.
+///   * Otherwise, sets the connection's [ConnectionState::largest_acked] to the minimum of
+///     [ConnectionState::sequence] and the acked sequence. This is to keep the largest acked
+///     number between the current sequence and the already acked.
+/// * [ControlCode::Data][]: Relays data from datagram's data section to the client. If sending
+///   data to the client fails, returns 0b10 to close the connection.
 async fn evaluate_datagram_queue(connection: &mut ConnectionState) -> u8 {
   let mut result = 0b00;
   while let Some(datagram_buf) =
@@ -687,6 +653,7 @@ async fn evaluate_datagram_queue(connection: &mut ConnectionState) -> u8 {
   result
 }
 
+/// Sends an ACK datagram and increases the connection's sequence and largest_acked.
 async fn send_ack(
   connection: &mut ConnectionState,
   client_to_sink_push: &async_channel::Sender<Bytes>,
@@ -722,10 +689,9 @@ async fn send_ack(
 ///    then uses [`process_sink_read()`] to handle and forward the data to the client.
 ///    The processing might signal connection termination, which breaks the loop.
 /// 3. **Incoming data from the client**:
-///    Uses [`peek()`](TcpStream::peek) to check for available data without blocking the STC
-///    channel. If data is available, reads it with [`try_read()`](TcpStream::try_read)
-///    and processes it with [`handle_client_read()`].
-///    If the connection is blocked (too many unacknowledged datagrams), sleeps instead of reading.
+///    Reads data from the TCP connection and relays it to the sink.
+///    If the connection is blocked (too many unacknowledged datagrams), slowly reads from the
+///    connection in tiny chunks to detect if the connection has closed.
 ///    The processing might signal connection termination, which breaks the loop.
 ///
 /// [`Close`]: ControlCode::Close
@@ -824,6 +790,7 @@ pub async fn connection_loop(
   debug!("Connection {} loop ending", connection.identifier);
 }
 
+/// Sends a CLOSE datagram and increases the connection's sequence.
 async fn send_close_datagram(
   identifier: u64,
   sequence: &mut u64,
