@@ -46,7 +46,7 @@ jobs:
             suffix: "-x86-64-v3"
     steps:
       - name: Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -56,7 +56,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
             ${{ runner.os }}-cargo-${{ matrix.variant }}-
             ${{ runner.os }}-cargo-
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Update rust
         run: rustup update
       - name: Extract version from Cargo.toml
@@ -71,7 +71,7 @@ jobs:
       - name: Strip binary
         run: strip target/release/${{ env.BINARY_NAME }}
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}${{ matrix.suffix }}
           path: target/release/${{ env.BINARY_NAME }}
@@ -93,7 +93,7 @@ jobs:
             suffix: "-x86-64-v3"
     steps:
       - name: Cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -103,7 +103,7 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
             ${{ runner.os }}-cargo-${{ matrix.variant }}-
             ${{ runner.os }}-cargo-
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Update rust
         run: rustup update
       - name: Extract version from Cargo.toml
@@ -117,7 +117,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}${{ matrix.suffix }}
           path: target/release/${{ env.BINARY_NAME }}.exe
@@ -131,29 +131,29 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep -m1 'version = ' Cargo.toml | cut -d '"' -f2)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
       - name: Download Linux standard artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64
           path: ./linux-standard/
       - name: Download Linux optimized artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.BINARY_NAME }}-linux-${{ env.VERSION }}-x86-64-v3
           path: ./linux-optimized/
       - name: Download Windows standard artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64
           path: ./windows-standard/
       - name: Download Windows optimized artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.BINARY_NAME }}-windows-${{ env.VERSION }}-x86-64-v3
           path: ./windows-optimized/
@@ -166,7 +166,7 @@ jobs:
           mv configs/config-host.toml config-host-${{ env.VERSION }}.toml
           mv configs/config-guest.toml config-guest-${{ env.VERSION }}.toml
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ env.BINARY_NAME }}-${{ env.VERSION }}-linux-x86-64
