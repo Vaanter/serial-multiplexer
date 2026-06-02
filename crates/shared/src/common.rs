@@ -128,8 +128,6 @@ pub async fn sink_loop(
   let mut unwritten_data_end = 0;
   loop {
     let current_span = Span::current();
-    sink_buf_read.resize(SINK_BUFFER_SIZE, 0);
-    sink_buf_write.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
@@ -261,8 +259,8 @@ pub async fn handle_sink_read(
   sink_buf: &mut BytesMut,
   decompression_buffer: &mut BytesMut,
 ) -> anyhow::Result<usize> {
-  debug_assert!(decompression_buffer.len() <= SINK_COMPRESSION_BUFFER_SIZE);
-  debug_assert!(sink_buf.len() <= SINK_BUFFER_SIZE);
+  debug_assert_eq!(decompression_buffer.len(), SINK_COMPRESSION_BUFFER_SIZE);
+  debug_assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
   trace!("Read {} bytes from sink", bytes_read);
   let mut read_data = &sink_buf[..bytes_read];
   trace!(target: HUGE_DATA_TARGET, "Data in working buffer: {:?}", &read_data);
@@ -374,6 +372,7 @@ pub async fn handle_sink_write(
   data: Bytes,
   sink_buffer: &mut BytesMut,
 ) -> anyhow::Result<usize> {
+  debug_assert_eq!(sink_buffer.len(), SINK_BUFFER_SIZE);
   trace!("Maximum compressed size: {}", zstd_safe::compress_bound(data.len()));
   let compressed_size =
     zstd_safe::compress(sink_buffer[HEADER_BYTES + LENGTH_BYTES..].as_mut(), &data, 9)
@@ -841,17 +840,18 @@ mod tests {
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[7, 8, 9]);
-    let mut buffer_size = sink_buf.len();
+    let mut bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(sink_buf.len(), buffer_size);
+    assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
     assert_eq!(unprocessed_bytes, 3);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
-    assert_eq!(sink_buf[3..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf[3..], BytesMut::zeroed(SINK_BUFFER_SIZE - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE));
     sink_buf.resize(unprocessed_bytes, 0);
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
@@ -860,16 +860,17 @@ mod tests {
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[11, 12, 13, 14, 15]);
-    buffer_size = sink_buf.len();
+    bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(sink_buf.len(), buffer_size);
+    assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
     assert_eq!(unprocessed_bytes, 5);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
-    assert_eq!(sink_buf[5..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf[5..], BytesMut::zeroed(SINK_BUFFER_SIZE - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE));
   }
 
   #[tokio::test]
@@ -899,18 +900,19 @@ mod tests {
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram3, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram3);
-    assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(sink_buf, BytesMut::zeroed(SINK_BUFFER_SIZE));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -932,16 +934,17 @@ mod tests {
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram);
-    assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(sink_buf, BytesMut::zeroed(SINK_BUFFER_SIZE));
     assert_eq!(&compression_buf, &BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -958,15 +961,16 @@ mod tests {
     );
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
-    let buffer_size = sink_buf.len();
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
+    assert_eq!(unprocessed_bytes, bytes_read - 2); // -2 because garbage was taken out
     assert_ne!(sink_buf, BytesMut::zeroed(sink_buf.len()));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
@@ -987,15 +991,16 @@ mod tests {
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     sink_buf.extend_from_slice(&5u16.to_be_bytes());
     sink_buf.extend_from_slice(&[1; 3]);
-    let buffer_size = sink_buf.len();
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
+    assert_eq!(unprocessed_bytes, bytes_read - 2); // -2 because garbage was taken out
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -1003,7 +1008,7 @@ mod tests {
   async fn test_handle_sink_read_data_garbage_cleanup() {
     setup_tracing();
     let mut sink_buf = BytesMut::new();
-    let mut compression_buf = BytesMut::zeroed(200);
+    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -1019,24 +1024,25 @@ mod tests {
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[65; 5]); // more garbage
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_ok());
     assert_eq!(unprocessed_bytes, 7);
     assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
-    assert_eq!(sink_buf[7..], BytesMut::zeroed(buffer_size - 7));
+    assert_eq!(sink_buf[7..], BytesMut::zeroed(SINK_BUFFER_SIZE - 7));
   }
 
   #[tokio::test]
   async fn test_handle_sink_read_data_partial_header() {
     setup_tracing();
     let mut sink_buf = BytesMut::new();
-    let mut compression_buf = BytesMut::zeroed(200);
+    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -1045,16 +1051,17 @@ mod tests {
     );
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, 7);
-    assert_eq!(&sink_buf[..], &DATAGRAM_HEADER[..7]);
+    assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
   }
 
   #[tokio::test]
