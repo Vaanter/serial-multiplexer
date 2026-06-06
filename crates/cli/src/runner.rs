@@ -48,6 +48,7 @@ pub mod common {
         &unix_socket_properties,
         channel_map.clone(),
         client_to_sink_pull.clone(),
+        config.disable_compression,
         cancel.clone(),
       )
       .await
@@ -195,6 +196,7 @@ pub mod common {
             &unix_socket,
             channel_map.clone(),
             client_to_sink_pull,
+            config.disable_compression,
             cancel.clone(),
           )
           .await
@@ -770,6 +772,7 @@ mod linux {
   use futures::future::try_join_all;
   use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
+  use serial_multiplexer_lib::sink::SinkLoopProperties;
   use std::collections::HashSet;
   use std::fs::remove_file;
   use std::io::ErrorKind;
@@ -784,11 +787,10 @@ mod linux {
   /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
-    channel_map: ChannelMap,
-    client_to_socket_pull: async_channel::Receiver<Bytes>,
+    sink_loop_properties: SinkLoopProperties,
     cancel: CancellationToken,
   ) -> JoinHandle<()> {
-    tokio::spawn(sink_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
+    tokio::spawn(sink_loop(unix_socket, sink_loop_properties, cancel))
   }
 
   /// Attempts to connect to a Unix socket and set up a sink loop.
@@ -814,6 +816,7 @@ mod linux {
     properties: &UnixSocketGuest,
     channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
@@ -839,17 +842,12 @@ mod linux {
       }
     }
 
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_socket_pull, disable_compression);
     Ok(
       connected_sockets
         .into_iter()
-        .map(|socket| {
-          create_unix_socket_loop(
-            socket,
-            channel_map.clone(),
-            client_to_socket_pull.clone(),
-            cancel.clone(),
-          )
-        })
+        .map(|socket| create_unix_socket_loop(socket, sink_loop_properties.clone(), cancel.clone()))
         .collect(),
     )
   }
@@ -880,6 +878,7 @@ mod linux {
     properties: &UnixSocketHost,
     channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
@@ -941,17 +940,13 @@ mod linux {
       }
       return Err(ret_error);
     }
+
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_sink_pull, disable_compression);
     Ok(
       connected_instances
         .into_iter()
-        .map(|i| {
-          tokio::spawn(sink_loop(
-            i.unwrap(),
-            channel_map.clone(),
-            client_to_sink_pull.clone(),
-            cancel.clone(),
-          ))
-        })
+        .map(|i| tokio::spawn(sink_loop(i.unwrap(), sink_loop_properties.clone(), cancel.clone())))
         .collect(),
     )
   }
@@ -961,12 +956,22 @@ mod linux {
     use super::*;
     use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
     #[tokio::test]
-    async fn listen_connect_accept_send_test() {
+    async fn listen_connect_accept_send_compressed_test() {
+      listen_connect_accept_send(false).await;
+    }
+
+    #[tokio::test]
+    async fn listen_connect_accept_send_uncompressed_test() {
+      listen_connect_accept_send(true).await;
+    }
+
+    async fn listen_connect_accept_send(disable_compression: bool) {
       setup_tracing();
       let socket_path = vec!["test_socket.sock".to_string()];
       let sink_properties = UnixSocketHost {
@@ -992,6 +997,7 @@ mod linux {
               &sink_properties,
               channel_map,
               client_to_sink_pull,
+              disable_compression,
               cancel.clone(),
             )
             .await
@@ -1009,6 +1015,7 @@ mod linux {
           &unix_socket_properties,
           channel_map,
           client_to_sink_pull,
+          disable_compression,
           cancel.clone(),
         )
         .await;
