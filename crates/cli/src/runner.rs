@@ -956,7 +956,6 @@ mod linux {
     use super::*;
     use papaya::HashMap;
     use serial_multiplexer_lib::test_utils::setup_tracing;
-    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
@@ -973,7 +972,10 @@ mod linux {
 
     async fn listen_connect_accept_send(disable_compression: bool) {
       setup_tracing();
-      let socket_path = vec!["test_socket.sock".to_string()];
+      let socket_path = vec![format!(
+        "test_socket-{}.sock",
+        if disable_compression { "compressed" } else { "uncompressed" }
+      )];
       let sink_properties = UnixSocketHost {
         socket_paths: socket_path.clone(),
         ..Default::default()
