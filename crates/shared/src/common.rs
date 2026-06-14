@@ -100,9 +100,7 @@ impl ConnectionState {
 /// # Parameters
 ///
 /// * `sink`: A [`Sink`] data transfer medium through which two multiplexers communicate.
-/// * `channel_map`: A [`ChannelMap`] for sending received datagrams to clients/client initiator.
-/// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
-///   function receives data sent by clients to be written to the sink.
+/// * `sink_loop_properties`: [`SinkLoopProperties`] containing configuration for the sink loop.
 /// * `cancel`: A [`CancellationToken`] used to signal when this loop should terminate.
 ///
 /// # Behaviour
@@ -225,7 +223,8 @@ pub async fn sink_loop(
 /// * `sink_buf`:
 ///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
 /// * `decompression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
-///   the datagram after decompression
+///   the datagram after decompression. Should be zero-sized if compression is disabled.
+/// * `disable_compression`: A flag indicating whether read datagrams don't need to be decompressed.
 ///
 /// # Behaviour
 ///
@@ -234,7 +233,7 @@ pub async fn sink_loop(
 ///    within the buffer to identify the start of datagrams.
 /// 3. Extracts each datagram from the buffer if it is complete
 ///    (based on the size after the header).
-/// 4. Decompresses the datagram
+/// 4. Decompresses the datagram if `disable_compression` is false.
 /// 5. Sends the decompressed datagram to the appropriate client channel based on the datagram identifier.
 /// 6. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
 ///    Ensures already processed is zeroed.
@@ -371,6 +370,7 @@ pub async fn handle_sink_read(
 ///   A [`Bytes`] object representing the datagram that will be written to the sink.
 /// * `compression_buffer`: A buffer to store all bytes (header, length, and datagram) that need
 ///   to be written to the sink.
+/// * `disable_compression`: A flag indicating whether datagrams will to be compressed before writing.
 ///
 /// # Behaviour
 /// The function follows these steps:

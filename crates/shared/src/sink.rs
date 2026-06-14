@@ -7,6 +7,14 @@ pub trait Sink: AsyncReadExt + AsyncWriteExt + Unpin + Sized + Send {}
 
 impl<T> Sink for T where T: AsyncReadExt + AsyncWriteExt + Unpin + Sized + Send {}
 
+/// Properties for a [`sink loop`].
+///
+/// * `channel_map`: A [`ChannelMap`] for sending received datagrams to clients/client initiator.
+/// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
+///   sink loop receives data sent by clients to be written to the sink.
+/// * `disable_compression`: A flag to disable the compression of datagrams sent through the sink.
+///
+/// [`sink loop`]: crate::common::sink_loop
 #[derive(Clone, Debug)]
 pub struct SinkLoopProperties {
   pub channel_map: ChannelMap,

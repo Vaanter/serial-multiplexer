@@ -236,6 +236,7 @@ pub mod common {
   /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
   ///   should terminate.
   ///
@@ -274,6 +275,22 @@ pub mod common {
     Ok(sink_loop_tasks)
   }
 
+  /// Validates sink initialization results, returning successfully opened sinks or an aggregated error.
+  ///
+  /// If `sink_err` is non-empty, all errors are chained into a single [`anyhow::Error`] and every
+  /// successfully opened sink in `sink_ok` is shut down gracefully before the error is returned.
+  /// If there are no errors, the function returns `sink_ok` unchanged.
+  ///
+  /// # Parameters
+  ///
+  /// * `sink_ok` - Sinks that were opened successfully.
+  /// * `sink_err` - Errors collected during sink initialization.
+  /// * `sink_name` - Human-readable name for the sink type, used in the error message.
+  ///
+  /// # Returns
+  ///
+  /// `Ok(sink_ok)` when `sink_err` is empty, otherwise an [`Err`] containing all initialization
+  /// errors composed via [`anyhow::Error::context`].
   pub async fn compose_sink_errors(
     sink_ok: Vec<impl Sink>,
     sink_err: Vec<anyhow::Error>,
@@ -294,6 +311,24 @@ pub mod common {
     Ok(sink_ok)
   }
 
+  /// Spawns a [`sink_loop`] task for each successfully opened sink and returns the task handles.
+  ///
+  /// For every sink in `sink_ok`, a [`tokio::task`] is created that runs [`sink_loop`] with shared
+  /// [`SinkLoopProperties`] derived from the remaining arguments. All tasks are collected into a
+  /// [`FuturesUnordered`].
+  ///
+  /// # Parameters
+  ///
+  /// * `sink_ok` - Sinks to run loops for, typically the successful output of [`compose_sink_errors`].
+  /// * `channel_map` - Routing table used by each sink loop to dispatch incoming datagrams.
+  /// * `client_to_sink_pull` - An [`async_channel::Receiver`], through which the sink loop
+  ///   receives datagrams sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
+  /// * `cancel` - [`CancellationToken`] that signals all sink loops to shut down.
+  ///
+  /// # Returns
+  ///
+  /// A [`FuturesUnordered<JoinHandle<()>>`] containing one handle per sink task.
   pub async fn compose_sink_loops(
     sink_ok: Vec<impl Sink + 'static>,
     channel_map: ChannelMap,
@@ -571,6 +606,7 @@ mod windows {
   ///   client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the
   ///   loop(s) should terminate.
   ///
@@ -619,6 +655,27 @@ mod windows {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
   }
 
+  /// Creates and listens on Windows named pipe(s), then creates a sink loop when a client connects.
+  ///
+  /// This function binds a new `NamedPipeServer` on the path specified in the host properties.
+  /// After a client connects, a sink loop task is spawned using [`sink_loop`].
+  ///
+  /// # Parameters:
+  /// * `properties`: A reference to [`WindowsPipeHost`], a struct that contains the `pipe_paths`
+  ///   property, which specifies paths where the Windows named pipes will be created.
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
+  /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the
+  ///   loop should terminate.
+  ///
+  /// # Returns:
+  /// An [`anyhow::Result<Vec<JoinHandle<()>>>`] with the spawned sink loop task if successful,
+  /// otherwise an error if:
+  ///   * Creating a named pipe server fails for any of the paths
+  ///   * The connected client does not have an address
+  ///   * One or more pipes fail to connect
   pub async fn listen_accept_windows_named_pipe(
     properties: &WindowsPipeGuest,
     channel_map: ChannelMap,
@@ -806,6 +863,7 @@ mod linux {
   ///    client loops.
   /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the loop
   ///    should terminate.
   ///
