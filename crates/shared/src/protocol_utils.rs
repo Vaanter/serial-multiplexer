@@ -39,7 +39,8 @@ fn create_datagram_with_code(
     },
   );
   builder.finish_minimal(datagram);
-  Bytes::copy_from_slice(builder.finished_data())
+  let (buffer, idx) = builder.collapse();
+  Bytes::from(buffer).slice(idx..)
 }
 
 pub fn datagram_from_bytes(data: &'_ [u8]) -> Result<Datagram<'_>, InvalidFlatbuffer> {
