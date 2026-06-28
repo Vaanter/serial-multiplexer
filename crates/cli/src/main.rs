@@ -23,6 +23,9 @@ use tracing_subscriber::{Layer, registry};
 
 mod runner;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
   fn inner_main() -> anyhow::Result<()> {
     let config = ConfigArgs::build_config().context("Failed to parse config")?;

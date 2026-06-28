@@ -1,7 +1,7 @@
 use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::protocol_utils::{create_ack_datagram, create_close_datagram, create_data_datagram};
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
-use crate::sink::Sink;
+use crate::sink::{Sink, SinkLoopProperties};
 use anyhow::{Context, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use memchr::memmem::Finder;
@@ -100,9 +100,7 @@ impl ConnectionState {
 /// # Parameters
 ///
 /// * `sink`: A [`Sink`] data transfer medium through which two multiplexers communicate.
-/// * `channel_map`: A [`ChannelMap`] for sending received datagrams to clients/client initiator.
-/// * `client_to_sink_pull`: An [`async_channel::Receiver`] channel through which the
-///   function receives data sent by clients to be written to the sink.
+/// * `sink_loop_properties`: [`SinkLoopProperties`] containing configuration for the sink loop.
 /// * `cancel`: A [`CancellationToken`] used to signal when this loop should terminate.
 ///
 /// # Behaviour
@@ -117,19 +115,24 @@ impl ConnectionState {
 #[instrument(skip_all)]
 pub async fn sink_loop(
   mut sink: impl Sink,
-  channel_map: ChannelMap,
-  client_to_sink_pull: async_channel::Receiver<Bytes>,
+  sink_loop_properties: SinkLoopProperties,
   cancel: CancellationToken,
 ) {
+  let channel_map = sink_loop_properties.channel_map;
+  let client_to_sink_pull = sink_loop_properties.client_to_sink_pull;
+  let disable_compression = sink_loop_properties.disable_compression;
+  debug!("Compression is {}", if disable_compression { "disabled" } else { "enabled" });
   let mut sink_buf_read = BytesMut::zeroed(SINK_BUFFER_SIZE);
   let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
-  let mut compression_buffer = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
+  let mut compression_buffer = if disable_compression {
+    BytesMut::new()
+  } else {
+    BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE)
+  };
   let mut unprocessed_data_start = 0;
   let mut unwritten_data_end = 0;
   loop {
     let current_span = Span::current();
-    sink_buf_read.resize(SINK_BUFFER_SIZE, 0);
-    sink_buf_write.resize(SINK_BUFFER_SIZE, 0);
     tokio::select! {
       biased;
       () = cancel.cancelled() => {
@@ -151,6 +154,7 @@ pub async fn sink_loop(
               n + unprocessed_data_start,
               &mut sink_buf_read,
               &mut compression_buffer,
+              disable_compression
             )
             .instrument(current_span)
             .await;
@@ -173,7 +177,7 @@ pub async fn sink_loop(
         match data {
           Ok(data) => {
             let sink_write_duration = Instant::now();
-            let write_result = handle_sink_write(&mut sink, data, &mut sink_buf_write)
+            let write_result = handle_sink_write(&mut sink, data, &mut sink_buf_write, disable_compression)
               .instrument(current_span)
               .await;
             trace!(target: METRICS_TARGET, duration = ?sink_write_duration.elapsed(), "Finished writing data to sink");
@@ -219,7 +223,8 @@ pub async fn sink_loop(
 /// * `sink_buf`:
 ///   A mutable reference to a buffer ([`BytesMut`]) that stores the data read from the sink.
 /// * `decompression_buffer`: A mutable reference to a buffer ([`BytesMut`]) for storing
-///   the datagram after decompression
+///   the datagram after decompression. Should be zero-sized if compression is disabled.
+/// * `disable_compression`: A flag indicating whether read datagrams don't need to be decompressed.
 ///
 /// # Behaviour
 ///
@@ -228,7 +233,7 @@ pub async fn sink_loop(
 ///    within the buffer to identify the start of datagrams.
 /// 3. Extracts each datagram from the buffer if it is complete
 ///    (based on the size after the header).
-/// 4. Decompresses the datagram
+/// 4. Decompresses the datagram if `disable_compression` is false.
 /// 5. Sends the decompressed datagram to the appropriate client channel based on the datagram identifier.
 /// 6. Updates the sink buffer (`sink_buf`) to retain any unprocessed data for the next read.
 ///    Ensures already processed is zeroed.
@@ -260,9 +265,14 @@ pub async fn handle_sink_read(
   bytes_read: usize,
   sink_buf: &mut BytesMut,
   decompression_buffer: &mut BytesMut,
+  disable_compression: bool,
 ) -> anyhow::Result<usize> {
-  debug_assert!(decompression_buffer.len() <= SINK_COMPRESSION_BUFFER_SIZE);
-  debug_assert!(sink_buf.len() <= SINK_BUFFER_SIZE);
+  if disable_compression {
+    debug_assert_eq!(decompression_buffer.len(), 0);
+  } else {
+    debug_assert_eq!(decompression_buffer.len(), SINK_COMPRESSION_BUFFER_SIZE);
+  }
+  debug_assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
   trace!("Read {} bytes from sink", bytes_read);
   let mut read_data = &sink_buf[..bytes_read];
   trace!(target: HUGE_DATA_TARGET, "Data in working buffer: {:?}", &read_data);
@@ -287,14 +297,20 @@ pub async fn handle_sink_read(
     }
     let datagram_start = header_idx + HEADER_BYTES + LENGTH_BYTES;
     let datagram_end = datagram_start + size as usize - 1;
-    let decompressed_size = zstd_safe::decompress(
-      decompression_buffer.as_mut(),
-      &read_data[datagram_start..=datagram_end],
-    )
-    .inspect(|n| trace!("Decompressed {} to {} bytes", size, n))
-    .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
-    let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
-    decompression_buffer.zeroize();
+    let datagram_bytes = if !disable_compression {
+      let decompressed_size = zstd_safe::decompress(
+        decompression_buffer.as_mut(),
+        &read_data[datagram_start..=datagram_end],
+      )
+      .inspect(|n| trace!("Decompressed {} to {} bytes", size, n))
+      .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
+      let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
+      decompression_buffer.zeroize();
+      datagram_bytes
+    } else {
+      Bytes::copy_from_slice(&read_data[datagram_start..=datagram_end])
+    };
+
     trace!(target: HUGE_DATA_TARGET, "Read datagram: {:?}", datagram_bytes.as_ref());
     unprocessed_data_start += datagram_end + 1 - header_idx;
     trace!(
@@ -354,6 +370,7 @@ pub async fn handle_sink_read(
 ///   A [`Bytes`] object representing the datagram that will be written to the sink.
 /// * `compression_buffer`: A buffer to store all bytes (header, length, and datagram) that need
 ///   to be written to the sink.
+/// * `disable_compression`: A flag indicating whether datagrams will to be compressed before writing.
 ///
 /// # Behaviour
 /// The function follows these steps:
@@ -373,16 +390,28 @@ pub async fn handle_sink_write(
   sink: &mut impl Sink,
   data: Bytes,
   sink_buffer: &mut BytesMut,
+  disable_compression: bool,
 ) -> anyhow::Result<usize> {
+  debug_assert_eq!(sink_buffer.len(), SINK_BUFFER_SIZE);
+  debug_assert!(sink_buffer.len() - HEADER_BYTES - LENGTH_BYTES >= data.len());
   trace!("Maximum compressed size: {}", zstd_safe::compress_bound(data.len()));
-  let compressed_size =
-    zstd_safe::compress(sink_buffer[HEADER_BYTES + LENGTH_BYTES..].as_mut(), &data, 9)
-      .inspect(|n| trace!("Compressed {} to {} bytes", data.len(), n))
-      .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
   sink_buffer[0..HEADER_BYTES].copy_from_slice(&DATAGRAM_HEADER);
-  sink_buffer[HEADER_BYTES..HEADER_BYTES + LENGTH_BYTES]
-    .copy_from_slice(&(compressed_size as u16).to_be_bytes());
-  let data_to_send = &mut sink_buffer[..HEADER_BYTES + LENGTH_BYTES + compressed_size];
+  let actual_size = if disable_compression {
+    sink_buffer[HEADER_BYTES..HEADER_BYTES + LENGTH_BYTES]
+      .copy_from_slice(&(data.len() as u16).to_be_bytes());
+    sink_buffer[HEADER_BYTES + LENGTH_BYTES..HEADER_BYTES + LENGTH_BYTES + data.len()]
+      .copy_from_slice(&data);
+    HEADER_BYTES + LENGTH_BYTES + data.len()
+  } else {
+    let compressed_size =
+      zstd_safe::compress(sink_buffer[HEADER_BYTES + LENGTH_BYTES..].as_mut(), &data, 9)
+        .inspect(|n| trace!("Compressed {} to {} bytes", data.len(), n))
+        .map_err(|e| anyhow!("Failed to compress datagram with error code = {}", e))?;
+    sink_buffer[HEADER_BYTES..HEADER_BYTES + LENGTH_BYTES]
+      .copy_from_slice(&(compressed_size as u16).to_be_bytes());
+    compressed_size
+  };
+  let data_to_send = &mut sink_buffer[..HEADER_BYTES + LENGTH_BYTES + actual_size];
   trace!(target: HUGE_DATA_TARGET, "Writing compressed datagram to sink: {:?}", data_to_send);
   write_to_sink(sink, data_to_send).await
 }
@@ -841,17 +870,18 @@ mod tests {
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[7, 8, 9]);
-    let mut buffer_size = sink_buf.len();
+    let mut bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(sink_buf.len(), buffer_size);
+    assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
     assert_eq!(unprocessed_bytes, 3);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
-    assert_eq!(sink_buf[3..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf[3..], BytesMut::zeroed(SINK_BUFFER_SIZE - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE));
     sink_buf.resize(unprocessed_bytes, 0);
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
@@ -860,16 +890,17 @@ mod tests {
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[11, 12, 13, 14, 15]);
-    buffer_size = sink_buf.len();
+    bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, sink_buf.len(), &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(sink_buf.len(), buffer_size);
+    assert_eq!(sink_buf.len(), SINK_BUFFER_SIZE);
     assert_eq!(unprocessed_bytes, 5);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
-    assert_eq!(sink_buf[5..], BytesMut::zeroed(buffer_size - unprocessed_bytes));
-    assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
+    assert_eq!(sink_buf[5..], BytesMut::zeroed(SINK_BUFFER_SIZE - unprocessed_bytes));
+    assert_eq!(compression_buf, BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE));
   }
 
   #[tokio::test]
@@ -899,18 +930,19 @@ mod tests {
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram3, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram1);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram2);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram3);
-    assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(sink_buf, BytesMut::zeroed(SINK_BUFFER_SIZE));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -932,16 +964,17 @@ mod tests {
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert_eq!(unprocessed_bytes, 0);
     assert_eq!(sink_to_client_pull.recv().await.unwrap(), datagram);
-    assert_eq!(sink_buf, BytesMut::zeroed(buffer_size));
+    assert_eq!(sink_buf, BytesMut::zeroed(SINK_BUFFER_SIZE));
     assert_eq!(&compression_buf, &BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -958,15 +991,16 @@ mod tests {
     );
     sink_buf.extend_from_slice(&[1, 2]); // invalid data to offset HEADER
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
-    let buffer_size = sink_buf.len();
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
+    assert_eq!(unprocessed_bytes, bytes_read - 2); // -2 because garbage was taken out
     assert_ne!(sink_buf, BytesMut::zeroed(sink_buf.len()));
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
@@ -987,15 +1021,16 @@ mod tests {
     sink_buf.extend_from_slice(&DATAGRAM_HEADER);
     sink_buf.extend_from_slice(&5u16.to_be_bytes());
     sink_buf.extend_from_slice(&[1; 3]);
-    let buffer_size = sink_buf.len();
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
-    assert_eq!(unprocessed_bytes, buffer_size - 2); // -2 because garbage was taken out
+    assert_eq!(unprocessed_bytes, bytes_read - 2); // -2 because garbage was taken out
     assert_eq!(compression_buf, BytesMut::zeroed(compression_buf.len()));
   }
 
@@ -1003,7 +1038,7 @@ mod tests {
   async fn test_handle_sink_read_data_garbage_cleanup() {
     setup_tracing();
     let mut sink_buf = BytesMut::new();
-    let mut compression_buf = BytesMut::zeroed(200);
+    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -1019,24 +1054,25 @@ mod tests {
     sink_buf.extend_from_slice(&compression_buf[..n]);
     sink_buf.extend_from_slice(&[65; 5]); // more garbage
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_ok());
     assert_eq!(unprocessed_bytes, 7);
     assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
-    assert_eq!(sink_buf[7..], BytesMut::zeroed(buffer_size - 7));
+    assert_eq!(sink_buf[7..], BytesMut::zeroed(SINK_BUFFER_SIZE - 7));
   }
 
   #[tokio::test]
   async fn test_handle_sink_read_data_partial_header() {
     setup_tracing();
     let mut sink_buf = BytesMut::new();
-    let mut compression_buf = BytesMut::zeroed(200);
+    let mut compression_buf = BytesMut::zeroed(SINK_COMPRESSION_BUFFER_SIZE);
     let channel_map = Arc::new(HashMap::new());
     let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
@@ -1045,16 +1081,17 @@ mod tests {
     );
 
     sink_buf.extend_from_slice(&DATAGRAM_HEADER[..7]);
+    let bytes_read = sink_buf.len();
+    sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
-    let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, bytes_read, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
-    assert_eq!(buffer_size, sink_buf.len());
+    assert_eq!(SINK_BUFFER_SIZE, sink_buf.len());
     assert!(sink_to_client_pull.try_recv().is_err());
     assert_eq!(unprocessed_bytes, 7);
-    assert_eq!(&sink_buf[..], &DATAGRAM_HEADER[..7]);
+    assert_eq!(&sink_buf[..7], &DATAGRAM_HEADER[..7]);
   }
 
   #[tokio::test]
@@ -1067,7 +1104,7 @@ mod tests {
     sink_buf.fill(80);
     let buffer_size = sink_buf.len();
     let unprocessed_bytes =
-      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf)
+      handle_sink_read(&channel_map, buffer_size, &mut sink_buf, &mut compression_buf, false)
         .await
         .unwrap();
     assert_eq!(buffer_size, sink_buf.len());
@@ -1077,7 +1114,16 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_sink_loop_read_sink() {
+  async fn test_sink_loop_read_sink_compressed() {
+    test_sink_loop_read_sink(false).await;
+  }
+
+  #[tokio::test]
+  async fn test_sink_loop_read_sink_uncompressed() {
+    test_sink_loop_read_sink(true).await;
+  }
+
+  async fn test_sink_loop_read_sink(disable_compression: bool) {
     setup_tracing();
     let mut sink_buf_write = BytesMut::zeroed(SINK_BUFFER_SIZE);
     let (sink_a, mut sink_b) = tokio::io::duplex(4096);
@@ -1089,13 +1135,16 @@ mod tests {
     );
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
-    let _sink_loop_handle =
-      tokio::spawn(sink_loop(sink_a, channel_map.clone(), client_to_sink_pull, cancel.clone()));
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map.clone(), client_to_sink_pull, disable_compression);
+    let _sink_loop_handle = tokio::spawn(sink_loop(sink_a, sink_loop_properties, cancel.clone()));
 
     info!("Sending initial datagram");
     let initial_data = "test data";
     let initial_datagram = create_initial_datagram(1, initial_data);
-    handle_sink_write(&mut sink_b, initial_datagram, &mut sink_buf_write).await.unwrap();
+    handle_sink_write(&mut sink_b, initial_datagram, &mut sink_buf_write, disable_compression)
+      .await
+      .unwrap();
     let datagram_bytes =
       timeout(Duration::from_secs(1), sink_to_client_pull.recv()).await.unwrap().unwrap();
     let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
@@ -1117,7 +1166,9 @@ mod tests {
       (sink_to_client_push.clone(), sink_to_client_pull.clone().deactivate()),
     );
     let ack_datagram = create_ack_datagram(2, 0, 0);
-    handle_sink_write(&mut sink_b, ack_datagram, &mut sink_buf_write).await.unwrap();
+    handle_sink_write(&mut sink_b, ack_datagram, &mut sink_buf_write, disable_compression)
+      .await
+      .unwrap();
     let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
     let ack_datagram = root_as_datagram(&datagram_bytes).unwrap();
     assert_eq!(ack_datagram.identifier(), 2);
@@ -1138,7 +1189,7 @@ mod tests {
     sink_b.flush().await.unwrap();
 
     let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
-    for (i, data_size) in (0..).zip(sizes.into_iter()) {
+    for (i, data_size) in (0..).zip(sizes) {
       let (sink_to_client_push, mut sink_to_client_pull) = async_broadcast::broadcast(10);
       channel_map.pin().insert(
         Identifier::Client(i),
@@ -1147,7 +1198,9 @@ mod tests {
       let mut data = BytesMut::new();
       data.resize(data_size, 100u8);
       let data_datagram = create_data_datagram(i, 1, &data);
-      handle_sink_write(&mut sink_b, data_datagram, &mut sink_buf_write).await.unwrap();
+      handle_sink_write(&mut sink_b, data_datagram, &mut sink_buf_write, disable_compression)
+        .await
+        .unwrap();
       let datagram_bytes = sink_to_client_pull.recv().await.unwrap();
       let data_datagram = root_as_datagram(&datagram_bytes).unwrap();
       assert_eq!(data_datagram.identifier(), i);
@@ -1176,10 +1229,14 @@ mod tests {
     );
     let (_client_to_sink_push_read, client_to_sink_pull_read) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
+    let sink_loop_properties_write =
+      SinkLoopProperties::new(channel_map_write, client_to_sink_pull_write, false);
+    let sink_loop_properties_read =
+      SinkLoopProperties::new(channel_map_read, client_to_sink_pull_read, false);
     let _sink_loop_write_handle =
-      tokio::spawn(sink_loop(sink_a, channel_map_write, client_to_sink_pull_write, cancel.clone()));
+      tokio::spawn(sink_loop(sink_a, sink_loop_properties_write, cancel.clone()));
     let _sink_loop_read_handle =
-      tokio::spawn(sink_loop(sink_b, channel_map_read, client_to_sink_pull_read, cancel.clone()));
+      tokio::spawn(sink_loop(sink_b, sink_loop_properties_read, cancel.clone()));
 
     let sizes = [1, 5, 100, 500, 1000, 5000, 10000, 15000, CONNECTION_BUFFER_SIZE];
     for (i, data_size) in sizes.into_iter().enumerate() {
@@ -1734,8 +1791,8 @@ mod tests {
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     client_to_sink_pull.close();
-    let _sink_loop_handle =
-      tokio::spawn(sink_loop(sink_a, channel_map, client_to_sink_pull, cancel.clone()));
+    let sink_loop_properties = SinkLoopProperties::new(channel_map, client_to_sink_pull, true);
+    let _sink_loop_handle = tokio::spawn(sink_loop(sink_a, sink_loop_properties, cancel.clone()));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 
@@ -1752,8 +1809,8 @@ mod tests {
     let (_client_to_sink_push, client_to_sink_pull) = async_channel::bounded(256);
     let cancel = CancellationToken::new();
     sink_b.shutdown().await.unwrap();
-    let _sink_loop_handle =
-      tokio::spawn(sink_loop(sink_a, channel_map, client_to_sink_pull, cancel.clone()));
+    let sink_loop_properties = SinkLoopProperties::new(channel_map, client_to_sink_pull, true);
+    let _sink_loop_handle = tokio::spawn(sink_loop(sink_a, sink_loop_properties, cancel.clone()));
     assert!(timeout(Duration::from_secs(1), cancel.cancelled()).await.is_ok());
   }
 }

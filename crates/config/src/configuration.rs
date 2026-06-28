@@ -37,6 +37,10 @@ pub struct ConfigArgs {
   /// Allows periodic logging of channel states
   #[arg(short, long, hide = true)]
   pub watch_channels: bool,
+
+  /// Disables compression of datagrams sent between multiplexers.
+  #[arg(short, long, hide = true)]
+  pub disable_compression: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Subcommand, Serialize, Deserialize)]

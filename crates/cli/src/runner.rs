@@ -14,11 +14,11 @@ pub mod common {
   use serial_multiplexer_lib::guest::client_initiator;
   use serial_multiplexer_lib::host::{ConnectionType, connection_initiator, run_listener};
   use serial_multiplexer_lib::host_http::run_http_listener;
+  use serial_multiplexer_lib::sink::{Sink, SinkLoopProperties};
   use serial_multiplexer_lib::utils::create_upstream_listener;
   use std::collections::{BTreeMap, HashSet};
   use std::sync::Arc;
   use std::time::Duration;
-  use tokio::io::AsyncWriteExt;
   use tokio::sync::mpsc;
   use tokio::task;
   use tokio::task::JoinHandle;
@@ -48,6 +48,7 @@ pub mod common {
         &unix_socket_properties,
         channel_map.clone(),
         client_to_sink_pull.clone(),
+        config.disable_compression,
         cancel.clone(),
       )
       .await
@@ -63,6 +64,7 @@ pub mod common {
         windows_pipe_properties,
         channel_map.clone(),
         client_to_sink_pull.clone(),
+        config.disable_compression,
         cancel.clone(),
       )
       .await
@@ -161,10 +163,15 @@ pub mod common {
     let mut sink_loops = FuturesUnordered::new();
     match properties.sink_type {
       GuestSink::Serial(serial) => {
-        let serial_port_sinks =
-          initialize_serials(&serial, channel_map.clone(), client_to_sink_pull, cancel.clone())
-            .await
-            .context("Failed to create serial port based sink loops.")?;
+        let serial_port_sinks = initialize_serials(
+          &serial,
+          channel_map.clone(),
+          client_to_sink_pull,
+          config.disable_compression,
+          cancel.clone(),
+        )
+        .await
+        .context("Failed to create serial port based sink loops.")?;
         sink_loops.extend(serial_port_sinks);
       }
       #[cfg(windows)]
@@ -174,6 +181,7 @@ pub mod common {
           windows_pipe_properties,
           channel_map.clone(),
           client_to_sink_pull.clone(),
+          config.disable_compression,
           cancel.clone(),
         )
         .await
@@ -188,6 +196,7 @@ pub mod common {
             &unix_socket,
             channel_map.clone(),
             client_to_sink_pull,
+            config.disable_compression,
             cancel.clone(),
           )
           .await
@@ -227,6 +236,7 @@ pub mod common {
   /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the loop(s)
   ///   should terminate.
   ///
@@ -237,6 +247,7 @@ pub mod common {
     properties: &SerialGuest,
     channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     debug!("Initializing serial ports");
@@ -257,31 +268,83 @@ pub mod common {
       }
     }
 
-    if !serials_err.is_empty() {
-      let mut error = anyhow::anyhow!("Failed to connect to all serial ports!");
-      for serial_error in serials_err {
+    let serials_ok = compose_sink_errors(serials_ok, serials_err, "serial port").await?;
+    let sink_loop_tasks =
+      compose_sink_loops(serials_ok, channel_map, client_to_sink_pull, disable_compression, cancel)
+        .await;
+    Ok(sink_loop_tasks)
+  }
+
+  /// Validates sink initialization results, returning successfully opened sinks or an aggregated error.
+  ///
+  /// If `sink_err` is non-empty, all errors are chained into a single [`anyhow::Error`] and every
+  /// successfully opened sink in `sink_ok` is shut down gracefully before the error is returned.
+  /// If there are no errors, the function returns `sink_ok` unchanged.
+  ///
+  /// # Parameters
+  ///
+  /// * `sink_ok` - Sinks that were opened successfully.
+  /// * `sink_err` - Errors collected during sink initialization.
+  /// * `sink_name` - Human-readable name for the sink type, used in the error message.
+  ///
+  /// # Returns
+  ///
+  /// `Ok(sink_ok)` when `sink_err` is empty, otherwise an [`Err`] containing all initialization
+  /// errors composed via [`anyhow::Error::context`].
+  pub async fn compose_sink_errors(
+    sink_ok: Vec<impl Sink>,
+    sink_err: Vec<anyhow::Error>,
+    sink_name: &str,
+  ) -> Result<Vec<impl Sink>, anyhow::Error> {
+    if !sink_err.is_empty() {
+      let mut error = anyhow::anyhow!("Failed to connect to all {}s!", sink_name);
+      for serial_error in sink_err {
         error = error.context(serial_error);
       }
-      for mut serial in serials_ok {
+      for mut serial in sink_ok {
         if let Err(e) = serial.shutdown().await {
-          error!("Failed to close serial port! {}", e);
+          error!("Failed to close {}! {}", sink_name, e);
         }
       }
       return Err(error);
     }
+    Ok(sink_ok)
+  }
 
-    let serial_tasks = FuturesUnordered::new();
+  /// Spawns a [`sink_loop`] task for each successfully opened sink and returns the task handles.
+  ///
+  /// For every sink in `sink_ok`, a [`tokio::task`] is created that runs [`sink_loop`] with shared
+  /// [`SinkLoopProperties`] derived from the remaining arguments. All tasks are collected into a
+  /// [`FuturesUnordered`].
+  ///
+  /// # Parameters
+  ///
+  /// * `sink_ok` - Sinks to run loops for, typically the successful output of [`compose_sink_errors`].
+  /// * `channel_map` - Routing table used by each sink loop to dispatch incoming datagrams.
+  /// * `client_to_sink_pull` - An [`async_channel::Receiver`], through which the sink loop
+  ///   receives datagrams sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
+  /// * `cancel` - [`CancellationToken`] that signals all sink loops to shut down.
+  ///
+  /// # Returns
+  ///
+  /// A [`FuturesUnordered<JoinHandle<()>>`] containing one handle per sink task.
+  pub async fn compose_sink_loops(
+    sink_ok: Vec<impl Sink + 'static>,
+    channel_map: ChannelMap,
+    client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
+    cancel: CancellationToken,
+  ) -> FuturesUnordered<JoinHandle<()>> {
+    let sink_tasks = FuturesUnordered::new();
 
-    for serial in serials_ok {
-      let serial_task = task::spawn(sink_loop(
-        serial,
-        channel_map.clone(),
-        client_to_sink_pull.clone(),
-        cancel.clone(),
-      ));
-      serial_tasks.push(serial_task);
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_sink_pull, disable_compression);
+    for sink in sink_ok {
+      let serial_task = task::spawn(sink_loop(sink, sink_loop_properties.clone(), cancel.clone()));
+      sink_tasks.push(serial_task);
     }
-    Ok(serial_tasks)
+    sink_tasks
   }
 
   /// Initializes network listeners from the specified [`Host`] properties.
@@ -510,6 +573,7 @@ pub mod common {
 
 #[cfg(windows)]
 mod windows {
+  use crate::runner::common::{compose_sink_errors, compose_sink_loops};
   use anyhow::{Context, Error, anyhow};
   use bytes::Bytes;
   use config::configuration::{WindowsPipeGuest, WindowsPipeHost};
@@ -517,9 +581,9 @@ mod windows {
   use futures::stream::FuturesUnordered;
   use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
+  use serial_multiplexer_lib::sink::SinkLoopProperties;
   use std::collections::HashSet;
   use std::time::Duration;
-  use tokio::io::AsyncWriteExt;
   use tokio::net::windows::named_pipe;
   use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
   use tokio::task::JoinHandle;
@@ -542,6 +606,7 @@ mod windows {
   ///   client loops.
   /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop(s) used to signal when the
   ///   loop(s) should terminate.
   ///
@@ -552,6 +617,7 @@ mod windows {
     properties: &WindowsPipeHost,
     channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<FuturesUnordered<JoinHandle<()>>> {
     let mut pipes_ok = Vec::new();
@@ -577,28 +643,11 @@ mod windows {
       }
     }
 
-    if !pipes_err.is_empty() {
-      let mut error = anyhow::anyhow!("Failed to connect to all pipes!");
-      for pipe_err in pipes_err {
-        error = error.context(pipe_err);
-      }
-      for mut pipe in pipes_ok {
-        if let Err(e) = pipe.shutdown().await {
-          error!("Failed to close a pipe! {}", e);
-        }
-      }
-      return Err(error);
-    }
-
-    let pipe_loops = FuturesUnordered::new();
-    for pipe in pipes_ok {
-      let cancel = cancel.clone();
-      let client_to_sink_pull = client_to_sink_pull.clone();
-      let channel_map = channel_map.clone();
-      let pipe_task = tokio::spawn(sink_loop(pipe, channel_map, client_to_sink_pull, cancel));
-      pipe_loops.push(pipe_task);
-    }
-    Ok(pipe_loops)
+    let pipes_ok = compose_sink_errors(pipes_ok, pipes_err, "pipe").await?;
+    let sink_loop_tasks =
+      compose_sink_loops(pipes_ok, channel_map, client_to_sink_pull, disable_compression, cancel)
+        .await;
+    Ok(sink_loop_tasks)
   }
 
   /// Attempts to open a named pipe at the specified path for reading and writing
@@ -606,10 +655,32 @@ mod windows {
     ClientOptions::new().write(true).read(true).open(pipe_path).map_err(|e| e.into())
   }
 
+  /// Creates and listens on Windows named pipe(s), then creates a sink loop when a client connects.
+  ///
+  /// This function binds a new `NamedPipeServer` on the path specified in the host properties.
+  /// After a client connects, a sink loop task is spawned using [`sink_loop`].
+  ///
+  /// # Parameters:
+  /// * `properties`: A reference to [`WindowsPipeHost`], a struct that contains the `pipe_paths`
+  ///   property, which specifies paths where the Windows named pipes will be created.
+  /// * `channel_map`: A [`ChannelMap`] used to send received datagrams to client loops.
+  /// * `client_to_sink_pull`: An [`async_channel::Receiver`], through which the sink loop
+  ///   receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
+  /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the
+  ///   loop should terminate.
+  ///
+  /// # Returns:
+  /// An [`anyhow::Result<Vec<JoinHandle<()>>>`] with the spawned sink loop task if successful,
+  /// otherwise an error if:
+  ///   * Creating a named pipe server fails for any of the paths
+  ///   * The connected client does not have an address
+  ///   * One or more pipes fail to connect
   pub async fn listen_accept_windows_named_pipe(
     properties: &WindowsPipeGuest,
     channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let pipe_instances = properties.pipe_paths.iter().try_fold(
@@ -670,17 +741,12 @@ mod windows {
       }
       return Err(ret_error);
     }
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_sink_pull, disable_compression);
     Ok(
       connected_instances
         .into_iter()
-        .map(|i| {
-          tokio::spawn(sink_loop(
-            i.unwrap(),
-            channel_map.clone(),
-            client_to_sink_pull.clone(),
-            cancel.clone(),
-          ))
-        })
+        .map(|i| tokio::spawn(sink_loop(i.unwrap(), sink_loop_properties.clone(), cancel.clone())))
         .collect(),
     )
   }
@@ -708,6 +774,7 @@ mod windows {
         &sink_properties,
         channel_map,
         client_to_sink_pull,
+        true,
         cancel.clone(),
       )
       .await;
@@ -743,6 +810,7 @@ mod windows {
         &sink_properties,
         channel_map,
         client_to_sink_pull,
+        true,
         cancel.clone(),
       )
       .await;
@@ -761,6 +829,7 @@ mod linux {
   use futures::future::try_join_all;
   use serial_multiplexer_lib::channels::ChannelMap;
   use serial_multiplexer_lib::common::sink_loop;
+  use serial_multiplexer_lib::sink::SinkLoopProperties;
   use std::collections::HashSet;
   use std::fs::remove_file;
   use std::io::ErrorKind;
@@ -775,11 +844,10 @@ mod linux {
   /// Check [`sink_loop`] documentation.
   fn create_unix_socket_loop(
     unix_socket: UnixStream,
-    channel_map: ChannelMap,
-    client_to_socket_pull: async_channel::Receiver<Bytes>,
+    sink_loop_properties: SinkLoopProperties,
     cancel: CancellationToken,
   ) -> JoinHandle<()> {
-    tokio::spawn(sink_loop(unix_socket, channel_map, client_to_socket_pull, cancel))
+    tokio::spawn(sink_loop(unix_socket, sink_loop_properties, cancel))
   }
 
   /// Attempts to connect to a Unix socket and set up a sink loop.
@@ -795,6 +863,7 @@ mod linux {
   ///    client loops.
   /// * `client_to_socket_pull`: An [`async_channel::Receiver`], through which the sink loop
   ///    receives data sent by clients to be written to the sink.
+  /// * `disable_compression`: A flag indicating whether datagram (de)compression will be disabled.
   /// * `cancel`: A [`CancellationToken`] passed to the sink loop used to signal when the loop
   ///    should terminate.
   ///
@@ -805,6 +874,7 @@ mod linux {
     properties: &UnixSocketGuest,
     channel_map: ChannelMap,
     client_to_socket_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
@@ -830,17 +900,12 @@ mod linux {
       }
     }
 
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_socket_pull, disable_compression);
     Ok(
       connected_sockets
         .into_iter()
-        .map(|socket| {
-          create_unix_socket_loop(
-            socket,
-            channel_map.clone(),
-            client_to_socket_pull.clone(),
-            cancel.clone(),
-          )
-        })
+        .map(|socket| create_unix_socket_loop(socket, sink_loop_properties.clone(), cancel.clone()))
         .collect(),
     )
   }
@@ -871,6 +936,7 @@ mod linux {
     properties: &UnixSocketHost,
     channel_map: ChannelMap,
     client_to_sink_pull: async_channel::Receiver<Bytes>,
+    disable_compression: bool,
     cancel: CancellationToken,
   ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let distinct_socket_paths = properties.socket_paths.iter().collect::<HashSet<_>>();
@@ -932,17 +998,13 @@ mod linux {
       }
       return Err(ret_error);
     }
+
+    let sink_loop_properties =
+      SinkLoopProperties::new(channel_map, client_to_sink_pull, disable_compression);
     Ok(
       connected_instances
         .into_iter()
-        .map(|i| {
-          tokio::spawn(sink_loop(
-            i.unwrap(),
-            channel_map.clone(),
-            client_to_sink_pull.clone(),
-            cancel.clone(),
-          ))
-        })
+        .map(|i| tokio::spawn(sink_loop(i.unwrap(), sink_loop_properties.clone(), cancel.clone())))
         .collect(),
     )
   }
@@ -957,9 +1019,21 @@ mod linux {
     use tokio::time::{sleep, timeout};
 
     #[tokio::test]
-    async fn listen_connect_accept_send_test() {
+    async fn listen_connect_accept_send_compressed_test() {
+      listen_connect_accept_send(false).await;
+    }
+
+    #[tokio::test]
+    async fn listen_connect_accept_send_uncompressed_test() {
+      listen_connect_accept_send(true).await;
+    }
+
+    async fn listen_connect_accept_send(disable_compression: bool) {
       setup_tracing();
-      let socket_path = vec!["test_socket.sock".to_string()];
+      let socket_path = vec![format!(
+        "test_socket-{}.sock",
+        if disable_compression { "compressed" } else { "uncompressed" }
+      )];
       let sink_properties = UnixSocketHost {
         socket_paths: socket_path.clone(),
         ..Default::default()
@@ -983,6 +1057,7 @@ mod linux {
               &sink_properties,
               channel_map,
               client_to_sink_pull,
+              disable_compression,
               cancel.clone(),
             )
             .await
@@ -1000,6 +1075,7 @@ mod linux {
           &unix_socket_properties,
           channel_map,
           client_to_sink_pull,
+          disable_compression,
           cancel.clone(),
         )
         .await;
