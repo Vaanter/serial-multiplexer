@@ -3,6 +3,7 @@ pub mod common;
 pub mod guest;
 pub mod host;
 pub mod host_http;
+pub mod protocol;
 pub mod protocol_utils;
 #[allow(clippy::all)]
 pub mod schema_generated;

@@ -154,7 +154,7 @@ pub mod common {
     };
     debug!("Creating guest tasks");
     let channel_map = Arc::new(HashMap::new());
-    let (initiator_push, initiator_pull) = async_broadcast::broadcast::<Bytes>(512);
+    let (initiator_push, initiator_pull) = async_broadcast::broadcast(512);
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(512);
     channel_map
       .pin()
@@ -491,7 +491,7 @@ pub mod common {
     use papaya::HashMap;
     use serial_multiplexer_lib::channels::Identifier;
     use serial_multiplexer_lib::host::ConnectionType;
-    use serial_multiplexer_lib::protocol_utils::create_ack_datagram;
+    use serial_multiplexer_lib::protocol::DatagramOwned;
     use serial_multiplexer_lib::test_utils::setup_tracing;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
@@ -562,7 +562,10 @@ pub mod common {
         .write_all(b"CONNECT google.com:443 HTTP/1.1\r\nHost: google.com\r\n\r\n")
         .await
         .unwrap();
-      sink_to_client_push.broadcast_direct(create_ack_datagram(connection_id, 0, 0)).await.unwrap();
+      sink_to_client_push
+        .broadcast_direct(DatagramOwned::new_ack(connection_id, 0, 0))
+        .await
+        .unwrap();
       let (state, connection_type) = connection_receiver.recv().await.unwrap();
       assert_eq!(state.identifier, connection_id);
       assert_eq!(state.client.peer_addr().unwrap(), http_client.local_addr().unwrap());
