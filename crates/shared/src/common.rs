@@ -40,6 +40,8 @@ const _: () = {
   assert!(maximum_size < SINK_COMPRESSION_BUFFER_SIZE);
   // Blocked connections read 4 bytes at a time to check if the connection was closed
   assert!(CONNECTION_BUFFER_SIZE.is_multiple_of(4));
+  // Sink must have a buffer at least twice as large as the client does
+  assert!(SINK_BUFFER_SIZE * 2 > CONNECTION_BUFFER_SIZE);
 };
 
 /// An array representing a header used to identify the start of a datagram in a byte stream
@@ -210,6 +212,9 @@ pub async fn sink_loop(
       }
     }
   }
+  sink_buf_read.zeroize();
+  sink_buf_write.zeroize();
+  compression_buffer.zeroize();
   cancel.cancel();
 }
 
@@ -305,9 +310,11 @@ pub async fn handle_sink_read(
       )
       .inspect(|n| trace!("Decompressed {} to {} bytes", size, n))
       .map_err(|e| anyhow!("Failed to decompress datagram with error code = {}", e))?;
-      let datagram_bytes = Bytes::copy_from_slice(&decompression_buffer[..decompressed_size]);
-      decompression_buffer.zeroize();
       let datagram_bytes = (&decompression_buffer[..decompressed_size]).try_into();
+      // `zstd_safe::decompress` may temporarily write past `decompressed_size` within the
+      // buffer. That extra space isn't reflected in the returned size, so the entire
+      // buffer must be zeroed out, not just the reported decompressed portion.
+      decompression_buffer.fill(0);
       datagram_bytes
     } else {
       (&read_data[datagram_start..=datagram_end]).try_into()
@@ -347,7 +354,7 @@ pub async fn handle_sink_read(
   let unprocessed_bytes = bytes_read - unprocessed_data_start;
   if unprocessed_data_start >= bytes_read {
     trace!("Whole buffer was read, zeroing out processed data");
-    sink_buf.zeroize();
+    sink_buf[..bytes_read].fill(0);
   } else if unprocessed_data_start > 0 {
     trace!(
       "Copying unprocessed data (start index: {}) to the start of buffer and zeroing out the rest",
@@ -356,7 +363,7 @@ pub async fn handle_sink_read(
     let buffer_end = sink_buf.len();
     trace!(target: HUGE_DATA_TARGET, "Buffer before copying and zeroing: {:?}", sink_buf.as_ref());
     sink_buf.copy_within(unprocessed_data_start..buffer_end, 0);
-    sink_buf[unprocessed_bytes..buffer_end].zeroize();
+    sink_buf[unprocessed_bytes..buffer_end].fill(0);
     trace!(target: HUGE_DATA_TARGET, "Buffer after copying and zeroing: {:?}", sink_buf.as_ref());
   }
   Ok(unprocessed_bytes)
@@ -443,7 +450,7 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
         let leftover_bytes = bytes_to_send.saturating_sub(bytes_sent);
         trace!("Unable to write {} bytes to sink", leftover_bytes);
         data_to_send.copy_within(bytes_sent..bytes_to_send, 0);
-        data_to_send[leftover_bytes..].zeroize();
+        data_to_send[leftover_bytes..].fill(0);
         if bytes_sent > 0 {
           sink.flush().await.context("Failed to flush data to sink")?;
         }
@@ -452,7 +459,7 @@ async fn write_to_sink(sink: &mut impl Sink, data_to_send: &mut [u8]) -> anyhow:
     };
   }
   trace!("All bytes written to sink");
-  data_to_send.zeroize();
+  data_to_send.fill(0);
   sink.flush().await.context("Failed to flush data to sink")?;
   Ok(0)
 }
@@ -514,7 +521,7 @@ pub async fn handle_client_read(
       *sequence = sequence.strict_add(1);
       let datagram = create_data_datagram(identifier, *sequence, &read_buf[..n]);
       trace!(target: HUGE_DATA_TARGET, "Built datagram with client data: {:?}", datagram.as_ref());
-      read_buf[..n].zeroize();
+      read_buf[..n].fill(0);
       debug!("Sending DATA datagram of {} bytes with seq: {}", datagram.len(), sequence);
       if let Err(e) = client_to_sink_push.send(datagram).await {
         error!("Failed to send DATA datagram for connection {}: {}", identifier, e);
@@ -629,6 +636,7 @@ async fn process_datagram(connection: &mut ConnectionState, datagram: DatagramOw
 /// * [ControlCode::Data][]: Relays data from datagram's data section to the client. If sending
 ///   data to the client fails, returns 0b10 to close the connection.
 async fn evaluate_datagram_queue(connection: &mut ConnectionState) -> u8 {
+  trace!(queue_size = %connection.datagram_queue.len(), "Starting datagram queue evaluation.");
   let mut result = 0b00;
   while let Some(datagram) = connection.datagram_queue.remove(&(connection.largest_processed + 1)) {
     connection.largest_processed += 1;
@@ -806,10 +814,12 @@ pub async fn connection_loop(
       }
     }
   }
+  tcp_buf.zeroize();
   debug!("Connection {} loop ending", connection.identifier);
 }
 
 /// Sends a CLOSE datagram and increases the connection's sequence.
+#[cold]
 async fn send_close_datagram(
   identifier: u64,
   sequence: &mut u64,
@@ -954,6 +964,7 @@ mod tests {
     let n = zstd_safe::compress(compression_buf.as_mut(), &datagram, 9).unwrap();
     sink_buf.extend_from_slice(&(n as u16).to_be_bytes());
     sink_buf.extend_from_slice(&compression_buf[..n]);
+    compression_buf.fill(0);
     let bytes_read = sink_buf.len();
     sink_buf.resize(SINK_BUFFER_SIZE, 0);
 
