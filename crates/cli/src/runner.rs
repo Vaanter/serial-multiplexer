@@ -69,7 +69,7 @@ pub mod common {
       )
       .await
       .context("Failed to create named pipe based sink loops.")?;
-      ensure!(!pipe_loop_tasks.is_empty(), "All pipe based sink loops failed to start");
+      ensure!(!pipe_loop_tasks.is_empty(), "All pipe based sink loops failed to start.");
       sink_loops.extend(pipe_loop_tasks);
     }
 
@@ -98,8 +98,8 @@ pub mod common {
       cancel,
     )
     .await
-    .context("Failed to initialize listeners")?;
-    ensure!(!listener_tasks.is_empty(), "All listeners failed to start");
+    .context("Failed to initialize listeners.")?;
+    ensure!(!listener_tasks.is_empty(), "All listeners failed to start.");
 
     if config.watch_channels {
       run_channel_watcher(channel_map, client_to_sink_push, Some(connection_sender));
@@ -185,7 +185,7 @@ pub mod common {
           cancel.clone(),
         )
         .await
-        .context("Failed to create Windows name pipe based sink loops.")?;
+        .context("Failed to create Windows named pipe based sink loops.")?;
         sink_loops.extend(pipe_sinks);
       }
       #[cfg(unix)]
@@ -263,7 +263,7 @@ pub mod common {
         Err(e) => {
           debug!("Failed to connect to serial port '{}'. {e}", serial_path);
           serials_err
-            .push(anyhow::anyhow!("Failed to connect to serial port '{serial_path}': {e}"));
+            .push(anyhow::anyhow!("Failed to connect to serial port '{serial_path}': {e}."));
         }
       }
     }
@@ -394,7 +394,10 @@ pub mod common {
         cancel,
       )
       .await
-      .context(format!("Failed to setup listener at address '{}'", pair_direct.listener_address))?;
+      .context(format!(
+        "Failed to setup listener at address '{}'.",
+        pair_direct.listener_address
+      ))?;
       listener_tasks.push(pair_task);
     }
 
@@ -406,7 +409,7 @@ pub mod common {
         cancel.clone(),
       )
       .await
-      .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'"))?;
+      .context(format!("Failed to setup socks5 listener at address '{socks5_proxy}'."))?;
       listener_tasks.push(socks5_task);
     }
 
@@ -419,7 +422,7 @@ pub mod common {
         cancel,
       )
       .await
-      .context(format!("Failed to setup http proxy listener at address '{http_proxy}'"))?;
+      .context(format!("Failed to setup http proxy listener at address '{http_proxy}'."))?;
       listener_tasks.push(http_task);
     }
 
@@ -639,7 +642,7 @@ mod windows {
             if i < 9 {
               sleep(Duration::from_millis(100)).await;
             } else {
-              pipes_err.push(anyhow::anyhow!("Failed to connect to pipe '{pipe_path}': {err}"));
+              pipes_err.push(anyhow::anyhow!("Failed to connect to pipe '{pipe_path}'.: {err}"));
             }
           }
         }
@@ -703,7 +706,7 @@ mod windows {
               error!("Failed to disconnect Windows named pipe. {:?}", e);
             }
           });
-          Err(e).context(format!("Failed to create Windows named pipe server '{}'", path))
+          Err(e).context(format!("Failed to create Windows named pipe server '{}'.", path))
         }
       },
     )?;
@@ -721,22 +724,22 @@ mod windows {
       .collect();
 
     let connected_instances =
-      try_join_all(instance_tasks).await.context("Failed waiting for all pipe tasks to finish")?;
+      try_join_all(instance_tasks).await.context("Failed waiting for all pipe tasks to finish.")?;
     if connected_instances.iter().any(|i| i.is_err()) {
-      let mut ret_error = anyhow::anyhow!("Some Windows pipes failed to connect");
+      let mut ret_error = anyhow::anyhow!("Some Windows pipes failed to connect.");
       for instance in connected_instances {
         match instance {
           Ok(instance) => {
             if let Err(e) = instance.disconnect() {
               ret_error =
-                ret_error.context(format!("Failed to disconnect Windows named pipe. {e}"));
+                ret_error.context(format!("Failed to disconnect Windows named pipe. {e}."));
             }
           }
           Err((instance, e)) => {
             let mut anyhow_e = anyhow!(e);
             if let Err(e) = instance.disconnect() {
               anyhow_e =
-                anyhow_e.context(format!("Also failed to disconnect Windows named pipe. {e}"));
+                anyhow_e.context(format!("Also failed to disconnect Windows named pipe. {e}."));
             }
             ret_error = ret_error.context(anyhow_e);
           }
@@ -890,12 +893,12 @@ mod linux {
           connected_sockets.push(socket);
         }
         Err(e) => {
-          error!("Failed to connect to socket at {}: {}", socket_path, e);
+          error!("Failed to connect to socket at {}: {}.", socket_path, e);
           let mut ret_error =
-            anyhow::anyhow!("Failed to connect to socket at {}", socket_path).context(e);
+            anyhow::anyhow!("Failed to connect to socket at {}.", socket_path).context(e);
           for mut connected_socket in connected_sockets {
             if let Err(e) = connected_socket.shutdown().await {
-              ret_error = ret_error.context("Also failed to shutdown connected socket").context(e);
+              ret_error = ret_error.context("Also failed to shutdown connected socket.").context(e);
             }
           }
           return Err(ret_error);
@@ -947,7 +950,7 @@ mod linux {
       if let Err(e) = remove_file(&socket_path)
         && e.kind() != ErrorKind::NotFound
       {
-        bail!("Failed to remove socket file: {}", e);
+        bail!("Failed to remove socket file: {}.", e);
       }
     }
     let pipe_instances = distinct_socket_paths.iter().try_fold(
@@ -958,7 +961,7 @@ mod linux {
           instances.push(instance);
           Ok(instances)
         }
-        Err(e) => Err(e).context(format!("Failed to bind a unix socket to '{}'", path)),
+        Err(e) => Err(e).context(format!("Failed to bind a unix socket to '{}'.", path)),
       },
     )?;
 
@@ -985,13 +988,13 @@ mod linux {
       .await
       .context("Failed waiting for all socket tasks to finish")?;
     if connected_instances.iter().any(|i| i.is_err()) {
-      let mut ret_error = anyhow::anyhow!("Some Unix listener failed to accept connection");
+      let mut ret_error = anyhow::anyhow!("Some Unix listener failed to accept connection.");
       for instance in connected_instances {
         match instance {
           Ok(mut instance) => {
             if let Err(e) = instance.shutdown().await {
               ret_error =
-                ret_error.context(format!("Failed to disconnect Unix socket connection. {e}"));
+                ret_error.context(format!("Failed to disconnect Unix socket connection. {e}."));
             }
           }
           Err(e) => {
