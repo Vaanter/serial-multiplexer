@@ -1,25 +1,40 @@
 use crate::common::ACK_THRESHOLD;
-use bytes::Bytes;
+use crate::protocol::DatagramOwned;
 use papaya::HashMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::debug;
 
 /// Thread-safe map storing separate channels for each client and the client initiator.
 /// Each entry contains a broadcast sender and inactive receiver for sending datagrams from the sink(s).
 pub type ChannelMap = Arc<
-  HashMap<Identifier, (async_broadcast::Sender<Bytes>, async_broadcast::InactiveReceiver<Bytes>)>,
+  HashMap<
+    Identifier,
+    (async_broadcast::Sender<DatagramOwned>, async_broadcast::InactiveReceiver<DatagramOwned>),
+  >,
 >;
 
-/// RAII guard that automatically removes a channel from the map when dropped.
-pub struct ChannelMapGuard {
-  channel_map: ChannelMap,
+type ChannelMapGuard = MapGuard<(
+  async_broadcast::Sender<DatagramOwned>,
+  async_broadcast::InactiveReceiver<DatagramOwned>,
+)>;
+
+/// RAII guard that automatically removes an entry from the map when dropped.
+pub struct MapGuard<V> {
+  map: Arc<HashMap<Identifier, V>>,
   identifier: Identifier,
 }
 
-impl Drop for ChannelMapGuard {
+impl<V> MapGuard<V> {
+  pub fn new(map: Arc<HashMap<Identifier, V>>, identifier: Identifier) -> Self {
+    Self { map, identifier }
+  }
+}
+
+impl<V> Drop for MapGuard<V> {
   fn drop(&mut self) {
-    debug!("Removing {:?} channel", self.identifier);
-    self.channel_map.pin().remove(&self.identifier);
+    debug!("Removing entry {:?}", self.identifier);
+    self.map.pin().remove(&self.identifier);
   }
 }
 
@@ -49,16 +64,16 @@ pub enum Identifier {
 pub fn channel_get_or_insert_with_guard(
   channel_map: ChannelMap,
   identifier: Identifier,
-) -> (async_broadcast::Receiver<Bytes>, ChannelMapGuard) {
+) -> (async_broadcast::Receiver<DatagramOwned>, ChannelMapGuard) {
   let guard = ChannelMapGuard {
-    channel_map: channel_map.clone(),
+    map: channel_map.clone(),
     identifier,
   };
   let sink_to_client_pull = channel_map
     .pin()
     .get_or_insert_with(identifier, || {
       let (sink_to_client_push, sink_to_client_pull) =
-        async_broadcast::broadcast::<Bytes>((ACK_THRESHOLD * 2) as usize);
+        async_broadcast::broadcast::<DatagramOwned>((ACK_THRESHOLD * 2) as usize);
       (sink_to_client_push, sink_to_client_pull.deactivate())
     })
     .1

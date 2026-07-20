@@ -202,7 +202,7 @@ fn create_400_response(body: Option<impl Into<Bytes>>) -> Response<BoxBody<Bytes
 mod tests {
   use super::*;
   use crate::host::ConnectionType;
-  use crate::protocol_utils::create_ack_datagram;
+  use crate::protocol::DatagramOwned;
   use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
   use crate::test_utils::{run_echo, setup_tracing};
   use bytes::Bytes;
@@ -274,7 +274,7 @@ mod tests {
         .0
         .clone();
       sink_to_client_push
-        .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
+        .broadcast_direct(DatagramOwned::new_ack(initial_datagram.identifier(), 0, 0))
         .await
         .unwrap();
     });

@@ -1,5 +1,6 @@
 use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::{ConnectionState, connection_loop};
+use crate::protocol::DatagramOwned;
 use crate::protocol_utils::{create_ack_datagram, datagram_from_bytes};
 use crate::schema_generated::serial_multiplexer::ControlCode;
 use crate::utils::connect_downstream;
@@ -133,44 +134,35 @@ pub async fn client_initiator(
 /// [`Initial`]: ControlCode::Initial
 /// [`ACK`]: ControlCode::Ack
 async fn initiate_client_connection(
-  data: Bytes,
+  datagram: DatagramOwned,
   client_to_sink_push: async_channel::Sender<Bytes>,
 ) -> anyhow::Result<Option<ConnectionState>> {
-  match datagram_from_bytes(&data) {
-    Ok(datagram) => {
-      // Not the first datagram for connection, ignore
-      if datagram.code() != ControlCode::Initial {
-        return Ok(None);
-      }
-      debug!("Connection {} received {:?} datagram", datagram.identifier(), datagram.code());
-      let identifier = datagram.identifier();
-      let Some(target_address) = datagram.data().map(|d| String::from_utf8_lossy(d.bytes())) else {
-        bail!("Initial datagram did not contain target address");
-      };
-      info!("Connecting to downstream: {}", target_address);
-      let mut downstream = connect_downstream(&target_address).await?;
-      let ack = create_ack_datagram(identifier, 0, 0);
-      let ack_datagram = datagram_from_bytes(&ack);
-      debug!("Sending ACK: {:?}", ack_datagram);
-      if let Err(e) = client_to_sink_push.send(ack).await {
-        if let Err(e) = downstream.shutdown().await {
-          error!("Failed to shutdown downstream after failing to send ACK: {}", e);
-        }
-        bail!("Failed to send ACK : {}", e);
-      }
-      Ok(Some(ConnectionState::new(identifier, downstream)))
-    }
-    Err(e) => {
-      debug!("Received invalid datagram, will ignore: {}", e);
-      Ok(None)
-    }
+  // Not the first datagram for connection, ignore
+  if datagram.code != ControlCode::Initial {
+    return Ok(None);
   }
+  debug!("Connection {} received {:?} datagram", datagram.identifier, datagram.code);
+  let identifier = datagram.identifier;
+  let Some(target_address) = datagram.data.as_ref().map(|d| String::from_utf8_lossy(d)) else {
+    bail!("Initial datagram did not contain target address");
+  };
+  info!("Connecting to downstream: {}", target_address);
+  let mut downstream = connect_downstream(&target_address).await?;
+  let ack = create_ack_datagram(identifier, 0, 0);
+  let ack_datagram = datagram_from_bytes(&ack);
+  debug!("Sending ACK: {:?}", ack_datagram);
+  if let Err(e) = client_to_sink_push.send(ack).await {
+    if let Err(e) = downstream.shutdown().await {
+      error!("Failed to shutdown downstream after failing to send ACK: {}", e);
+    }
+    bail!("Failed to send ACK : {}", e);
+  }
+  Ok(Some(ConnectionState::new(identifier, downstream)))
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::protocol_utils::create_initial_datagram;
   use crate::schema_generated::serial_multiplexer::root_as_datagram;
   use crate::test_utils::{run_echo, setup_tracing};
   use papaya::HashMap;
@@ -182,7 +174,7 @@ mod tests {
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let datagram = create_initial_datagram(123, &target_address);
+    let datagram = DatagramOwned::new_initial(123, &target_address);
 
     let connection =
       initiate_client_connection(datagram, client_to_sink_push.clone()).await.unwrap().unwrap();
@@ -198,15 +190,6 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_initiate_client_connection_invalid_datagram() {
-    setup_tracing();
-    let (client_to_sink_push, _client_to_sink_pull) = async_channel::bounded(10);
-
-    let connection = initiate_client_connection(Bytes::new(), client_to_sink_push.clone()).await;
-    assert!(matches!(connection, Ok(None)));
-  }
-
-  #[tokio::test]
   async fn test_client_initiator_success() {
     setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded(10);
@@ -218,7 +201,7 @@ mod tests {
     );
     let (target_address, _) = run_echo().await;
     let target_address = target_address.to_string();
-    let initial = create_initial_datagram(123, &target_address);
+    let initial = DatagramOwned::new_initial(123, &target_address);
 
     tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 
@@ -241,7 +224,7 @@ mod tests {
       (sink_to_client_push.clone(), sink_to_client_pull.deactivate()),
     );
     let target_address = "127.0.0.1:0".to_string();
-    let initial = create_initial_datagram(123, &target_address);
+    let initial = DatagramOwned::new_initial(123, &target_address);
 
     tokio::spawn(client_initiator(channel_map, client_to_sink_push, CancellationToken::new()));
 

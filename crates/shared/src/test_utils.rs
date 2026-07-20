@@ -1,4 +1,4 @@
-use crate::protocol_utils::create_ack_datagram;
+use crate::protocol::DatagramOwned;
 use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
 use bytes::{Bytes, BytesMut};
 use std::io::{stderr, stdout};
@@ -60,7 +60,7 @@ pub async fn receive_initial_ack_data(
   identifier: u64,
   initial_data: Bytes,
   client_to_sink_pull: async_channel::Receiver<Bytes>,
-  sink_to_client_push: async_broadcast::Sender<Bytes>,
+  sink_to_client_push: async_broadcast::Sender<DatagramOwned>,
   data_datagram_contents: Bytes,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
@@ -69,7 +69,7 @@ pub async fn receive_initial_ack_data(
     assert_eq!(initial_datagram.identifier(), identifier);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), initial_data);
-    let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
+    let ack = DatagramOwned::new_ack(initial_datagram.identifier(), 0, 0);
     sink_to_client_push.broadcast_direct(ack).await.unwrap();
     let data = client_to_sink_pull.recv().await.unwrap();
     let data_datagram = root_as_datagram(&data).unwrap();

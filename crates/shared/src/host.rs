@@ -1,7 +1,8 @@
 use crate::channels::{ChannelMap, Identifier, channel_get_or_insert_with_guard};
 use crate::common::{ConnectionState, HUGE_DATA_TARGET, connection_loop};
+use crate::protocol::DatagramOwned;
 use crate::protocol_utils::{create_initial_datagram, datagram_from_bytes};
-use crate::schema_generated::serial_multiplexer::{ControlCode, root_as_datagram};
+use crate::schema_generated::serial_multiplexer::ControlCode;
 use anyhow::{Context, Error};
 use bytes::Bytes;
 use fast_socks5::ReplyError;
@@ -158,7 +159,7 @@ async fn connection_initiation_dispatch(
   connection_state: &mut ConnectionState,
   connection_type: ConnectionType,
   client_to_sink_push: &async_channel::Sender<Bytes>,
-  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<DatagramOwned>,
 ) -> anyhow::Result<()> {
   match connection_type {
     ConnectionType::Direct { target_address } => {
@@ -182,7 +183,7 @@ async fn initiate_direct_connection(
   connection_state: &ConnectionState,
   target_address: String,
   client_to_sink_push: &async_channel::Sender<Bytes>,
-  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<DatagramOwned>,
 ) -> anyhow::Result<()> {
   info!("Starting direct connection to {}", &target_address);
   if initiate_connection(
@@ -202,7 +203,7 @@ async fn initiate_direct_connection(
 async fn initiate_socks5_connection(
   connection_state: &mut ConnectionState,
   client_to_sink_push: &async_channel::Sender<Bytes>,
-  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<DatagramOwned>,
 ) -> anyhow::Result<()> {
   // Use the local address as the guest does not reply with the actual address of it's connection
   let local_address = connection_state.client.local_addr()?;
@@ -243,7 +244,7 @@ pub(crate) async fn initiate_connection(
   connection_identifier: u64,
   target_address: String,
   client_to_sink_push: &async_channel::Sender<Bytes>,
-  sink_to_client_pull: &mut async_broadcast::Receiver<Bytes>,
+  sink_to_client_pull: &mut async_broadcast::Receiver<DatagramOwned>,
 ) -> bool {
   let initial_datagram = create_initial_datagram(connection_identifier, &target_address);
   trace!(target: HUGE_DATA_TARGET, "Sending initial datagram: {:?}", datagram_from_bytes(&initial_datagram));
@@ -254,48 +255,38 @@ pub(crate) async fn initiate_connection(
     );
     return false;
   }
-  // TODO rework
-  if let Ok(Some(datagram)) = timeout(Duration::from_secs(5), async {
+  let Ok(Some(datagram)) = timeout(Duration::from_secs(5), async {
     loop {
       match sink_to_client_pull.recv_direct().await {
-        Ok(data) => match root_as_datagram(&data) {
-          Ok(datagram) => {
-            trace!(target: HUGE_DATA_TARGET, "Received datagram from server: {:?}", datagram);
-            if datagram.identifier() == connection_identifier {
-              break Some(data);
-            }
+        Ok(datagram) => {
+          trace!(target: HUGE_DATA_TARGET, "Received datagram from server: {:?}", datagram);
+          if datagram.identifier == connection_identifier {
+            break Some(datagram);
           }
-          Err(e) => {
-            debug!("Received invalid datagram, will ignore: {:?}", e);
-          }
-        },
+        }
         Err(_) => break None,
       }
     }
   })
   .await
-  {
-    let datagram = root_as_datagram(&datagram)
-      .expect("Datagram should have been validated by checking the identifier");
-    if datagram.code() != ControlCode::Ack || datagram.identifier() != connection_identifier {
-      debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
-      return false;
-    }
-    debug!("Successfully initiated connection {} to {}", connection_identifier, target_address);
-    true
-  } else {
+  else {
     debug!(
-      "Failed to initialize connection {}, sink is closed or failed to receive response",
+      "Failed to initialize connection {} timed out or invalid response",
       connection_identifier
     );
-    false
+    return false;
+  };
+  if datagram.code != ControlCode::Ack || datagram.identifier != connection_identifier {
+    debug!(target: HUGE_DATA_TARGET, "Received invalid response from server: {:?}", datagram);
+    return false;
   }
+  debug!("Successfully initiated connection {} to {}", connection_identifier, target_address);
+  true
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::protocol_utils::create_ack_datagram;
   use crate::test_utils::{receive_initial_ack_data, run_echo, setup_tracing};
   use crate::utils::create_upstream_listener;
   use bytes::BytesMut;
@@ -350,14 +341,12 @@ mod tests {
     });
 
     let initial_datagram_bytes = client_to_sink_pull.recv().await.unwrap();
-    let initial_datagram = root_as_datagram(&initial_datagram_bytes).unwrap();
+    let initial_datagram = datagram_from_bytes(&initial_datagram_bytes).unwrap();
     let initial_data = initial_datagram.data().unwrap().bytes();
     assert_eq!(target_address.as_bytes(), initial_data);
     assert_eq!(identifier, initial_datagram.identifier());
-    sink_to_client_push
-      .broadcast_direct(create_ack_datagram(initial_datagram.identifier(), 0, 0))
-      .await
-      .unwrap();
+    let ack_datagram = DatagramOwned::new_ack(initial_datagram.identifier(), 0, 0);
+    sink_to_client_push.broadcast_direct(ack_datagram).await.unwrap();
 
     assert!(initiate_handle.await.unwrap());
   }
@@ -390,8 +379,8 @@ mod tests {
 
     let guest_task = tokio::spawn(async move {
       let initial = client_to_sink_pull.recv().await.unwrap();
-      let initial_datagram = root_as_datagram(&initial).unwrap();
-      let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
+      let initial_datagram = datagram_from_bytes(&initial).unwrap();
+      let ack = DatagramOwned::new_ack(initial_datagram.identifier(), 0, 0);
       sink_to_client_push.broadcast_direct(ack).await.unwrap();
     });
 
@@ -444,11 +433,11 @@ mod tests {
     let connection_type = ConnectionType::new_direct(target_addr.to_string());
     connection_sender.send((connection_state, connection_type)).await.unwrap();
     let datagram_bytes = client_to_sink_pull.recv().await.unwrap();
-    let initial_datagram = root_as_datagram(&datagram_bytes).unwrap();
+    let initial_datagram = datagram_from_bytes(&datagram_bytes).unwrap();
     assert_eq!(initial_datagram.identifier(), 0);
     assert_eq!(initial_datagram.code(), ControlCode::Initial);
     assert_eq!(initial_datagram.data().unwrap().bytes(), target_addr.as_bytes());
-    let ack = create_ack_datagram(initial_datagram.identifier(), 0, 0);
+    let ack = DatagramOwned::new_ack(initial_datagram.identifier(), 0, 0);
     sink_to_client_push.broadcast_direct(ack).await.unwrap();
     cancel.cancel();
     timeout(Duration::from_secs(1), initiator_task).await.unwrap().unwrap();
@@ -459,7 +448,7 @@ mod tests {
   async fn test_handle_new_connection_direct_success() {
     setup_tracing();
     let (client_to_sink_push, client_to_sink_pull) = async_channel::bounded::<Bytes>(256);
-    let channel_map = Arc::new(HashMap::new());
+    let channel_map = ChannelMap::new(HashMap::new());
     let (sink_to_client_push, sink_to_client_pull) = async_broadcast::broadcast(10);
     channel_map.pin().insert(
       Identifier::Client(0),
