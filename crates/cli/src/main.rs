@@ -72,26 +72,28 @@ fn main() -> ExitCode {
 fn initiate_tracing(config: &ConfigArgs) -> anyhow::Result<Vec<WorkerGuard>> {
   let mut tracing_guards = Vec::with_capacity(2);
 
-  let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
-  tracing_guards.push(stdout_guard);
-
-  let stdout_layer = setup_tracing_layer(config, stdout_writer, true);
-
-  let registry_setup = Registry::default().with(stdout_layer);
-
-  if let Some(ref log_file_name) = config.log_file {
+  // The file layer (without ANSI) must be registered before the stdout layer (with ANSI).
+  // tracing_subscriber caches each span's formatted fields the first time any layer visits it
+  // and reuses that cached (ANSI or not) string for every other layer, so registering the ANSI
+  // layer first would cause escape codes to leak into the plain-text file log.
+  let file_layer = if let Some(ref log_file_name) = config.log_file {
     let mut log_file_options = OpenOptions::new();
     log_file_options.write(true).truncate(true).create(true);
     let log_file = log_file_options.open(log_file_name).context("Failed to access log file")?;
     let (file_writer, file_guard) = tracing_appender::non_blocking(log_file);
     tracing_guards.push(file_guard);
 
-    let file_layer = setup_tracing_layer(config, file_writer, false);
-
-    registry_setup.with(file_layer).init();
+    Some(setup_tracing_layer(config, file_writer, false))
   } else {
-    registry_setup.init();
-  }
+    None
+  };
+
+  let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+  tracing_guards.push(stdout_guard);
+
+  let stdout_layer = setup_tracing_layer(config, stdout_writer, true);
+
+  Registry::default().with(file_layer).with(stdout_layer).init();
   Ok(tracing_guards)
 }
 
